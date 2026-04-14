@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import App from '../../App';
@@ -36,5 +36,28 @@ describe('app flow', () => {
     await user.click(screen.getByRole('button', { name: '重新开局' }));
 
     expect(screen.getByText(/当前回合：红方/)).toBeInTheDocument();
+  });
+
+  it('does not expose hidden piece faction styling before a piece is flipped', () => {
+    const initialState = createEmptyGameState({
+      pieces: [
+        piece({ id: 'red-king', camp: 'red', type: 'king', position: { x: 4, y: 9 } }),
+        piece({ id: 'black-king', camp: 'black', type: 'king', position: { x: 4, y: 0 } }),
+        piece({ id: 'hidden-red-rook', camp: 'red', type: 'rook', position: { x: 0, y: 5 }, revealed: false }),
+        piece({ id: 'hidden-black-horse', camp: 'black', type: 'horse', position: { x: 1, y: 5 }, revealed: false }),
+      ],
+    });
+
+    const { container } = render(<App initialState={initialState} />);
+    const board = within(container);
+    const hiddenRedCell = board.getByTestId('cell-0-5');
+    const hiddenBlackCell = board.getByTestId('cell-1-5');
+
+    expect(hiddenRedCell).toHaveTextContent('暗');
+    expect(hiddenRedCell).toHaveClass('hidden');
+    expect(hiddenRedCell).not.toHaveClass('red');
+    expect(hiddenBlackCell).toHaveTextContent('暗');
+    expect(hiddenBlackCell).toHaveClass('hidden');
+    expect(hiddenBlackCell).not.toHaveClass('black');
   });
 });

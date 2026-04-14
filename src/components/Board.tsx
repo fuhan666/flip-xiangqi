@@ -17,7 +17,7 @@ export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) 
           );
           const isSelected = selectedPosition?.x === x && selectedPosition?.y === y;
           const classes = ['cell'];
-          if (piece) {
+          if (piece?.revealed) {
             classes.push(piece.camp);
           }
           if (!piece?.revealed) {
