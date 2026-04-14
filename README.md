@@ -37,4 +37,5 @@ npm run build
 
 - [游戏玩法说明](docs/gameplay-rules.md)
 - [开发分阶段规划](docs/development-roadmap.md)
+- [Multica Agent 工作流](docs/agent-workflow.md)
 - [PHASE1-5 实施计划](docs/plans/2026-04-14_phase1-5-mvp-implementation.md)
