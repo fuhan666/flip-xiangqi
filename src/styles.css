@@ -1,0 +1,93 @@
+:root {
+  color: #f3ede0;
+  background: #1f1510;
+  font-family: 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+button {
+  font: inherit;
+}
+
+.app-shell {
+  min-height: 100vh;
+  padding: 24px;
+  box-sizing: border-box;
+}
+
+.layout {
+  display: flex;
+  gap: 24px;
+  align-items: flex-start;
+}
+
+.board {
+  display: grid;
+  grid-template-columns: repeat(9, 64px);
+  gap: 6px;
+  background: #6c4224;
+  padding: 12px;
+  border-radius: 16px;
+}
+
+.cell {
+  width: 64px;
+  height: 64px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 12px;
+  background: #cfa56a;
+  color: #2b1407;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px;
+  cursor: pointer;
+}
+
+.cell.hidden {
+  background: #7d5d3b;
+  color: #f7efe0;
+}
+
+.cell.red {
+  color: #8f1d14;
+}
+
+.cell.black {
+  color: #1d2433;
+}
+
+.cell.selected {
+  outline: 3px solid #f4e285;
+}
+
+.coordinate {
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.piece-text {
+  font-size: 28px;
+  line-height: 1;
+}
+
+.sidebar {
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.panel {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  padding: 16px;
+}
+
+.error {
+  color: #ffb4a4;
+}
