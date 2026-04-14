@@ -30,6 +30,7 @@ export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) 
           return (
             <button
               key={`${x}-${y}`}
+              aria-pressed={isSelected}
               className={classes.join(' ')}
               data-testid={`cell-${x}-${y}`}
               onClick={() => onCellClick({ x, y })}

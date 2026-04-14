@@ -18,29 +18,57 @@ export default function App({ initialState }: AppProps) {
   const seedState = useMemo(() => initialState ?? createInitialGameState(), [initialState]);
   const [gameState, setGameState] = useState<GameState>(seedState);
   const [selectedPosition, setSelectedPosition] = useState<Position | null>(null);
+  const [interactionMessage, setInteractionMessage] = useState<string | null>(null);
 
   const handleCellClick = (position: Position) => {
     const piece = getPieceAt(gameState, position);
 
     if (piece && !piece.revealed) {
+      const nextState = applyAction(gameState, { type: 'flip', position });
       setSelectedPosition(null);
-      setGameState((current) => applyAction(current, { type: 'flip', position }));
+      setInteractionMessage(null);
+      setGameState(nextState);
+      return;
+    }
+
+    if (
+      selectedPosition &&
+      isOwnRevealedPiece(gameState, position) &&
+      selectedPosition.x === position.x &&
+      selectedPosition.y === position.y
+    ) {
+      setSelectedPosition(null);
+      setInteractionMessage('已取消选中，请重新选择棋子或翻开暗子');
       return;
     }
 
     if (isOwnRevealedPiece(gameState, position)) {
       setSelectedPosition(position);
+      setInteractionMessage(null);
+      return;
+    }
+
+    if (!selectedPosition && !piece) {
+      setInteractionMessage('该格当前不可直接操作，请先选择己方明子或翻开暗子');
+      return;
+    }
+
+    if (!selectedPosition && piece) {
+      setInteractionMessage('不能直接操作对方明子，请先选择己方明子');
       return;
     }
 
     if (selectedPosition) {
-      setGameState((current) => applyAction(current, { type: 'move', from: selectedPosition, to: position }));
+      const nextState = applyAction(gameState, { type: 'move', from: selectedPosition, to: position });
+      setInteractionMessage(null);
+      setGameState(nextState);
       setSelectedPosition(null);
     }
   };
 
   const handleRestart = () => {
     setSelectedPosition(null);
+    setInteractionMessage(null);
     setGameState(restartGame());
   };
 
@@ -54,7 +82,7 @@ export default function App({ initialState }: AppProps) {
       <div className="layout">
         <Board gameState={gameState} selectedPosition={selectedPosition} onCellClick={handleCellClick} />
         <aside className="sidebar">
-          <StatusPanel gameState={gameState} />
+          <StatusPanel gameState={gameState} interactionMessage={interactionMessage} />
           <CapturedPieces gameState={gameState} />
           <section className="panel">
             <h2>操作</h2>

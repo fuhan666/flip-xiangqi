@@ -88,6 +88,10 @@ button {
   padding: 16px;
 }
 
+.hint {
+  color: #f7d78b;
+}
+
 .error {
   color: #ffb4a4;
 }
