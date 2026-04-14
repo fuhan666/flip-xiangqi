@@ -1,4 +1,4 @@
-import { cloneState, getPieceAt, otherCamp, positionsEqual } from './state';
+import { cloneState, getPieceAt, otherCamp, positionsEqual, restoreState, snapshotState } from './state';
 import { createInitialGameState } from './setup';
 import { hasAnyLegalAction, isInCheck, validateMove, violatesFacingKings } from './move-rules';
 import type {
@@ -60,8 +60,9 @@ function recordHistory(
     statusMessage: resolution.statusMessage,
   };
 
-  resolution.state.actionHistory = [...state.actionHistory, entry];
+  resolution.state.actionHistory = [...resolution.state.actionHistory, entry];
   resolution.state.recentAction = entry;
+  resolution.state.undoStack = [...state.undoStack, snapshotState(state)];
   return resolution.state;
 }
 
@@ -75,7 +76,6 @@ function finalizeTurn(state: GameState, actingCamp: Camp): TurnResolution {
   if (!opponentKingAlive) {
     next.winner = actingCamp;
     next.checkedCamp = null;
-    next.currentTurn = nextTurn;
     next.statusMessage = `${campLabel(actingCamp)}获胜`;
     return {
       state: next,
@@ -236,6 +236,16 @@ export function applyAction(state: GameState, action: GameAction): GameState {
   }
 
   return applyMove(state, action);
+}
+
+export function undoLastAction(state: GameState): GameState {
+  if (state.undoStack.length === 0) {
+    return cloneState(state);
+  }
+
+  const nextUndoStack = state.undoStack.slice(0, -1);
+  const previousState = state.undoStack[state.undoStack.length - 1];
+  return restoreState(previousState, nextUndoStack);
 }
 
 export function restartGame(rng?: () => number): GameState {

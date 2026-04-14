@@ -80,6 +80,16 @@ export interface GameHistoryEntry {
   statusMessage: string;
 }
 
+export interface GameStateSnapshot {
+  pieces: Piece[];
+  currentTurn: Camp;
+  winner: Camp | null;
+  checkedCamp: Camp | null;
+  lastError: string | null;
+  statusMessage: string;
+  actionHistory: GameHistoryEntry[];
+  recentAction: GameHistoryEntry | null;
+}
 export interface GameState {
   pieces: Piece[];
   currentTurn: Camp;
@@ -89,6 +99,7 @@ export interface GameState {
   statusMessage: string;
   actionHistory: GameHistoryEntry[];
   recentAction: GameHistoryEntry | null;
+  undoStack: GameStateSnapshot[];
 }
 
 export interface FlipAction {

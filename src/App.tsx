@@ -1,9 +1,10 @@
 import { useMemo, useState } from 'react';
-import { applyAction, createInitialGameState, getPieceAt, restartGame } from './game';
+import { applyAction, createInitialGameState, getPieceAt, restartGame, undoLastAction } from './game';
 import type { GameState, Position } from './game';
 import { Board } from './components/Board';
 import { CapturedPieces } from './components/CapturedPieces';
 import { MoveHistory } from './components/MoveHistory';
+import { GameControls } from './components/GameControls';
 import { StatusPanel } from './components/StatusPanel';
 
 interface AppProps {
@@ -19,6 +20,7 @@ export default function App({ initialState }: AppProps) {
   const seedState = useMemo(() => initialState ?? createInitialGameState(), [initialState]);
   const [gameState, setGameState] = useState<GameState>(seedState);
   const [selectedPosition, setSelectedPosition] = useState<Position | null>(null);
+  const canUndo = gameState.undoStack.length > 0;
 
   const handleCellClick = (position: Position) => {
     const piece = getPieceAt(gameState, position);
@@ -45,6 +47,11 @@ export default function App({ initialState }: AppProps) {
     setGameState(restartGame());
   };
 
+  const handleUndo = () => {
+    setSelectedPosition(null);
+    setGameState((current) => undoLastAction(current));
+  };
+
   return (
     <main className="app-shell">
       <header>
@@ -58,12 +65,7 @@ export default function App({ initialState }: AppProps) {
           <MoveHistory recentAction={gameState.recentAction} />
           <StatusPanel gameState={gameState} />
           <CapturedPieces gameState={gameState} />
-          <section className="panel">
-            <h2>操作</h2>
-            <button onClick={handleRestart} type="button">
-              重新开局
-            </button>
-          </section>
+          <GameControls canUndo={canUndo} onRestart={handleRestart} onUndo={handleUndo} />
         </aside>
       </div>
     </main>

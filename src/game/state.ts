@@ -5,6 +5,7 @@ import type {
   GameHistoryConsequence,
   GameHistoryEntry,
   GameState,
+  GameStateSnapshot,
   HistoryPieceSnapshot,
   Piece,
   Position,
@@ -14,6 +15,12 @@ function clonePosition(position: Position | null): Position | null {
   return position ? { ...position } : null;
 }
 
+function clonePiece(piece: Piece): Piece {
+  return {
+    ...piece,
+    position: clonePosition(piece.position),
+  };
+}
 function cloneHistoryPieceSnapshot(piece: HistoryPieceSnapshot): HistoryPieceSnapshot {
   return {
     ...piece,
@@ -58,6 +65,30 @@ function cloneHistoryEntry(entry: GameHistoryEntry): GameHistoryEntry {
   };
 }
 
+export function cloneStateSnapshot(snapshot: GameStateSnapshot): GameStateSnapshot {
+  return {
+    currentTurn: snapshot.currentTurn,
+    winner: snapshot.winner,
+    checkedCamp: snapshot.checkedCamp,
+    lastError: snapshot.lastError,
+    statusMessage: snapshot.statusMessage,
+    pieces: snapshot.pieces.map(clonePiece),
+    actionHistory: snapshot.actionHistory.map(cloneHistoryEntry),
+    recentAction: snapshot.recentAction ? cloneHistoryEntry(snapshot.recentAction) : null,
+  };
+}
+
+export function snapshotState(state: GameState): GameStateSnapshot {
+  return cloneStateSnapshot(state);
+}
+
+export function restoreState(snapshot: GameStateSnapshot, undoStack: GameStateSnapshot[]): GameState {
+  return {
+    ...cloneStateSnapshot(snapshot),
+    undoStack: undoStack.map(cloneStateSnapshot),
+  };
+}
+
 export function createEmptyGameState(overrides: Partial<GameState> = {}): GameState {
   return {
     pieces: [],
@@ -68,6 +99,7 @@ export function createEmptyGameState(overrides: Partial<GameState> = {}): GameSt
     statusMessage: '红方先行',
     actionHistory: [],
     recentAction: null,
+    undoStack: [],
     ...overrides,
   };
 }
@@ -100,18 +132,7 @@ export function createBasePieces(): Piece[] {
 }
 
 export function cloneState(state: GameState): GameState {
-  const actionHistory = state.actionHistory.map(cloneHistoryEntry);
-  const recentAction = state.recentAction ? cloneHistoryEntry(state.recentAction) : null;
-
-  return {
-    ...state,
-    pieces: state.pieces.map((piece) => ({
-      ...piece,
-      position: clonePosition(piece.position),
-    })),
-    actionHistory,
-    recentAction,
-  };
+  return restoreState(snapshotState(state), state.undoStack);
 }
 
 export function positionsEqual(left: Position, right: Position): boolean {
