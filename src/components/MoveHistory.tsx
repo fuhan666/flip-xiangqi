@@ -5,7 +5,7 @@ interface MoveHistoryProps {
   recentAction: GameHistoryEntry | null;
 }
 
-function campLabel(camp: Camp): string {
+export function campLabel(camp: Camp): string {
   return camp === 'red' ? '红方' : '黑方';
 }
 
@@ -17,7 +17,7 @@ function pieceLabel(piece: HistoryPieceSnapshot): string {
   return `${campLabel(piece.camp)}${PIECE_SYMBOLS[piece.camp][piece.type]}`;
 }
 
-function actionSummary(entry: GameHistoryEntry): string {
+export function actionSummary(entry: GameHistoryEntry): string {
   if (entry.action.type === 'flip') {
     return `${campLabel(entry.actor)}翻开了${pieceLabel(entry.action.piece)}`;
   }
