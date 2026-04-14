@@ -88,6 +88,79 @@ button {
   padding: 16px;
 }
 
+.panel h2 {
+  margin: 0 0 12px;
+}
+
+.move-history-panel,
+.status-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.move-history-content,
+.status-list {
+  gap: 10px;
+}
+
+.move-history-turn {
+  margin: 0;
+  color: #f4dba7;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.move-history-summary,
+.move-history-detail,
+.move-history-consequence,
+.move-history-next-turn,
+.move-history-empty {
+  margin: 0;
+}
+
+.move-history-summary {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.move-history-detail,
+.move-history-next-turn,
+.move-history-empty {
+  color: rgba(243, 237, 224, 0.78);
+}
+
+.move-history-consequence {
+  color: #f4dba7;
+}
+
+.status-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.status-item:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.status-item-alert .status-value {
+  color: #f4dba7;
+}
+
+.status-label {
+  color: rgba(243, 237, 224, 0.72);
+}
+
+.status-value {
+  text-align: right;
+}
+
 .error {
+  margin: 12px 0 0;
   color: #ffb4a4;
 }

@@ -3,6 +3,7 @@ import { applyAction, createInitialGameState, getPieceAt, restartGame } from './
 import type { GameState, Position } from './game';
 import { Board } from './components/Board';
 import { CapturedPieces } from './components/CapturedPieces';
+import { MoveHistory } from './components/MoveHistory';
 import { StatusPanel } from './components/StatusPanel';
 
 interface AppProps {
@@ -54,6 +55,7 @@ export default function App({ initialState }: AppProps) {
       <div className="layout">
         <Board gameState={gameState} selectedPosition={selectedPosition} onCellClick={handleCellClick} />
         <aside className="sidebar">
+          <MoveHistory recentAction={gameState.recentAction} />
           <StatusPanel gameState={gameState} />
           <CapturedPieces gameState={gameState} />
           <section className="panel">
