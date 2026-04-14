@@ -38,6 +38,42 @@ describe('app flow', () => {
     expect(screen.getByText(/当前回合：红方/)).toBeInTheDocument();
   });
 
+  it('undoes the last move from the control panel and clears the current selection', async () => {
+    const user = userEvent.setup();
+    const initialState = createEmptyGameState({
+      pieces: [
+        piece({ id: 'red-king', camp: 'red', type: 'king', position: { x: 4, y: 9 } }),
+        piece({ id: 'black-king', camp: 'black', type: 'king', position: { x: 4, y: 0 } }),
+        piece({ id: 'center-blocker', camp: 'red', type: 'pawn', position: { x: 4, y: 5 } }),
+        piece({ id: 'red-rook', camp: 'red', type: 'rook', position: { x: 0, y: 9 } }),
+      ],
+    });
+
+    const { container } = render(<App initialState={initialState} />);
+    const view = within(container);
+    const undoButton = view.getByRole('button', { name: '悔棋' });
+    expect(undoButton).toBeDisabled();
+
+    await user.click(view.getByTestId('cell-0-9'));
+    await user.click(view.getByTestId('cell-0-5'));
+
+    expect(view.getByTestId('cell-0-5')).toHaveTextContent('俥');
+    expect(view.getByText(/当前回合：黑方/)).toBeInTheDocument();
+    expect(undoButton).toBeEnabled();
+
+    const blackKingCell = view.getByTestId('cell-4-0');
+    await user.click(blackKingCell);
+    expect(blackKingCell).toHaveClass('selected');
+
+    await user.click(undoButton);
+
+    expect(view.getByTestId('cell-0-9')).toHaveTextContent('俥');
+    expect(view.getByTestId('cell-0-5')).not.toHaveTextContent('俥');
+    expect(view.getByText(/当前回合：红方/)).toBeInTheDocument();
+    expect(blackKingCell).not.toHaveClass('selected');
+    expect(undoButton).toBeDisabled();
+  });
+
   it('does not expose hidden piece faction styling before a piece is flipped', () => {
     const initialState = createEmptyGameState({
       pieces: [
