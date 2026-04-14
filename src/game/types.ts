@@ -23,6 +23,63 @@ export interface Piece {
   captured: boolean;
 }
 
+export interface HistoryPieceSnapshot {
+  id: string;
+  camp: Camp;
+  type: PieceType;
+  position: Position | null;
+}
+
+export interface FlipHistoryAction {
+  type: 'flip';
+  position: Position;
+  piece: HistoryPieceSnapshot;
+}
+
+export interface MoveHistoryAction {
+  type: 'move';
+  from: Position;
+  to: Position;
+  piece: HistoryPieceSnapshot;
+}
+
+export type GameHistoryAction = FlipHistoryAction | MoveHistoryAction;
+
+export interface CaptureHistoryConsequence {
+  type: 'capture';
+  piece: HistoryPieceSnapshot;
+  position: Position;
+}
+
+export interface CheckHistoryConsequence {
+  type: 'check';
+  camp: Camp;
+}
+
+export type GameHistoryEndgameReason = 'king-captured' | 'checkmate';
+
+export interface EndgameHistoryConsequence {
+  type: 'endgame';
+  winner: Camp;
+  reason: GameHistoryEndgameReason;
+}
+
+export type GameHistoryConsequence =
+  | CaptureHistoryConsequence
+  | CheckHistoryConsequence
+  | EndgameHistoryConsequence;
+
+export interface GameHistoryEntry {
+  turnNumber: number;
+  actor: Camp;
+  action: GameHistoryAction;
+  consequences: GameHistoryConsequence[];
+  nextTurn: Camp | null;
+  checkedCamp: Camp | null;
+  winner: Camp | null;
+  statusMessage: string;
+}
+
 export interface GameState {
   pieces: Piece[];
   currentTurn: Camp;
@@ -30,6 +87,8 @@ export interface GameState {
   checkedCamp: Camp | null;
   lastError: string | null;
   statusMessage: string;
+  actionHistory: GameHistoryEntry[];
+  recentAction: GameHistoryEntry | null;
 }
 
 export interface FlipAction {

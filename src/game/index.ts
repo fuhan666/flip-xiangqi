@@ -3,4 +3,16 @@ export { applyAction, restartGame } from './actions';
 export { createInitialGameState } from './setup';
 export { createEmptyGameState, getPieceAt } from './state';
 export { hasAnyLegalAction, isInCheck, listLegalMoves, validateMove } from './move-rules';
-export type { Camp, GameAction, GameState, Piece, PieceType, Position } from './types';
+export type {
+  Camp,
+  GameAction,
+  GameHistoryAction,
+  GameHistoryConsequence,
+  GameHistoryEndgameReason,
+  GameHistoryEntry,
+  GameState,
+  HistoryPieceSnapshot,
+  Piece,
+  PieceType,
+  Position,
+} from './types';

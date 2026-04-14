@@ -1,5 +1,62 @@
 import { BLACK_KING_POSITION, NON_KING_PIECES, RED_KING_POSITION } from './constants';
-import type { Camp, GameState, Piece, Position } from './types';
+import type {
+  Camp,
+  GameHistoryAction,
+  GameHistoryConsequence,
+  GameHistoryEntry,
+  GameState,
+  HistoryPieceSnapshot,
+  Piece,
+  Position,
+} from './types';
+
+function clonePosition(position: Position | null): Position | null {
+  return position ? { ...position } : null;
+}
+
+function cloneHistoryPieceSnapshot(piece: HistoryPieceSnapshot): HistoryPieceSnapshot {
+  return {
+    ...piece,
+    position: clonePosition(piece.position),
+  };
+}
+
+function cloneHistoryAction(action: GameHistoryAction): GameHistoryAction {
+  if (action.type === 'flip') {
+    return {
+      ...action,
+      position: { ...action.position },
+      piece: cloneHistoryPieceSnapshot(action.piece),
+    };
+  }
+
+  return {
+    ...action,
+    from: { ...action.from },
+    to: { ...action.to },
+    piece: cloneHistoryPieceSnapshot(action.piece),
+  };
+}
+
+function cloneHistoryConsequence(consequence: GameHistoryConsequence): GameHistoryConsequence {
+  if (consequence.type === 'capture') {
+    return {
+      ...consequence,
+      piece: cloneHistoryPieceSnapshot(consequence.piece),
+      position: { ...consequence.position },
+    };
+  }
+
+  return { ...consequence };
+}
+
+function cloneHistoryEntry(entry: GameHistoryEntry): GameHistoryEntry {
+  return {
+    ...entry,
+    action: cloneHistoryAction(entry.action),
+    consequences: entry.consequences.map(cloneHistoryConsequence),
+  };
+}
 
 export function createEmptyGameState(overrides: Partial<GameState> = {}): GameState {
   return {
@@ -9,6 +66,8 @@ export function createEmptyGameState(overrides: Partial<GameState> = {}): GameSt
     checkedCamp: null,
     lastError: null,
     statusMessage: '红方先行',
+    actionHistory: [],
+    recentAction: null,
     ...overrides,
   };
 }
@@ -41,12 +100,17 @@ export function createBasePieces(): Piece[] {
 }
 
 export function cloneState(state: GameState): GameState {
+  const actionHistory = state.actionHistory.map(cloneHistoryEntry);
+  const recentAction = state.recentAction ? cloneHistoryEntry(state.recentAction) : null;
+
   return {
     ...state,
     pieces: state.pieces.map((piece) => ({
       ...piece,
-      position: piece.position ? { ...piece.position } : null,
+      position: clonePosition(piece.position),
     })),
+    actionHistory,
+    recentAction,
   };
 }
 
