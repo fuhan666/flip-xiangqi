@@ -1,5 +1,6 @@
-import { BOARD_HEIGHT, BOARD_WIDTH, PIECE_SYMBOLS } from '../game';
 import type { GameState, Position } from '../game';
+import { BoardScene } from './three/BoardScene';
+import { mapBoardSceneModel } from './three/boardSceneMapper';
 
 interface BoardProps {
   gameState: GameState;
@@ -8,42 +9,42 @@ interface BoardProps {
 }
 
 export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) {
-  return (
-    <div className="board" role="grid" aria-label="翻牌中国象棋棋盘">
-      {Array.from({ length: BOARD_HEIGHT }, (_, y) =>
-        Array.from({ length: BOARD_WIDTH }, (_, x) => {
-          const piece = gameState.pieces.find(
-            (item) => !item.captured && item.position?.x === x && item.position?.y === y,
-          );
-          const isSelected = selectedPosition?.x === x && selectedPosition?.y === y;
-          const classes = ['cell'];
-          if (piece?.revealed) {
-            classes.push(piece.camp);
-          }
-          if (!piece?.revealed) {
-            classes.push('hidden');
-          }
-          if (isSelected) {
-            classes.push('selected');
-          }
+  const sceneModel = mapBoardSceneModel(gameState, selectedPosition);
 
-          return (
-            <button
-              key={`${x}-${y}`}
-              aria-pressed={isSelected}
-              className={classes.join(' ')}
-              data-testid={`cell-${x}-${y}`}
-              onClick={() => onCellClick({ x, y })}
-              type="button"
-            >
-              <span className="coordinate">{x},{y}</span>
-              <span className="piece-text">
-                {piece ? (piece.revealed ? PIECE_SYMBOLS[piece.camp][piece.type] : '暗') : ''}
-              </span>
-            </button>
-          );
-        }),
-      )}
-    </div>
+  return (
+    <section className="board-shell">
+      <div className="board-stage-frame">
+        <BoardScene model={sceneModel} />
+        <div className="board" role="grid" aria-label="翻牌中国象棋棋盘">
+          {sceneModel.cells.map((cell) => {
+            const classes = ['cell'];
+            if (cell.pieceCamp) {
+              classes.push(cell.pieceCamp);
+            }
+            if (cell.isFaceDown) {
+              classes.push('hidden');
+            }
+            if (cell.isSelected) {
+              classes.push('selected');
+            }
+
+            return (
+              <button
+                key={cell.key}
+                aria-label={`第 ${cell.position.x + 1} 列，第 ${cell.position.y + 1} 行`}
+                aria-pressed={cell.isSelected}
+                className={classes.join(' ')}
+                data-testid={cell.testId}
+                onClick={() => onCellClick(cell.position)}
+                type="button"
+              >
+                <span className="coordinate">{cell.coordinateLabel}</span>
+                <span className="piece-text">{cell.pieceLabel}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </section>
   );
 }
