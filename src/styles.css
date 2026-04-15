@@ -66,6 +66,35 @@ button:disabled {
   min-width: 140px;
 }
 
+.board-stage-meta {
+  display: flex;
+  flex: 1 1 280px;
+  align-items: center;
+  gap: 12px;
+  min-width: 240px;
+}
+
+.board-beta-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 6px 12px;
+  background: rgba(244, 219, 167, 0.16);
+  border: 1px solid rgba(244, 219, 167, 0.32);
+  color: #f4dba7;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.board-stage-copy {
+  margin: 0;
+  color: rgba(243, 237, 224, 0.74);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
 .board-turn-label {
   font-size: 12px;
   letter-spacing: 0.08em;
@@ -96,6 +125,8 @@ button:disabled {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  justify-content: flex-end;
+  margin-left: auto;
 }
 
 .board-legend-item {
@@ -166,6 +197,39 @@ button:disabled {
   background:
     radial-gradient(circle at 50% 18%, rgba(255, 223, 163, 0.2), transparent 36%),
     linear-gradient(180deg, #2a1812 0%, #130c0a 100%);
+}
+
+.board-stage--loading {
+  background:
+    radial-gradient(circle at 50% 18%, rgba(255, 223, 163, 0.24), transparent 42%),
+    linear-gradient(180deg, #2a1812 0%, #130c0a 100%);
+}
+
+.board-stage-overlay {
+  position: absolute;
+  left: 20px;
+  right: 20px;
+  bottom: 20px;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(10, 6, 5, 0.48);
+  border: 1px solid rgba(244, 219, 167, 0.18);
+  backdrop-filter: blur(8px);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+}
+
+.board-stage-overlay strong {
+  color: #f4dba7;
+  font-size: 14px;
+}
+
+.board-stage-overlay span {
+  color: rgba(243, 237, 224, 0.82);
+  font-size: 13px;
 }
 
 .board {
@@ -538,6 +602,13 @@ button:disabled {
 @media (max-width: 720px) {
   .app-shell {
     padding: 16px;
+  }
+
+  .board-stage-meta {
+    min-width: 0;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
   }
 
   .board {

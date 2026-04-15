@@ -26,6 +26,10 @@ export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) 
           <span className="board-turn-label">回合焦点</span>
           <strong className="board-turn-value">{currentTurnLabel(gameState)}</strong>
         </div>
+        <div className="board-stage-meta">
+          <span className="board-beta-badge">3D Beta</span>
+          <p className="board-stage-copy">保留语义点击棋盘，Three.js 场景按需懒加载以降低首屏阻塞。</p>
+        </div>
         <ul aria-label="棋盘状态说明" className="board-legend">
           <li className="board-legend-item board-legend-item-hidden">暗子</li>
           <li className="board-legend-item board-legend-item-active">己方明子</li>
