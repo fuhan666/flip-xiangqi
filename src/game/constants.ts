@@ -41,6 +41,29 @@ export const HIDDEN_OPENING_POSITIONS: Position[] = [
   { x: 8, y: 9 },
 ];
 
+export const HIDDEN_OPENING_FORBIDDEN_POSITIONS_BY_TYPE: Partial<Record<PieceType, Position[]>> = {
+  rook: [
+    { x: 4, y: 6 },
+    { x: 4, y: 3 },
+    { x: 3, y: 9 },
+    { x: 5, y: 9 },
+    { x: 3, y: 0 },
+    { x: 5, y: 0 },
+  ],
+  pawn: [
+    { x: 3, y: 9 },
+    { x: 5, y: 9 },
+    { x: 3, y: 0 },
+    { x: 5, y: 0 },
+  ],
+  cannon: [
+    { x: 2, y: 9 },
+    { x: 6, y: 9 },
+    { x: 2, y: 0 },
+    { x: 6, y: 0 },
+  ],
+};
+
 const PIECE_DISTRIBUTION: Array<[PieceType, number]> = [
   ['advisor', 2],
   ['elephant', 2],
