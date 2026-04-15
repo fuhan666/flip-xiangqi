@@ -10,6 +10,7 @@ interface GameResultSummary {
 interface StatusPanelProps {
   currentGameSummary: GameResultSummary | null;
   gameState: GameState;
+  interactionMessage: string | null;
   recentCompletedGames: GameResultSummary[];
 }
 
@@ -17,7 +18,7 @@ function campLabel(camp: GameState['currentTurn']): string {
   return camp === 'red' ? '红方' : '黑方';
 }
 
-export function StatusPanel({ currentGameSummary, gameState, recentCompletedGames }: StatusPanelProps) {
+export function StatusPanel({ currentGameSummary, gameState, interactionMessage, recentCompletedGames }: StatusPanelProps) {
   const currentTurnLabel = gameState.winner ? '对局结束' : campLabel(gameState.currentTurn);
   const checkLabel = gameState.checkedCamp ? `${campLabel(gameState.checkedCamp)}被将军` : '无';
   const winnerLabel = gameState.winner ? `${campLabel(gameState.winner)}胜利` : '进行中';
@@ -43,6 +44,7 @@ export function StatusPanel({ currentGameSummary, gameState, recentCompletedGame
           <strong className="status-value">{winnerLabel}</strong>
         </div>
       </div>
+      {interactionMessage ? <p className="hint" role="status">操作提示：{interactionMessage}</p> : null}
       {currentGameSummary ? (
         <div className="status-summary-card">
           <h3>本局结果</h3>
@@ -74,7 +76,7 @@ export function StatusPanel({ currentGameSummary, gameState, recentCompletedGame
           </ul>
         </div>
       ) : null}
-      {gameState.lastError ? <p className="error">非法操作：{gameState.lastError}</p> : null}
+      {gameState.lastError ? <p className="error" role="alert">非法操作：{gameState.lastError}</p> : null}
     </section>
   );
 }

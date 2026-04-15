@@ -171,6 +171,11 @@ button:disabled {
   text-align: right;
 }
 
+.hint {
+  margin: 12px 0 0;
+  color: #f7d78b;
+}
+
 .status-summary-card {
   margin-top: 16px;
   display: flex;
