@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import App from '../../App';
@@ -109,5 +109,29 @@ describe('interaction feedback', () => {
     expect(screen.getByTestId('cell-0-9')).toHaveAttribute('aria-pressed', 'true');
     expect(container.querySelector('.legal-move')).toBeNull();
     expect(screen.queryByText(/合法落点|可落子|可移动/)).not.toBeInTheDocument();
+  });
+
+  it('surfaces flip feedback in the status panel and marks the flipped cell as the latest action', async () => {
+    const user = userEvent.setup();
+    const initialState = createEmptyGameState({
+      pieces: [
+        piece({ id: 'red-king', camp: 'red', type: 'king', position: { x: 4, y: 9 } }),
+        piece({ id: 'black-king', camp: 'black', type: 'king', position: { x: 4, y: 0 } }),
+        piece({ id: 'center-blocker', camp: 'red', type: 'pawn', position: { x: 4, y: 5 } }),
+        piece({ id: 'hidden-red-rook', camp: 'red', type: 'rook', position: { x: 0, y: 5 }, revealed: false }),
+      ],
+    });
+
+    render(<App initialState={initialState} />);
+
+    await user.click(screen.getByTestId('cell-0-5'));
+
+    const liveFeedback = screen.getByTestId('status-live-feedback');
+    expect(within(liveFeedback).getByText('即时反馈')).toBeInTheDocument();
+    expect(within(liveFeedback).getByText('红方翻开了红方俥')).toBeInTheDocument();
+    expect(within(liveFeedback).getByText('位置：第 1 列，第 6 行')).toBeInTheDocument();
+    expect(within(liveFeedback).getByText('下一手：黑方')).toBeInTheDocument();
+    expect(screen.getByTestId('cell-0-5')).toHaveAttribute('data-recent-action', 'flip');
+    expect(screen.getByTestId('cell-0-5')).toHaveAttribute('data-turn-state', 'opponent');
   });
 });

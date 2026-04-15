@@ -1,7 +1,7 @@
 import { Canvas } from '@react-three/fiber';
 import { useMemo } from 'react';
 import { CanvasTexture } from 'three';
-import type { BoardSceneModel, BoardScenePieceModel } from './boardSceneMapper';
+import type { BoardSceneCellModel, BoardSceneModel, BoardScenePieceModel } from './boardSceneMapper';
 import { SCENE_BOARD_WORLD_HEIGHT, SCENE_BOARD_WORLD_WIDTH, SCENE_CELL_SIZE } from './boardSceneMapper';
 
 interface BoardSceneCanvasProps {
@@ -11,6 +11,114 @@ interface BoardSceneCanvasProps {
 const CELL_TILE_SIZE = SCENE_CELL_SIZE * 0.84;
 const PIECE_RADIUS = SCENE_CELL_SIZE * 0.31;
 const PIECE_HEIGHT = 0.24;
+
+function pieceTexturePalette(piece: BoardScenePieceModel): { fillStyle: string; strokeStyle: string; textColor: string } {
+  if (piece.isHidden) {
+    return {
+      fillStyle: '#6d4a31',
+      strokeStyle: piece.recentAction === 'flip' ? '#f4d287' : '#f2d4a0',
+      textColor: '#f7ecd5',
+    };
+  }
+
+  if (piece.camp === 'red') {
+    return {
+      fillStyle: piece.turnState === 'active' ? '#f1d2a3' : '#e0c398',
+      strokeStyle: piece.isSelected ? '#f6d271' : piece.recentAction !== 'none' ? '#ffd39d' : '#9f5d35',
+      textColor: '#8f1d14',
+    };
+  }
+
+  return {
+    fillStyle: piece.turnState === 'active' ? '#dde6ef' : '#c9d5e1',
+    strokeStyle: piece.isSelected ? '#f6d271' : piece.recentAction !== 'none' ? '#a9d0ff' : '#44566d',
+    textColor: '#223246',
+  };
+}
+
+function pieceBaseColor(piece: BoardScenePieceModel): string {
+  if (piece.isHidden) {
+    return '#705038';
+  }
+
+  if (piece.camp === 'red') {
+    return piece.turnState === 'active' ? '#d39a62' : '#b8814d';
+  }
+
+  return piece.turnState === 'active' ? '#9fb5c8' : '#8699aa';
+}
+
+function pieceMarkerColor(piece: BoardScenePieceModel): string | null {
+  if (piece.recentAction === 'capture') {
+    return '#d86a50';
+  }
+
+  if (piece.recentAction === 'move-to' || piece.recentAction === 'flip') {
+    return '#f0ca79';
+  }
+
+  if (piece.turnState === 'active') {
+    return '#7392b1';
+  }
+
+  return null;
+}
+
+function tileColor(cell: BoardSceneCellModel): string {
+  if (cell.isSelected) {
+    return '#f2c86b';
+  }
+
+  if (cell.recentAction === 'capture') {
+    return '#9d4e3b';
+  }
+
+  if (cell.recentAction === 'move-to' || cell.recentAction === 'flip') {
+    return '#c89a58';
+  }
+
+  if (cell.recentAction === 'move-from') {
+    return '#6e5c43';
+  }
+
+  if (cell.cellState === 'hidden') {
+    return '#6e4930';
+  }
+
+  if (cell.turnState === 'active') {
+    return '#c9a36b';
+  }
+
+  if (cell.turnState === 'opponent') {
+    return '#8d745a';
+  }
+
+  return '#b27e49';
+}
+
+function tileEmissive(cell: BoardSceneCellModel): { color: string; intensity: number } {
+  if (cell.isSelected) {
+    return { color: '#7f5d23', intensity: 0.35 };
+  }
+
+  if (cell.recentAction === 'capture') {
+    return { color: '#6d1f13', intensity: 0.42 };
+  }
+
+  if (cell.recentAction === 'move-to' || cell.recentAction === 'flip') {
+    return { color: '#7b5a1c', intensity: 0.28 };
+  }
+
+  if (cell.recentAction === 'move-from') {
+    return { color: '#314257', intensity: 0.2 };
+  }
+
+  if (cell.turnState === 'active') {
+    return { color: '#65512f', intensity: 0.14 };
+  }
+
+  return { color: '#000000', intensity: 0 };
+}
 
 function createPieceTexture(piece: BoardScenePieceModel): CanvasTexture {
   const canvas = document.createElement('canvas');
@@ -22,9 +130,7 @@ function createPieceTexture(piece: BoardScenePieceModel): CanvasTexture {
     return new CanvasTexture(canvas);
   }
 
-  const fillStyle = piece.isHidden ? '#6d4a31' : piece.camp === 'red' ? '#e7c58b' : '#d2dbe3';
-  const strokeStyle = piece.isSelected ? '#f6d271' : piece.isHidden ? '#f2d4a0' : '#7a5131';
-  const textColor = piece.isHidden ? '#f7ecd5' : piece.camp === 'red' ? '#8f1d14' : '#223246';
+  const { fillStyle, strokeStyle, textColor } = pieceTexturePalette(piece);
 
   context.clearRect(0, 0, canvas.width, canvas.height);
   context.fillStyle = fillStyle;
@@ -54,17 +160,32 @@ function createPieceTexture(piece: BoardScenePieceModel): CanvasTexture {
 function PieceToken({ piece }: { piece: BoardScenePieceModel }) {
   const texture = useMemo(
     () => createPieceTexture(piece),
-    [piece.camp, piece.isHidden, piece.isSelected, piece.label],
+    [piece.camp, piece.isHidden, piece.isSelected, piece.label, piece.recentAction, piece.turnState],
   );
+  const markerColor = pieceMarkerColor(piece);
 
   return (
     <group position={[piece.worldX, 0.26, piece.worldZ]}>
-      <mesh castShadow receiveShadow scale={piece.isSelected ? 1.08 : 1}>
+      {markerColor ? (
+        <mesh position={[0, -PIECE_HEIGHT / 2 - 0.03, 0]} receiveShadow>
+          <cylinderGeometry args={[PIECE_RADIUS * 1.2, PIECE_RADIUS * 1.2, 0.04, 48]} />
+          <meshStandardMaterial
+            color={markerColor}
+            emissive={markerColor}
+            emissiveIntensity={piece.recentAction !== 'none' ? 0.34 : 0.12}
+            metalness={0.08}
+            opacity={piece.recentAction !== 'none' ? 0.88 : 0.52}
+            roughness={0.48}
+            transparent
+          />
+        </mesh>
+      ) : null}
+      <mesh castShadow receiveShadow scale={piece.isSelected ? 1.12 : 1}>
         <cylinderGeometry args={[PIECE_RADIUS, PIECE_RADIUS, PIECE_HEIGHT, 48]} />
         <meshStandardMaterial
-          color={piece.isHidden ? '#705038' : piece.camp === 'red' ? '#b8814d' : '#92a1af'}
-          emissive={piece.isSelected ? '#7c5b1f' : '#000000'}
-          emissiveIntensity={piece.isSelected ? 0.45 : 0}
+          color={pieceBaseColor(piece)}
+          emissive={piece.isSelected ? '#7c5b1f' : markerColor ?? '#000000'}
+          emissiveIntensity={piece.isSelected ? 0.45 : piece.recentAction !== 'none' ? 0.1 : 0}
           metalness={0.22}
           roughness={0.52}
         />
@@ -99,18 +220,22 @@ function SceneContents({ model }: { model: BoardSceneModel }) {
         <meshStandardMaterial color="#2d4768" opacity={0.68} roughness={0.72} transparent />
       </mesh>
 
-      {model.cells.map((cell) => (
-        <mesh castShadow key={cell.key} position={[cell.worldX, 0.04, cell.worldZ]} receiveShadow>
-          <boxGeometry args={[CELL_TILE_SIZE, 0.08, CELL_TILE_SIZE]} />
-          <meshStandardMaterial
-            color={cell.isSelected ? '#f2c86b' : cell.isFaceDown ? '#6e4930' : '#c79255'}
-            emissive={cell.isSelected ? '#7f5d23' : '#000000'}
-            emissiveIntensity={cell.isSelected ? 0.35 : 0}
-            metalness={0.06}
-            roughness={0.76}
-          />
-        </mesh>
-      ))}
+      {model.cells.map((cell) => {
+        const emissive = tileEmissive(cell);
+
+        return (
+          <mesh castShadow key={cell.key} position={[cell.worldX, 0.04, cell.worldZ]} receiveShadow>
+            <boxGeometry args={[CELL_TILE_SIZE, 0.08, CELL_TILE_SIZE]} />
+            <meshStandardMaterial
+              color={tileColor(cell)}
+              emissive={emissive.color}
+              emissiveIntensity={emissive.intensity}
+              metalness={0.06}
+              roughness={0.76}
+            />
+          </mesh>
+        );
+      })}
 
       {model.pieces.map((piece) => (
         <PieceToken key={piece.id} piece={piece} />

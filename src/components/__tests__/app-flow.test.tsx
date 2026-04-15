@@ -137,6 +137,9 @@ describe('app flow', () => {
     await user.click(view.getByTestId('cell-0-5'));
 
     expect(view.getByTestId('cell-0-5')).toHaveTextContent('俥');
+    expect(view.getByTestId('cell-0-9')).toHaveAttribute('data-recent-action', 'move-from');
+    expect(view.getByTestId('cell-0-5')).toHaveAttribute('data-recent-action', 'move-to');
+    expect(view.getByTestId('cell-0-5')).toHaveAttribute('data-turn-state', 'opponent');
     expect(view.getByText('当前回合')).toBeInTheDocument();
     expect(view.getByText('黑方')).toBeInTheDocument();
     expect(undoButton).toBeEnabled();
@@ -149,6 +152,9 @@ describe('app flow', () => {
 
     expect(view.getByTestId('cell-0-9')).toHaveTextContent('俥');
     expect(view.getByTestId('cell-0-5')).not.toHaveTextContent('俥');
+    expect(view.getByTestId('cell-0-9')).toHaveAttribute('data-recent-action', 'none');
+    expect(view.getByTestId('cell-0-9')).toHaveAttribute('data-turn-state', 'active');
+    expect(view.getByTestId('cell-0-5')).toHaveAttribute('data-recent-action', 'none');
     expect(view.getByText('红方')).toBeInTheDocument();
     expect(blackKingCell).not.toHaveClass('selected');
     expect(undoButton).toBeDisabled();
