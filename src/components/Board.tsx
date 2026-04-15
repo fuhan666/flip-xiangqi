@@ -13,6 +13,10 @@ export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) 
 
   return (
     <section className="board-shell">
+      <div className="board-stage-meta">
+        <span className="board-beta-badge">3D Beta</span>
+        <p className="board-stage-copy">保留语义点击棋盘，Three.js 场景按需懒加载以降低首屏阻塞。</p>
+      </div>
       <div className="board-stage-frame">
         <BoardScene model={sceneModel} />
         <div className="board" role="grid" aria-label="翻牌中国象棋棋盘">
