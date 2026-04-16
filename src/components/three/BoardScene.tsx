@@ -3,15 +3,16 @@ import type { BoardSceneModel } from './boardSceneMapper';
 
 interface BoardSceneProps {
   model: BoardSceneModel;
+  onCellClick?: (position: { x: number; y: number }) => void;
 }
 
 const RuntimeBoardScene = lazy(async () => {
   const module = await import('./BoardSceneCanvas');
   return {
-    default: function RuntimeBoardSceneStage({ model }: BoardSceneProps) {
+    default: function RuntimeBoardSceneStage({ model, onCellClick }: BoardSceneProps) {
       return (
         <div aria-label="翻牌中国象棋棋盘 3D 视图" className="board-stage" role="img">
-          <module.BoardSceneCanvas model={model} />
+          <module.BoardSceneCanvas model={model} onCellClick={onCellClick} />
         </div>
       );
     },
@@ -38,14 +39,14 @@ function BoardSceneFallback({ busy }: { busy: boolean }) {
   );
 }
 
-export function BoardScene({ model }: BoardSceneProps) {
+export function BoardScene({ model, onCellClick }: BoardSceneProps) {
   if (isTestEnvironment()) {
     return <BoardSceneFallback busy={false} />;
   }
 
   return (
     <Suspense fallback={<BoardSceneFallback busy />}>
-      <RuntimeBoardScene model={model} />
+      <RuntimeBoardScene model={model} onCellClick={onCellClick} />
     </Suspense>
   );
 }

@@ -39,8 +39,8 @@ export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) 
         </ul>
       </div>
       <div className="board-stage-frame">
-        <BoardScene model={sceneModel} />
-        <div className="board" role="grid" aria-label="翻牌中国象棋棋盘">
+        <BoardScene model={sceneModel} onCellClick={onCellClick} />
+        <div className="board board--hidden" role="grid" aria-label="翻牌中国象棋棋盘">
           {sceneModel.cells.map((cell) => {
             const classes = ['cell'];
             if (cell.pieceCamp) {

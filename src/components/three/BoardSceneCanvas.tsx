@@ -6,6 +6,7 @@ import { SCENE_BOARD_WORLD_HEIGHT, SCENE_BOARD_WORLD_WIDTH, SCENE_CELL_SIZE } fr
 
 interface BoardSceneCanvasProps {
   model: BoardSceneModel;
+  onCellClick?: (position: { x: number; y: number }) => void;
 }
 
 const CELL_TILE_SIZE = SCENE_CELL_SIZE * 0.84;
@@ -157,7 +158,7 @@ function createPieceTexture(piece: BoardScenePieceModel): CanvasTexture {
   return texture;
 }
 
-function PieceToken({ piece }: { piece: BoardScenePieceModel }) {
+function PieceToken({ piece, onCellClick, onPointerOver, onPointerOut }: { piece: BoardScenePieceModel; onCellClick?: (position: { x: number; y: number }) => void; onPointerOver: () => void; onPointerOut: () => void; }) {
   const texture = useMemo(
     () => createPieceTexture(piece),
     [piece.camp, piece.isHidden, piece.isSelected, piece.label, piece.recentAction, piece.turnState],
@@ -165,7 +166,18 @@ function PieceToken({ piece }: { piece: BoardScenePieceModel }) {
   const markerColor = pieceMarkerColor(piece);
 
   return (
-    <group position={[piece.worldX, 0.26, piece.worldZ]}>
+    <group 
+      position={[piece.worldX, 0.26, piece.worldZ]}
+      onClick={(e) => {
+        e.stopPropagation();
+        onCellClick?.(piece.position);
+      }}
+      onPointerOver={(e) => {
+        e.stopPropagation();
+        onPointerOver();
+      }}
+      onPointerOut={onPointerOut}
+    >
       {markerColor ? (
         <mesh position={[0, -PIECE_HEIGHT / 2 - 0.03, 0]} receiveShadow>
           <cylinderGeometry args={[PIECE_RADIUS * 1.2, PIECE_RADIUS * 1.2, 0.04, 48]} />
@@ -198,7 +210,14 @@ function PieceToken({ piece }: { piece: BoardScenePieceModel }) {
   );
 }
 
-function SceneContents({ model }: { model: BoardSceneModel }) {
+function SceneContents({ model, onCellClick }: { model: BoardSceneModel; onCellClick?: (position: { x: number; y: number }) => void }) {
+  const onPointerOver = () => {
+    document.body.style.cursor = 'pointer';
+  };
+  const onPointerOut = () => {
+    document.body.style.cursor = 'auto';
+  };
+
   return (
     <>
       <ambientLight intensity={1.15} />
@@ -224,7 +243,21 @@ function SceneContents({ model }: { model: BoardSceneModel }) {
         const emissive = tileEmissive(cell);
 
         return (
-          <mesh castShadow key={cell.key} position={[cell.worldX, 0.04, cell.worldZ]} receiveShadow>
+          <mesh 
+            castShadow 
+            key={cell.key} 
+            position={[cell.worldX, 0.04, cell.worldZ]} 
+            receiveShadow
+            onClick={(e) => {
+              e.stopPropagation();
+              onCellClick?.(cell.position);
+            }}
+            onPointerOver={(e) => {
+              e.stopPropagation();
+              onPointerOver();
+            }}
+            onPointerOut={onPointerOut}
+          >
             <boxGeometry args={[CELL_TILE_SIZE, 0.08, CELL_TILE_SIZE]} />
             <meshStandardMaterial
               color={tileColor(cell)}
@@ -238,13 +271,19 @@ function SceneContents({ model }: { model: BoardSceneModel }) {
       })}
 
       {model.pieces.map((piece) => (
-        <PieceToken key={piece.id} piece={piece} />
+        <PieceToken 
+          key={piece.id} 
+          piece={piece} 
+          onCellClick={onCellClick} 
+          onPointerOver={onPointerOver}
+          onPointerOut={onPointerOut}
+        />
       ))}
     </>
   );
 }
 
-export function BoardSceneCanvas({ model }: BoardSceneCanvasProps) {
+export function BoardSceneCanvas({ model, onCellClick }: BoardSceneCanvasProps) {
   return (
     <Canvas
       camera={{ fov: 36, position: [0, 8.7, 8.9] }}
@@ -253,7 +292,7 @@ export function BoardSceneCanvas({ model }: BoardSceneCanvasProps) {
       shadows
     >
       <fog attach="fog" args={['#140d0b', 9, 19]} />
-      <SceneContents model={model} />
+      <SceneContents model={model} onCellClick={onCellClick} />
     </Canvas>
   );
 }

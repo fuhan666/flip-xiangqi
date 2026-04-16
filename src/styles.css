@@ -628,3 +628,8 @@ button:disabled {
     padding: 14px;
   }
 }
+
+.board--hidden {
+  pointer-events: none;
+  opacity: 0;
+}
