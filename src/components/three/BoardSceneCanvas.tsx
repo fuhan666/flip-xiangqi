@@ -372,19 +372,7 @@ function PieceToken({
   });
 
   return (
-    <group
-      ref={rootRef}
-      onClick={(event) => {
-        event.stopPropagation();
-        onCellClick?.(piece.position);
-      }}
-      onPointerOut={onPointerOut}
-      onPointerOver={(event) => {
-        event.stopPropagation();
-        onPointerOver();
-      }}
-      position={[piece.worldX, PIECE_BASE_Y, piece.worldZ]}
-    >
+    <group ref={rootRef} position={[piece.worldX, PIECE_BASE_Y, piece.worldZ]}>
       <group ref={selectionRef}>
         {markerColor ? (
           <mesh position={[0, -PIECE_HEIGHT / 2 - 0.03, 0]} receiveShadow>
@@ -420,6 +408,22 @@ function PieceToken({
 
         {piece.isSelected ? <SelectionPulse /> : null}
       </group>
+
+      {/* Invisible hit target so the piece is raycastable as a whole */}
+      <mesh
+        onClick={(event) => {
+          event.stopPropagation();
+          onCellClick?.(piece.position);
+        }}
+        onPointerOut={onPointerOut}
+        onPointerOver={(event) => {
+          event.stopPropagation();
+          onPointerOver();
+        }}
+      >
+        <cylinderGeometry args={[PIECE_RADIUS * 1.25, PIECE_RADIUS * 1.25, PIECE_HEIGHT + 0.1, 48]} />
+        <meshBasicMaterial transparent opacity={0} />
+      </mesh>
     </group>
   );
 }
@@ -473,14 +477,17 @@ function CapturedGhost({
     return null;
   }
 
+  const ghostPointerProps = {
+    onPointerOut,
+    onPointerOver: (event: any) => {
+      event.stopPropagation();
+      onPointerOver();
+    },
+  };
+
   return (
-    <group
-      ref={groupRef}
-      onPointerOut={onPointerOut}
-      onPointerOver={onPointerOver}
-      position={[captured.worldX, PIECE_BASE_Y, captured.worldZ]}
-    >
-      <mesh castShadow receiveShadow>
+    <group ref={groupRef} position={[captured.worldX, PIECE_BASE_Y, captured.worldZ]}>
+      <mesh castShadow receiveShadow {...ghostPointerProps}>
         <cylinderGeometry args={[PIECE_RADIUS, PIECE_RADIUS, PIECE_HEIGHT, 48]} />
         <meshStandardMaterial
           ref={bodyMaterialRef}
@@ -493,7 +500,7 @@ function CapturedGhost({
           transparent
         />
       </mesh>
-      <mesh position={[0, PIECE_HEIGHT / 2 + 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+      <mesh position={[0, PIECE_HEIGHT / 2 + 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]} {...ghostPointerProps}>
         <planeGeometry args={[PIECE_RADIUS * 2.05, PIECE_RADIUS * 2.05]} />
         <meshBasicMaterial ref={faceMaterialRef} map={texture} opacity={0.9} toneMapped={false} transparent />
       </mesh>
