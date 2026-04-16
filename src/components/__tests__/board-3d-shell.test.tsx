@@ -24,8 +24,8 @@ describe('Board 3D shell', () => {
 
     render(<Board gameState={gameState} selectedPosition={{ x: 0, y: 9 }} onCellClick={vi.fn()} />);
 
-    expect(screen.getByText('3D Beta')).toBeInTheDocument();
-    expect(screen.getByText('保留语义点击棋盘，Three.js 场景按需懒加载以降低首屏阻塞。')).toBeInTheDocument();
+    expect(screen.getByText('3D 主视图')).toBeInTheDocument();
+    expect(screen.getByText('棋盘、棋子与交互已全面迁移至 Three.js 3D 场景。')).toBeInTheDocument();
     expect(screen.getByLabelText('翻牌中国象棋棋盘 3D 视图')).toBeInTheDocument();
     expect(screen.getByText('已启用 3D 棋盘静态回退视图。')).toBeInTheDocument();
     expect(screen.getByRole('grid', { name: '翻牌中国象棋棋盘' })).toBeInTheDocument();

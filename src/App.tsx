@@ -142,7 +142,7 @@ export default function App({ initialState }: AppProps) {
     <main className="app-shell">
       <header>
         <h1>翻牌中国象棋</h1>
-        <p>本地双人 3D Beta：翻牌、走子、将军与终局结算。</p>
+        <p>本地双人 3D 对局：翻牌、走子、将军与终局结算。</p>
       </header>
 
       <div className="layout">
