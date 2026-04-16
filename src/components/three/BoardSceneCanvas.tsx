@@ -473,8 +473,8 @@ function CapturedGhost({
   );
 }
 
-const CAMERA_RED: [number, number, number] = [0, 8.7, 8.9];
-const CAMERA_BLACK: [number, number, number] = [0, 8.7, -8.9];
+const CAMERA_RED: [number, number, number] = [0, 17, 20];
+const CAMERA_BLACK: [number, number, number] = [0, 17, -20];
 
 function CameraController({ currentTurn }: { currentTurn: 'red' | 'black' }) {
   const { camera } = useThree();
@@ -583,8 +583,8 @@ function SceneContents({
 
 export function BoardSceneCanvas({ model, onCellClick }: BoardSceneCanvasProps) {
   return (
-    <Canvas camera={{ fov: 36, position: [0, 8.7, 8.9] }} dpr={[1, 1.5]} gl={{ alpha: true, antialias: true }} shadows>
-      <fog attach="fog" args={['#140d0b', 9, 19]} />
+    <Canvas camera={{ fov: 36, position: [0, 17, 20] }} dpr={[1, 1.5]} gl={{ alpha: true, antialias: true }} shadows>
+      <fog attach="fog" args={['#140d0b', 28, 55]} />
       <SceneContents model={model} onCellClick={onCellClick} />
     </Canvas>
   );
