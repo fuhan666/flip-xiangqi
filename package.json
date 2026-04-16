@@ -11,6 +11,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@react-spring/core": "^10.0.3",
+    "@react-spring/three": "^10.0.3",
     "@react-three/fiber": "^9.6.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

@@ -32,6 +32,8 @@ export interface BoardScenePieceModel {
   isSelected: boolean;
   label: string;
   position: Position;
+  previousWorldX: number | null;
+  previousWorldZ: number | null;
   recentAction: BoardSceneRecentAction;
   turnState: BoardSceneTurnState;
   type: PieceType;
@@ -39,8 +41,19 @@ export interface BoardScenePieceModel {
   worldZ: number;
 }
 
+export interface BoardSceneCapturedPieceModel {
+  camp: Camp;
+  id: string;
+  label: string;
+  type: PieceType;
+  worldX: number;
+  worldZ: number;
+}
+
 export interface BoardSceneModel {
   cells: BoardSceneCellModel[];
+  capturedPieces: BoardSceneCapturedPieceModel[];
+  currentTurn: Camp;
   pieces: BoardScenePieceModel[];
 }
 
@@ -155,8 +168,41 @@ export function mapBoardSceneModel(gameState: GameState, selectedPosition: Posit
 
   return {
     cells,
+    capturedPieces: gameState.pieces
+      .filter((piece) => piece.captured)
+      .map((piece) => {
+        const lastPosition = gameState.actionHistory
+          .flatMap((entry) => entry.consequences)
+          .filter((c): c is Extract<typeof c, { type: 'capture' }> => c.type === 'capture' && c.piece.id === piece.id)
+          .map((c) => c.position)[0];
+
+        const worldPosition = lastPosition ? toSceneBoardPosition(lastPosition) : { worldX: 0, worldZ: 0 };
+        return {
+          camp: piece.camp,
+          id: piece.id,
+          label: PIECE_SYMBOLS[piece.camp][piece.type],
+          type: piece.type,
+          worldX: worldPosition.worldX,
+          worldZ: worldPosition.worldZ,
+        } satisfies BoardSceneCapturedPieceModel;
+      }),
+    currentTurn: gameState.currentTurn,
     pieces: pieces.map((piece) => {
       const worldPosition = toSceneBoardPosition(piece.position);
+      const recentActionKey = positionKey(piece.position);
+      const isTarget = recentActionKey === recentActionMarkers.targetKey;
+      let previousWorldX: number | null = null;
+      let previousWorldZ: number | null = null;
+
+      if (isTarget && recentActionMarkers.sourceKey !== null) {
+        const sourcePositionParts = recentActionMarkers.sourceKey.split('-');
+        if (sourcePositionParts.length === 2) {
+          const sourcePos = { x: Number(sourcePositionParts[0]), y: Number(sourcePositionParts[1]) };
+          const sourceWorld = toSceneBoardPosition(sourcePos);
+          previousWorldX = sourceWorld.worldX;
+          previousWorldZ = sourceWorld.worldZ;
+        }
+      }
 
       return {
         camp: piece.camp,
@@ -165,10 +211,9 @@ export function mapBoardSceneModel(gameState: GameState, selectedPosition: Posit
         isSelected: isSelectedPosition(piece.position, selectedPosition),
         label: piece.revealed ? PIECE_SYMBOLS[piece.camp][piece.type] : '暗',
         position: piece.position,
-        recentAction:
-          positionKey(piece.position) === recentActionMarkers.targetKey
-            ? recentActionMarkers.targetMarker
-            : 'none',
+        previousWorldX,
+        previousWorldZ,
+        recentAction: isTarget ? recentActionMarkers.targetMarker : 'none',
         turnState: getTurnState(piece, gameState.currentTurn),
         type: piece.type,
         worldX: worldPosition.worldX,
