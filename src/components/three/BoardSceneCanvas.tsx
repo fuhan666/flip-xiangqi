@@ -1,8 +1,19 @@
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
-import { animated, useSpring } from '@react-spring/three';
-import { useMemo, useRef, useState } from 'react';
-import { CanvasTexture, type Group, type Mesh, type MeshStandardMaterial } from 'three';
-import type { BoardSceneCellModel, BoardSceneCapturedPieceModel, BoardSceneModel, BoardScenePieceModel } from './boardSceneMapper';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  CanvasTexture,
+  MathUtils,
+  type Group,
+  type Mesh,
+  type MeshBasicMaterial,
+  type MeshStandardMaterial,
+} from 'three';
+import type {
+  BoardSceneCellModel,
+  BoardSceneCapturedPieceModel,
+  BoardSceneModel,
+  BoardScenePieceModel,
+} from './boardSceneMapper';
 import { SCENE_BOARD_WORLD_HEIGHT, SCENE_BOARD_WORLD_WIDTH, SCENE_CELL_SIZE } from './boardSceneMapper';
 
 interface BoardSceneCanvasProps {
@@ -13,8 +24,14 @@ interface BoardSceneCanvasProps {
 const CELL_TILE_SIZE = SCENE_CELL_SIZE * 0.84;
 const PIECE_RADIUS = SCENE_CELL_SIZE * 0.31;
 const PIECE_HEIGHT = 0.24;
+const PIECE_BASE_Y = 0.26;
+const MOVE_DURATION = 0.34;
+const CAPTURE_BURST_DURATION = 0.28;
+const CAPTURE_GHOST_DURATION = 0.38;
 
-/* ─── colour helpers (unchanged) ─── */
+function easeOutCubic(value: number): number {
+  return 1 - (1 - value) ** 3;
+}
 
 function pieceTexturePalette(piece: BoardScenePieceModel): { fillStyle: string; strokeStyle: string; textColor: string } {
   if (piece.isHidden) {
@@ -124,9 +141,7 @@ function tileEmissive(cell: BoardSceneCellModel): { color: string; intensity: nu
   return { color: '#000000', intensity: 0 };
 }
 
-/* ─── texture factory ─── */
-
-function createPieceTexture(piece: BoardScenePieceModel): CanvasTexture {
+function createTokenTexture(label: string, fillStyle: string, strokeStyle: string, textColor: string): CanvasTexture {
   const canvas = document.createElement('canvas');
   canvas.width = 256;
   canvas.height = 256;
@@ -135,8 +150,6 @@ function createPieceTexture(piece: BoardScenePieceModel): CanvasTexture {
   if (!context) {
     return new CanvasTexture(canvas);
   }
-
-  const { fillStyle, strokeStyle, textColor } = pieceTexturePalette(piece);
 
   context.clearRect(0, 0, canvas.width, canvas.height);
   context.fillStyle = fillStyle;
@@ -156,54 +169,72 @@ function createPieceTexture(piece: BoardScenePieceModel): CanvasTexture {
   context.font = '700 128px "STKaiti", "Kaiti SC", "PingFang SC", sans-serif';
   context.textAlign = 'center';
   context.textBaseline = 'middle';
-  context.fillText(piece.label, 128, 136);
+  context.fillText(label, 128, 136);
 
   const texture = new CanvasTexture(canvas);
   texture.needsUpdate = true;
   return texture;
 }
 
-/* ─── selection pulse ring ─── */
+function createPieceTexture(piece: BoardScenePieceModel): CanvasTexture {
+  const { fillStyle, strokeStyle, textColor } = pieceTexturePalette(piece);
+  return createTokenTexture(piece.label, fillStyle, strokeStyle, textColor);
+}
+
+function createCapturedPieceTexture(captured: BoardSceneCapturedPieceModel): CanvasTexture {
+  return createTokenTexture(
+    captured.label,
+    captured.camp === 'red' ? '#e0c398' : '#c9d5e1',
+    '#d86a50',
+    captured.camp === 'red' ? '#8f1d14' : '#223246',
+  );
+}
 
 function SelectionPulse() {
   const ringRef = useRef<Mesh>(null);
-  const matRef = useRef<MeshStandardMaterial>(null);
+  const materialRef = useRef<MeshStandardMaterial>(null);
 
   useFrame(({ clock }) => {
-    if (!ringRef.current || !matRef.current) return;
-    const t = clock.getElapsedTime();
-    const pulse = 0.5 + 0.5 * Math.sin(t * 3.5);
-    const s = 1 + 0.06 * pulse;
-    ringRef.current.scale.set(s, 1, s);
-    matRef.current.emissiveIntensity = 0.3 + 0.2 * pulse;
+    if (!ringRef.current || !materialRef.current) {
+      return;
+    }
+
+    const pulse = 0.5 + 0.5 * Math.sin(clock.getElapsedTime() * 3.5);
+    const scale = 1 + 0.06 * pulse;
+    ringRef.current.scale.set(scale, 1, scale);
+    materialRef.current.emissiveIntensity = 0.3 + 0.2 * pulse;
   });
 
   return (
     <mesh ref={ringRef} position={[0, PIECE_HEIGHT / 2 + 0.015, 0]} rotation={[-Math.PI / 2, 0, 0]}>
       <ringGeometry args={[PIECE_RADIUS * 0.92, PIECE_RADIUS * 1.12, 48]} />
       <meshStandardMaterial
-        ref={matRef}
+        ref={materialRef}
         color="#f6d271"
         emissive="#f6d271"
         emissiveIntensity={0.45}
-        transparent
         opacity={0.72}
         side={2}
+        transparent
       />
     </mesh>
   );
 }
 
-/* ─── animated piece token ─── */
-
-function PieceToken({ piece, onCellClick, onPointerOver, onPointerOut }: {
+function PieceToken({
+  piece,
+  onCellClick,
+  onPointerOut,
+  onPointerOver,
+}: {
   piece: BoardScenePieceModel;
   onCellClick?: (position: { x: number; y: number }) => void;
   onPointerOver: () => void;
   onPointerOut: () => void;
 }) {
-  const groupRef = useRef<Group>(null);
-  const [prevHidden, setPrevHidden] = useState(piece.isHidden);
+  const rootRef = useRef<Group>(null);
+  const selectionRef = useRef<Group>(null);
+  const flipRef = useRef<Group>(null);
 
   const texture = useMemo(
     () => createPieceTexture(piece),
@@ -211,219 +242,265 @@ function PieceToken({ piece, onCellClick, onPointerOver, onPointerOut }: {
   );
   const markerColor = pieceMarkerColor(piece);
 
-  /* ── flip animation (X-rotation book-flip) ── */
-  const flipAngle = piece.isHidden ? 0 : Math.PI;
-  const prevFlipAngle = prevHidden ? 0 : Math.PI;
-
-  const { rotX } = useSpring({
-    rotX: flipAngle,
-    from: { rotX: prevFlipAngle },
-    config: { mass: 1.2, tension: 180, friction: 20 },
-    onChange: ({ value }) => {
-      if (piece.isHidden !== prevHidden) {
-        setPrevHidden(piece.isHidden);
-      }
-    },
+  const moveState = useRef({
+    progress: 1,
+    startX: piece.worldX,
+    startZ: piece.worldZ,
+    endX: piece.worldX,
+    endZ: piece.worldZ,
+    arcHeight: 0,
   });
+  const flipState = useRef(piece.isHidden ? 0 : Math.PI);
+  const selectionScale = useRef(piece.isSelected ? 1.1 : 1);
+  const selectionLift = useRef(piece.isSelected ? 0.08 : 0);
+  const captureScale = useRef(1);
+  const captureBurstRemaining = useRef(0);
+  const lastMoveKey = useRef(`${piece.id}:${piece.worldX}:${piece.worldZ}:${piece.recentAction}`);
+  const lastFlipHidden = useRef(piece.isHidden);
+  const lastCaptureKey = useRef(`${piece.id}:idle`);
 
-  /* ── move animation (spring-interpolated position with vertical arc) ── */
-  const startPos = piece.previousWorldX !== null && piece.previousWorldZ !== null
-    ? [piece.previousWorldX, 0.26, piece.previousWorldZ] as [number, number, number]
-    : [piece.worldX, 0.26, piece.worldZ] as [number, number, number];
-  const endPos: [number, number, number] = [piece.worldX, 0.26, piece.worldZ];
+  useEffect(() => {
+    const nextMoveKey = `${piece.id}:${piece.worldX}:${piece.worldZ}:${piece.recentAction}`;
+    const isMoveAction = piece.recentAction === 'move-to' || piece.recentAction === 'capture';
+    const startX = piece.previousWorldX;
+    const startZ = piece.previousWorldZ;
+    const canAnimateMove = isMoveAction && startX !== null && startZ !== null;
 
-  const isMoving = piece.recentAction === 'move-to' || piece.recentAction === 'capture';
+    if (canAnimateMove && nextMoveKey !== lastMoveKey.current) {
+      const distance = Math.hypot(piece.worldX - startX, piece.worldZ - startZ);
+      moveState.current = {
+        progress: 0,
+        startX,
+        startZ,
+        endX: piece.worldX,
+        endZ: piece.worldZ,
+        arcHeight: Math.min(0.16 + distance * 0.2, 0.72),
+      };
+    } else {
+      moveState.current = {
+        progress: 1,
+        startX: piece.worldX,
+        startZ: piece.worldZ,
+        endX: piece.worldX,
+        endZ: piece.worldZ,
+        arcHeight: 0,
+      };
+    }
 
-  const { pos } = useSpring({
-    pos: endPos,
-    from: isMoving ? startPos : endPos,
-    config: { mass: 1, tension: 240, friction: 26 },
-  });
+    lastMoveKey.current = nextMoveKey;
+  }, [piece.id, piece.previousWorldX, piece.previousWorldZ, piece.recentAction, piece.worldX, piece.worldZ]);
 
-  /* ── selection float + scale ── */
-  const { selScale, selY } = useSpring({
-    selScale: piece.isSelected ? 1.1 : 1,
-    selY: piece.isSelected ? 0.08 : 0,
-    config: { mass: 0.6, tension: 320, friction: 22 },
-  });
+  useEffect(() => {
+    if (piece.isHidden !== lastFlipHidden.current) {
+      lastFlipHidden.current = piece.isHidden;
+    }
+  }, [piece.isHidden]);
 
-  /* ── capture burst scale (brief pop then settle) ── */
-  const { captureScale } = useSpring({
-    captureScale: piece.recentAction === 'capture' ? 1.15 : 1,
-    from: { captureScale: piece.recentAction === 'capture' ? 0.85 : 1 },
-    config: { mass: 0.8, tension: 300, friction: 18 },
+  useEffect(() => {
+    const nextCaptureKey = `${piece.id}:${piece.recentAction}:${piece.worldX}:${piece.worldZ}`;
+    if (piece.recentAction === 'capture' && nextCaptureKey !== lastCaptureKey.current) {
+      captureBurstRemaining.current = CAPTURE_BURST_DURATION;
+    }
+    lastCaptureKey.current = nextCaptureKey;
+  }, [piece.id, piece.recentAction, piece.worldX, piece.worldZ]);
+
+  useFrame((_, delta) => {
+    const move = moveState.current;
+    if (move.progress < 1) {
+      move.progress = Math.min(1, move.progress + delta / MOVE_DURATION);
+    }
+
+    const moveProgress = easeOutCubic(move.progress);
+    const worldX = MathUtils.lerp(move.startX, move.endX, moveProgress);
+    const worldZ = MathUtils.lerp(move.startZ, move.endZ, moveProgress);
+    const arcOffset = move.arcHeight * 4 * moveProgress * (1 - moveProgress);
+    rootRef.current?.position.set(worldX, PIECE_BASE_Y + arcOffset, worldZ);
+
+    const targetFlip = piece.isHidden ? 0 : Math.PI;
+    flipState.current = MathUtils.damp(flipState.current, targetFlip, 10, delta);
+    if (flipRef.current) {
+      flipRef.current.rotation.x = flipState.current;
+    }
+
+    const targetSelectionScale = piece.isSelected ? 1.1 : 1;
+    const targetSelectionLift = piece.isSelected ? 0.08 : 0;
+    selectionScale.current = MathUtils.damp(selectionScale.current, targetSelectionScale, 9, delta);
+    selectionLift.current = MathUtils.damp(selectionLift.current, targetSelectionLift, 9, delta);
+    if (selectionRef.current) {
+      selectionRef.current.scale.setScalar(selectionScale.current);
+      selectionRef.current.position.set(0, selectionLift.current, 0);
+    }
+
+    if (captureBurstRemaining.current > 0) {
+      captureBurstRemaining.current = Math.max(0, captureBurstRemaining.current - delta);
+      const burstProgress = 1 - captureBurstRemaining.current / CAPTURE_BURST_DURATION;
+      const burstWave = Math.sin(burstProgress * Math.PI);
+      captureScale.current = 1 + burstWave * 0.15 - (1 - burstWave) * 0.05;
+    } else {
+      captureScale.current = MathUtils.damp(captureScale.current, 1, 12, delta);
+    }
+
+    rootRef.current?.scale.setScalar(captureScale.current);
   });
 
   return (
-    <animated.group
-      ref={groupRef}
-      position={pos.to((x, _y, z) => {
-        const dx = x - endPos[0];
-        const dz = z - endPos[2];
-        const dist = Math.sqrt(dx * dx + dz * dz);
-        const arcH = Math.min(dist * 0.35, 1.2) * Math.sin(Math.min(dist / 3, 1) * Math.PI);
-        return [x, 0.26 + arcH, z] as [number, number, number];
-      })}
-      onClick={(e) => {
-        e.stopPropagation();
+    <group
+      ref={rootRef}
+      onClick={(event) => {
+        event.stopPropagation();
         onCellClick?.(piece.position);
       }}
-      onPointerOver={(e) => {
-        e.stopPropagation();
+      onPointerOut={onPointerOut}
+      onPointerOver={(event) => {
+        event.stopPropagation();
         onPointerOver();
       }}
-      onPointerOut={onPointerOut}
+      position={[piece.worldX, PIECE_BASE_Y, piece.worldZ]}
     >
-      <animated.group scale={captureScale.to((s) => [s, s, s] as [number, number, number])}>
-        <animated.group
-          scale={selScale.to((s) => [s, s, s] as [number, number, number])}
-          position={selY.to((y) => [0, y, 0] as [number, number, number])}
-        >
-          {markerColor ? (
-            <mesh position={[0, -PIECE_HEIGHT / 2 - 0.03, 0]} receiveShadow>
-              <cylinderGeometry args={[PIECE_RADIUS * 1.2, PIECE_RADIUS * 1.2, 0.04, 48]} />
-              <meshStandardMaterial
-                color={markerColor}
-                emissive={markerColor}
-                emissiveIntensity={piece.recentAction !== 'none' ? 0.34 : 0.12}
-                metalness={0.08}
-                opacity={piece.recentAction !== 'none' ? 0.88 : 0.52}
-                roughness={0.48}
-                transparent
-              />
-            </mesh>
-          ) : null}
+      <group ref={selectionRef}>
+        {markerColor ? (
+          <mesh position={[0, -PIECE_HEIGHT / 2 - 0.03, 0]} receiveShadow>
+            <cylinderGeometry args={[PIECE_RADIUS * 1.2, PIECE_RADIUS * 1.2, 0.04, 48]} />
+            <meshStandardMaterial
+              color={markerColor}
+              emissive={markerColor}
+              emissiveIntensity={piece.recentAction !== 'none' ? 0.34 : 0.12}
+              metalness={0.08}
+              opacity={piece.recentAction !== 'none' ? 0.88 : 0.52}
+              roughness={0.48}
+              transparent
+            />
+          </mesh>
+        ) : null}
 
-          {/* flip pivot — rotate around X axis */}
-          <animated.group rotation={rotX.to((r) => [r, 0, 0] as [number, number, number])}>
-            <mesh castShadow receiveShadow>
-              <cylinderGeometry args={[PIECE_RADIUS, PIECE_RADIUS, PIECE_HEIGHT, 48]} />
-              <meshStandardMaterial
-                color={pieceBaseColor(piece)}
-                emissive={piece.isSelected ? '#7c5b1f' : markerColor ?? '#000000'}
-                emissiveIntensity={piece.isSelected ? 0.45 : piece.recentAction !== 'none' ? 0.1 : 0}
-                metalness={0.22}
-                roughness={0.52}
-              />
-            </mesh>
-            <mesh position={[0, PIECE_HEIGHT / 2 + 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-              <planeGeometry args={[PIECE_RADIUS * 2.05, PIECE_RADIUS * 2.05]} />
-              <meshBasicMaterial map={texture} toneMapped={false} transparent />
-            </mesh>
-          </animated.group>
+        <group ref={flipRef}>
+          <mesh castShadow receiveShadow>
+            <cylinderGeometry args={[PIECE_RADIUS, PIECE_RADIUS, PIECE_HEIGHT, 48]} />
+            <meshStandardMaterial
+              color={pieceBaseColor(piece)}
+              emissive={piece.isSelected ? '#7c5b1f' : markerColor ?? '#000000'}
+              emissiveIntensity={piece.isSelected ? 0.45 : piece.recentAction !== 'none' ? 0.1 : 0}
+              metalness={0.22}
+              roughness={0.52}
+            />
+          </mesh>
+          <mesh position={[0, PIECE_HEIGHT / 2 + 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+            <planeGeometry args={[PIECE_RADIUS * 2.05, PIECE_RADIUS * 2.05]} />
+            <meshBasicMaterial map={texture} toneMapped={false} transparent />
+          </mesh>
+        </group>
 
-          {piece.isSelected && <SelectionPulse />}
-        </animated.group>
-      </animated.group>
-    </animated.group>
+        {piece.isSelected ? <SelectionPulse /> : null}
+      </group>
+    </group>
   );
 }
 
-/* ─── capture fade-out ghost ─── */
-
-function CapturedGhost({ captured, onPointerOver, onPointerOut }: {
+function CapturedGhost({
+  captured,
+  onPointerOut,
+  onPointerOver,
+}: {
   captured: BoardSceneCapturedPieceModel;
   onPointerOver: () => void;
   onPointerOut: () => void;
 }) {
   const [visible, setVisible] = useState(true);
-  const texture = useMemo(
-    () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = 256;
-      canvas.height = 256;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return new CanvasTexture(canvas);
-      const isRed = captured.camp === 'red';
-      const fill = isRed ? '#e0c398' : '#c9d5e1';
-      const stroke = '#d86a50';
-      const text = isRed ? '#8f1d14' : '#223246';
-      ctx.clearRect(0, 0, 256, 256);
-      ctx.fillStyle = fill;
-      ctx.strokeStyle = stroke;
-      ctx.lineWidth = 14;
-      ctx.beginPath();
-      ctx.arc(128, 128, 104, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-      ctx.lineWidth = 6;
-      ctx.beginPath();
-      ctx.arc(128, 128, 78, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.fillStyle = text;
-      ctx.font = '700 128px "STKaiti", "Kaiti SC", "PingFang SC", sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(captured.label, 128, 136);
-      const t = new CanvasTexture(canvas);
-      t.needsUpdate = true;
-      return t;
-    },
-    [captured.camp, captured.label],
-  );
+  const texture = useMemo(() => createCapturedPieceTexture(captured), [captured.camp, captured.label]);
+  const groupRef = useRef<Group>(null);
+  const bodyMaterialRef = useRef<MeshStandardMaterial>(null);
+  const faceMaterialRef = useRef<MeshBasicMaterial>(null);
+  const lifeProgress = useRef(0);
 
-  const { ghostOpacity, ghostScale } = useSpring({
-    ghostOpacity: 0,
-    ghostScale: 0.3,
-    from: { ghostOpacity: 0.9, ghostScale: 1.1 },
-    config: { mass: 1, tension: 120, friction: 24 },
-    onRest: () => setVisible(false),
+  useFrame((_, delta) => {
+    if (!visible) {
+      return;
+    }
+
+    lifeProgress.current = Math.min(1, lifeProgress.current + delta / CAPTURE_GHOST_DURATION);
+    const eased = easeOutCubic(lifeProgress.current);
+    const opacity = 0.9 * (1 - eased);
+    const scale = MathUtils.lerp(1.08, 0.32, eased);
+    const lift = MathUtils.lerp(0, 0.18, eased);
+
+    if (groupRef.current) {
+      groupRef.current.position.set(captured.worldX, PIECE_BASE_Y + lift, captured.worldZ);
+      groupRef.current.scale.setScalar(scale);
+    }
+
+    if (bodyMaterialRef.current) {
+      bodyMaterialRef.current.opacity = opacity;
+    }
+
+    if (faceMaterialRef.current) {
+      faceMaterialRef.current.opacity = opacity;
+    }
+
+    if (lifeProgress.current >= 1) {
+      setVisible(false);
+    }
   });
 
-  if (!visible) return null;
+  if (!visible) {
+    return null;
+  }
 
   return (
-    <animated.group
-      position={[captured.worldX, 0.26, captured.worldZ]}
-      scale={ghostScale.to((s) => [s, s, s] as [number, number, number])}
-      onPointerOver={onPointerOver}
+    <group
+      ref={groupRef}
       onPointerOut={onPointerOut}
+      onPointerOver={onPointerOver}
+      position={[captured.worldX, PIECE_BASE_Y, captured.worldZ]}
     >
       <mesh castShadow receiveShadow>
         <cylinderGeometry args={[PIECE_RADIUS, PIECE_RADIUS, PIECE_HEIGHT, 48]} />
-        <animated.meshStandardMaterial
+        <meshStandardMaterial
+          ref={bodyMaterialRef}
           color={captured.camp === 'red' ? '#b8814d' : '#8699aa'}
           emissive="#6d1f13"
           emissiveIntensity={0.5}
           metalness={0.22}
+          opacity={0.9}
           roughness={0.52}
           transparent
-          opacity={ghostOpacity}
         />
       </mesh>
       <mesh position={[0, PIECE_HEIGHT / 2 + 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]}>
         <planeGeometry args={[PIECE_RADIUS * 2.05, PIECE_RADIUS * 2.05]} />
-        <animated.meshBasicMaterial map={texture} toneMapped={false} transparent opacity={ghostOpacity} />
+        <meshBasicMaterial ref={faceMaterialRef} map={texture} opacity={0.9} toneMapped={false} transparent />
       </mesh>
-    </animated.group>
+    </group>
   );
 }
-
-/* ─── camera controller ─── */
 
 const CAMERA_RED: [number, number, number] = [0, 8.7, 8.9];
 const CAMERA_BLACK: [number, number, number] = [0, 8.7, -8.9];
 
 function CameraController({ currentTurn }: { currentTurn: 'red' | 'black' }) {
   const { camera } = useThree();
-  const targetPos = currentTurn === 'red' ? CAMERA_RED : CAMERA_BLACK;
+  const targetPosition = currentTurn === 'red' ? CAMERA_RED : CAMERA_BLACK;
 
-  useFrame(() => {
-    camera.position.x += (targetPos[0] - camera.position.x) * 0.04;
-    camera.position.y += (targetPos[1] - camera.position.y) * 0.04;
-    camera.position.z += (targetPos[2] - camera.position.z) * 0.04;
+  useFrame((_, delta) => {
+    camera.position.x = MathUtils.damp(camera.position.x, targetPosition[0], 4.2, delta);
+    camera.position.y = MathUtils.damp(camera.position.y, targetPosition[1], 4.2, delta);
+    camera.position.z = MathUtils.damp(camera.position.z, targetPosition[2], 4.2, delta);
     camera.lookAt(0, 0, 0);
   });
 
   return null;
 }
 
-/* ─── scene ─── */
-
-function SceneContents({ model, onCellClick }: { model: BoardSceneModel; onCellClick?: (position: { x: number; y: number }) => void }) {
+function SceneContents({
+  model,
+  onCellClick,
+}: {
+  model: BoardSceneModel;
+  onCellClick?: (position: { x: number; y: number }) => void;
+}) {
   const onPointerOver = () => {
     document.body.style.cursor = 'pointer';
   };
+
   const onPointerOut = () => {
     document.body.style.cursor = 'auto';
   };
@@ -458,17 +535,17 @@ function SceneContents({ model, onCellClick }: { model: BoardSceneModel; onCellC
           <mesh
             castShadow
             key={cell.key}
-            position={[cell.worldX, 0.04, cell.worldZ]}
-            receiveShadow
-            onClick={(e) => {
-              e.stopPropagation();
+            onClick={(event) => {
+              event.stopPropagation();
               onCellClick?.(cell.position);
             }}
-            onPointerOver={(e) => {
-              e.stopPropagation();
+            onPointerOut={onPointerOut}
+            onPointerOver={(event) => {
+              event.stopPropagation();
               onPointerOver();
             }}
-            onPointerOut={onPointerOut}
+            position={[cell.worldX, 0.04, cell.worldZ]}
+            receiveShadow
           >
             <boxGeometry args={[CELL_TILE_SIZE, 0.08, CELL_TILE_SIZE]} />
             <meshStandardMaterial
@@ -486,8 +563,8 @@ function SceneContents({ model, onCellClick }: { model: BoardSceneModel; onCellC
         <CapturedGhost
           key={`ghost-${captured.id}`}
           captured={captured}
-          onPointerOver={onPointerOver}
           onPointerOut={onPointerOut}
+          onPointerOver={onPointerOver}
         />
       ))}
 
@@ -496,8 +573,8 @@ function SceneContents({ model, onCellClick }: { model: BoardSceneModel; onCellC
           key={piece.id}
           piece={piece}
           onCellClick={onCellClick}
-          onPointerOver={onPointerOver}
           onPointerOut={onPointerOut}
+          onPointerOver={onPointerOver}
         />
       ))}
     </>
@@ -506,12 +583,7 @@ function SceneContents({ model, onCellClick }: { model: BoardSceneModel; onCellC
 
 export function BoardSceneCanvas({ model, onCellClick }: BoardSceneCanvasProps) {
   return (
-    <Canvas
-      camera={{ fov: 36, position: [0, 8.7, 8.9] }}
-      dpr={[1, 1.5]}
-      gl={{ antialias: true, alpha: true }}
-      shadows
-    >
+    <Canvas camera={{ fov: 36, position: [0, 8.7, 8.9] }} dpr={[1, 1.5]} gl={{ alpha: true, antialias: true }} shadows>
       <fog attach="fog" args={['#140d0b', 9, 19]} />
       <SceneContents model={model} onCellClick={onCellClick} />
     </Canvas>

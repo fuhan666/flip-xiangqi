@@ -72,7 +72,9 @@ describe('mapBoardSceneModel', () => {
     const hiddenCell = model.cells.find((cell) => cell.key === '1-5');
     const movedPiece = model.pieces.find((entry) => entry.id === 'red-rook');
     const blackKing = model.pieces.find((entry) => entry.id === 'black-king');
+    const capturedPiece = model.capturedPieces.find((entry) => entry.id === 'black-pawn');
 
+    expect(model.currentTurn).toBe('black');
     expect(originCell).toMatchObject({
       recentAction: 'move-from',
       turnState: 'neutral',
@@ -89,8 +91,14 @@ describe('mapBoardSceneModel', () => {
       turnState: 'neutral',
     });
     expect(movedPiece).toMatchObject({
+      previousWorldX: -4 * SCENE_CELL_SIZE,
+      previousWorldZ: -4.5 * SCENE_CELL_SIZE,
       recentAction: 'capture',
       turnState: 'opponent',
+    });
+    expect(capturedPiece).toMatchObject({
+      worldX: -4 * SCENE_CELL_SIZE,
+      worldZ: -0.5 * SCENE_CELL_SIZE,
     });
     expect(blackKing).toMatchObject({
       recentAction: 'none',
