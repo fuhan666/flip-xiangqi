@@ -190,6 +190,34 @@ function createCapturedPieceTexture(captured: BoardSceneCapturedPieceModel): Can
   );
 }
 
+function createRiverTexture(): CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = 1536;
+  canvas.height = 256;
+
+  const context = canvas.getContext('2d');
+  if (!context) {
+    return new CanvasTexture(canvas);
+  }
+
+  context.fillStyle = '#b27e49';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+
+  context.strokeStyle = '#5c3a21';
+  context.lineWidth = 6;
+  context.strokeRect(12, 12, canvas.width - 24, canvas.height - 24);
+
+  context.fillStyle = '#2a1710';
+  context.font = '700 132px "STKaiti", "Kaiti SC", "PingFang SC", serif';
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  context.fillText('楚 河 汉 界', canvas.width / 2, canvas.height / 2 + 8);
+
+  const texture = new CanvasTexture(canvas);
+  texture.needsUpdate = true;
+  return texture;
+}
+
 function SelectionPulse() {
   const ringRef = useRef<Mesh>(null);
   const materialRef = useRef<MeshStandardMaterial>(null);
@@ -525,7 +553,7 @@ function SceneContents({
 
       <mesh position={[0, 0.03, 0]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
         <planeGeometry args={[SCENE_BOARD_WORLD_WIDTH + 0.1, SCENE_CELL_SIZE * 1.45]} />
-        <meshStandardMaterial color="#2d4768" opacity={0.68} roughness={0.72} transparent />
+        <meshStandardMaterial map={useMemo(() => createRiverTexture(), [])} roughness={0.78} />
       </mesh>
 
       {model.cells.map((cell) => {

@@ -630,6 +630,7 @@ button:disabled {
 }
 
 .board--hidden {
+  display: none;
   pointer-events: none;
   opacity: 0;
 }

@@ -19,7 +19,7 @@ const RuntimeBoardScene = lazy(async () => {
   };
 });
 
-function isTestEnvironment(): boolean {
+export function isTestEnvironment(): boolean {
   return typeof navigator !== 'undefined' && /jsdom/i.test(navigator.userAgent);
 }
 

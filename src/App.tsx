@@ -59,6 +59,17 @@ function isOwnRevealedPiece(gameState: GameState, position: Position): boolean {
   return Boolean(piece && piece.revealed && piece.camp === gameState.currentTurn);
 }
 
+function hasRevealedOpponentNonKingPieces(gameState: GameState): boolean {
+  return gameState.pieces.some(
+    (piece) =>
+      !piece.captured &&
+      piece.position !== null &&
+      piece.revealed &&
+      piece.camp !== gameState.currentTurn &&
+      piece.type !== 'king',
+  );
+}
+
 export default function App({ initialState }: AppProps) {
   const seedState = useMemo(() => initialState ?? createInitialGameState(), [initialState]);
   const [gameState, setGameState] = useState<GameState>(seedState);
@@ -102,7 +113,11 @@ export default function App({ initialState }: AppProps) {
     }
 
     if (!selectedPosition && piece) {
-      setInteractionMessage('不能直接操作对方明子，请先选择己方明子');
+      if (hasRevealedOpponentNonKingPieces(gameState)) {
+        setInteractionMessage('不能直接操作对方明子，请先选择己方明子');
+      } else {
+        setInteractionMessage('该格当前不可直接操作，请先选择己方明子或翻开暗子');
+      }
       return;
     }
 
