@@ -1,5 +1,7 @@
 import { BOARD_HEIGHT, BOARD_WIDTH, PIECE_SYMBOLS, getPieceAt } from '../game';
 import type { Camp, GameState, Piece, Position } from '../game';
+import { BoardArtwork } from './BoardArtwork';
+import { PieceFace } from './PieceFace';
 
 interface BoardProps {
   gameState: GameState;
@@ -135,8 +137,8 @@ export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) 
           <strong className="board-turn-value">{currentTurnLabel(gameState)}</strong>
         </div>
         <div className="board-stage-meta">
-          <span className="board-beta-badge">2D 棋盘</span>
-          <p className="board-stage-copy">棋盘、棋子与交互均以 2D 网格渲染。</p>
+          <span className="board-beta-badge">操作提示</span>
+          <p className="board-stage-copy">点击暗子翻开；选中己方明子后点击目标位置走子。</p>
         </div>
         <ul aria-label="棋盘状态说明" className="board-legend">
           <li className="board-legend-item board-legend-item-hidden">暗子</li>
@@ -146,37 +148,42 @@ export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) 
           <li className="board-legend-item board-legend-item-recent">最近动作</li>
         </ul>
       </div>
-      <div className="board" role="grid" aria-label="翻牌中国象棋棋盘">
-        {cells.map((cell) => {
-          const classes = ['cell'];
-          if (cell.pieceCamp) {
-            classes.push(cell.pieceCamp);
-          }
-          if (cell.isFaceDown) {
-            classes.push('hidden');
-          }
-          if (cell.isSelected) {
-            classes.push('selected');
-          }
+      <div className="board-frame">
+        <div className="board" role="grid" aria-label="翻牌中国象棋棋盘">
+          <BoardArtwork />
+          {cells.map((cell) => {
+            const classes = ['cell'];
+            if (cell.pieceCamp) {
+              classes.push(cell.pieceCamp);
+            }
+            if (cell.isFaceDown) {
+              classes.push('hidden');
+            }
+            if (cell.isSelected) {
+              classes.push('selected');
+            }
 
-          return (
-            <button
-              key={cell.key}
-              aria-label={`第 ${cell.position.x + 1} 列，第 ${cell.position.y + 1} 行`}
-              aria-pressed={cell.isSelected}
-              className={classes.join(' ')}
-              data-cell-state={cell.cellState}
-              data-recent-action={cell.recentAction}
-              data-testid={cell.testId}
-              data-turn-state={cell.turnState}
-              onClick={() => onCellClick(cell.position)}
-              type="button"
-            >
-              <span className="coordinate">{cell.coordinateLabel}</span>
-              <span className="piece-text">{cell.pieceLabel}</span>
-            </button>
-          );
-        })}
+            return (
+              <button
+                key={cell.key}
+                aria-label={`第 ${cell.position.x + 1} 列，第 ${cell.position.y + 1} 行`}
+                aria-pressed={cell.isSelected}
+                className={classes.join(' ')}
+                data-cell-state={cell.cellState}
+                data-recent-action={cell.recentAction}
+                data-testid={cell.testId}
+                data-turn-state={cell.turnState}
+                onClick={() => onCellClick(cell.position)}
+                type="button"
+              >
+                <span className="coordinate">{cell.coordinateLabel}</span>
+                <PieceFace cellState={cell.cellState} pieceCamp={cell.pieceCamp} pieceLabel={cell.pieceLabel} />
+                <span aria-hidden="true" className="state-ring" />
+                <span className="piece-text">{cell.pieceLabel}</span>
+              </button>
+            );
+          })}
+        </div>
       </div>
     </section>
   );
