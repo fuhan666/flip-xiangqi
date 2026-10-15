@@ -1,12 +1,34 @@
-import type { GameState, Position } from '../game';
-import { BoardScene } from './three/BoardScene';
-import { isTestEnvironment } from './three/BoardScene';
-import { mapBoardSceneModel } from './three/boardSceneMapper';
+import { BOARD_HEIGHT, BOARD_WIDTH, PIECE_SYMBOLS, getPieceAt } from '../game';
+import type { Camp, GameState, Piece, Position } from '../game';
 
 interface BoardProps {
   gameState: GameState;
   selectedPosition: Position | null;
   onCellClick: (position: Position) => void;
+}
+
+type CellState = 'empty' | 'hidden' | 'revealed';
+type TurnState = 'neutral' | 'active' | 'opponent';
+type RecentAction = 'none' | 'flip' | 'move-from' | 'move-to' | 'capture';
+
+interface BoardCellModel {
+  cellState: CellState;
+  coordinateLabel: string;
+  isFaceDown: boolean;
+  isSelected: boolean;
+  key: string;
+  pieceCamp: Camp | null;
+  pieceLabel: string;
+  position: Position;
+  recentAction: RecentAction;
+  testId: string;
+  turnState: TurnState;
+}
+
+interface RecentActionMarkers {
+  sourceKey: string | null;
+  targetKey: string | null;
+  targetMarker: RecentAction;
 }
 
 function currentTurnLabel(gameState: GameState): string {
@@ -17,8 +39,93 @@ function currentTurnLabel(gameState: GameState): string {
   return gameState.currentTurn === 'red' ? '红方回合' : '黑方回合';
 }
 
+function positionKey(position: Position): string {
+  return `${position.x}-${position.y}`;
+}
+
+function getCellState(piece: Piece | undefined): CellState {
+  if (!piece) {
+    return 'empty';
+  }
+
+  return piece.revealed ? 'revealed' : 'hidden';
+}
+
+function getTurnState(piece: Piece | undefined, currentTurn: Camp): TurnState {
+  if (!piece || !piece.revealed) {
+    return 'neutral';
+  }
+
+  return piece.camp === currentTurn ? 'active' : 'opponent';
+}
+
+function getRecentActionMarkers(gameState: GameState): RecentActionMarkers {
+  const recentAction = gameState.recentAction;
+
+  if (!recentAction) {
+    return {
+      sourceKey: null,
+      targetKey: null,
+      targetMarker: 'none',
+    };
+  }
+
+  if (recentAction.action.type === 'flip') {
+    return {
+      sourceKey: null,
+      targetKey: positionKey(recentAction.action.position),
+      targetMarker: 'flip',
+    };
+  }
+
+  return {
+    sourceKey: positionKey(recentAction.action.from),
+    targetKey: positionKey(recentAction.action.to),
+    targetMarker: recentAction.consequences.some((consequence) => consequence.type === 'capture')
+      ? 'capture'
+      : 'move-to',
+  };
+}
+
+function buildBoardCells(gameState: GameState, selectedPosition: Position | null): BoardCellModel[] {
+  const markers = getRecentActionMarkers(gameState);
+  const cells: BoardCellModel[] = [];
+
+  for (let y = 0; y < BOARD_HEIGHT; y += 1) {
+    for (let x = 0; x < BOARD_WIDTH; x += 1) {
+      const position = { x, y };
+      const key = positionKey(position);
+      const piece = getPieceAt(gameState, position);
+      const cellState = getCellState(piece);
+      let recentAction: RecentAction = 'none';
+
+      if (key === markers.sourceKey) {
+        recentAction = 'move-from';
+      } else if (key === markers.targetKey) {
+        recentAction = markers.targetMarker;
+      }
+
+      cells.push({
+        cellState,
+        coordinateLabel: `${x},${y}`,
+        isFaceDown: cellState === 'hidden',
+        isSelected: position.x === selectedPosition?.x && position.y === selectedPosition?.y,
+        key,
+        pieceCamp: piece?.revealed ? piece.camp : null,
+        pieceLabel: piece ? (piece.revealed ? PIECE_SYMBOLS[piece.camp][piece.type] : '暗') : '',
+        position,
+        recentAction,
+        testId: `cell-${x}-${y}`,
+        turnState: getTurnState(piece, gameState.currentTurn),
+      });
+    }
+  }
+
+  return cells;
+}
+
 export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) {
-  const sceneModel = mapBoardSceneModel(gameState, selectedPosition);
+  const cells = buildBoardCells(gameState, selectedPosition);
 
   return (
     <section className="board-shell" data-turn={gameState.winner ? 'finished' : gameState.currentTurn}>
@@ -28,8 +135,8 @@ export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) 
           <strong className="board-turn-value">{currentTurnLabel(gameState)}</strong>
         </div>
         <div className="board-stage-meta">
-          <span className="board-beta-badge">3D 主视图</span>
-          <p className="board-stage-copy">棋盘、棋子与交互已全面迁移至 Three.js 3D 场景。</p>
+          <span className="board-beta-badge">2D 棋盘</span>
+          <p className="board-stage-copy">棋盘、棋子与交互均以 2D 网格渲染。</p>
         </div>
         <ul aria-label="棋盘状态说明" className="board-legend">
           <li className="board-legend-item board-legend-item-hidden">暗子</li>
@@ -39,42 +146,37 @@ export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) 
           <li className="board-legend-item board-legend-item-recent">最近动作</li>
         </ul>
       </div>
-      <div className="board-stage-frame">
-        <BoardScene model={sceneModel} onCellClick={onCellClick} />
-        {isTestEnvironment() ? (
-          <div className="board" role="grid" aria-label="翻牌中国象棋棋盘">
-            {sceneModel.cells.map((cell) => {
-              const classes = ['cell'];
-              if (cell.pieceCamp) {
-                classes.push(cell.pieceCamp);
-              }
-              if (cell.isFaceDown) {
-                classes.push('hidden');
-              }
-              if (cell.isSelected) {
-                classes.push('selected');
-              }
+      <div className="board" role="grid" aria-label="翻牌中国象棋棋盘">
+        {cells.map((cell) => {
+          const classes = ['cell'];
+          if (cell.pieceCamp) {
+            classes.push(cell.pieceCamp);
+          }
+          if (cell.isFaceDown) {
+            classes.push('hidden');
+          }
+          if (cell.isSelected) {
+            classes.push('selected');
+          }
 
-              return (
-                <button
-                  key={cell.key}
-                  aria-label={`第 ${cell.position.x + 1} 列，第 ${cell.position.y + 1} 行`}
-                  aria-pressed={cell.isSelected}
-                  className={classes.join(' ')}
-                  data-cell-state={cell.cellState}
-                  data-recent-action={cell.recentAction}
-                  data-testid={cell.testId}
-                  data-turn-state={cell.turnState}
-                  onClick={() => onCellClick(cell.position)}
-                  type="button"
-                >
-                  <span className="coordinate">{cell.coordinateLabel}</span>
-                  <span className="piece-text">{cell.pieceLabel}</span>
-                </button>
-              );
-            })}
-          </div>
-        ) : null}
+          return (
+            <button
+              key={cell.key}
+              aria-label={`第 ${cell.position.x + 1} 列，第 ${cell.position.y + 1} 行`}
+              aria-pressed={cell.isSelected}
+              className={classes.join(' ')}
+              data-cell-state={cell.cellState}
+              data-recent-action={cell.recentAction}
+              data-testid={cell.testId}
+              data-turn-state={cell.turnState}
+              onClick={() => onCellClick(cell.position)}
+              type="button"
+            >
+              <span className="coordinate">{cell.coordinateLabel}</span>
+              <span className="piece-text">{cell.pieceLabel}</span>
+            </button>
+          );
+        })}
       </div>
     </section>
   );

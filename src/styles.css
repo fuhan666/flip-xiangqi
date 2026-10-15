@@ -169,11 +169,16 @@ button:disabled {
   color: #ffb88f;
 }
 
-.board-stage-frame {
-  position: relative;
+.board {
   width: 100%;
   aspect-ratio: 9 / 10;
   overflow: hidden;
+  display: grid;
+  grid-template-columns: repeat(9, minmax(0, 1fr));
+  grid-template-rows: repeat(10, minmax(0, 1fr));
+  gap: 7px;
+  padding: 16px;
+  box-sizing: border-box;
   border-radius: 28px;
   background:
     radial-gradient(circle at top, rgba(255, 226, 183, 0.18), transparent 45%),
@@ -182,64 +187,6 @@ button:disabled {
   box-shadow:
     0 24px 80px rgba(0, 0, 0, 0.34),
     inset 0 1px 0 rgba(255, 255, 255, 0.06);
-}
-
-.board-stage {
-  position: absolute;
-  inset: 0;
-}
-
-.board-stage canvas {
-  display: block;
-}
-
-.board-stage--static {
-  background:
-    radial-gradient(circle at 50% 18%, rgba(255, 223, 163, 0.2), transparent 36%),
-    linear-gradient(180deg, #2a1812 0%, #130c0a 100%);
-}
-
-.board-stage--loading {
-  background:
-    radial-gradient(circle at 50% 18%, rgba(255, 223, 163, 0.24), transparent 42%),
-    linear-gradient(180deg, #2a1812 0%, #130c0a 100%);
-}
-
-.board-stage-overlay {
-  position: absolute;
-  left: 20px;
-  right: 20px;
-  bottom: 20px;
-  z-index: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 14px 16px;
-  border-radius: 16px;
-  background: rgba(10, 6, 5, 0.48);
-  border: 1px solid rgba(244, 219, 167, 0.18);
-  backdrop-filter: blur(8px);
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
-}
-
-.board-stage-overlay strong {
-  color: #f4dba7;
-  font-size: 14px;
-}
-
-.board-stage-overlay span {
-  color: rgba(243, 237, 224, 0.82);
-  font-size: 13px;
-}
-
-.board {
-  position: absolute;
-  inset: 16px;
-  z-index: 1;
-  display: grid;
-  grid-template-columns: repeat(9, minmax(0, 1fr));
-  grid-template-rows: repeat(10, minmax(0, 1fr));
-  gap: 7px;
 }
 
 .cell {
@@ -612,8 +559,8 @@ button:disabled {
   }
 
   .board {
-    inset: 12px;
     gap: 6px;
+    padding: 12px;
   }
 
   .board-shell-header {
@@ -627,10 +574,4 @@ button:disabled {
   .panel {
     padding: 14px;
   }
-}
-
-.board--hidden {
-  display: none;
-  pointer-events: none;
-  opacity: 0;
 }
