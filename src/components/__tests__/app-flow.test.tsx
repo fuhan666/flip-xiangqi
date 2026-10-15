@@ -106,6 +106,11 @@ describe('app flow', () => {
     expect(screen.getByTestId('cell-0-5')).toHaveTextContent('俥');
     expect(screen.getByText('红方移动红方俥')).toBeInTheDocument();
     expect(screen.getByText('路线：第 1 列，第 10 行 -> 第 1 列，第 6 行')).toBeInTheDocument();
+
+    const liveFeedback = screen.getByTestId('status-live-feedback');
+    expect(within(liveFeedback).getByText('刚刚走子')).toBeInTheDocument();
+    expect(within(liveFeedback).getByText('落点：第 1 列，第 6 行')).toBeInTheDocument();
+
     expect(screen.getByText('当前回合')).toBeInTheDocument();
     expect(screen.getByText('黑方')).toBeInTheDocument();
 
