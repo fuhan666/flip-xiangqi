@@ -199,4 +199,72 @@ describe('Board', () => {
     expect(container.querySelector('.board-stage')).toBeNull();
     expect(container.querySelectorAll('.board')).toHaveLength(1);
   });
+
+  it('renders identical DOM for hidden pieces regardless of their real identity', () => {
+    const renderHiddenCellHtml = (hiddenPiece: Piece): string => {
+      const gameState = createEmptyGameState({
+        pieces: [
+          piece({ id: 'red-king', camp: 'red', type: 'king', position: { x: 4, y: 9 } }),
+          piece({ id: 'black-king', camp: 'black', type: 'king', position: { x: 4, y: 0 } }),
+          hiddenPiece,
+        ],
+      });
+
+      const { container, unmount } = render(<Board gameState={gameState} selectedPosition={null} onCellClick={vi.fn()} />);
+      const html = container.querySelector('[data-testid="cell-0-5"]')?.outerHTML ?? '';
+      unmount();
+      return html;
+    };
+
+    const hiddenRedRookHtml = renderHiddenCellHtml(
+      piece({ id: 'hidden-red-rook', camp: 'red', type: 'rook', position: { x: 0, y: 5 }, revealed: false }),
+    );
+    const hiddenBlackPawnHtml = renderHiddenCellHtml(
+      piece({ id: 'hidden-black-pawn', camp: 'black', type: 'pawn', position: { x: 0, y: 5 }, revealed: false }),
+    );
+
+    expect(hiddenRedRookHtml).not.toBe('');
+    expect(hiddenRedRookHtml).toBe(hiddenBlackPawnHtml);
+    expect(hiddenRedRookHtml).toContain('暗');
+    expect(hiddenRedRookHtml).not.toContain('俥');
+    expect(hiddenRedRookHtml).not.toContain('車');
+    expect(hiddenRedRookHtml).not.toContain('卒');
+    expect(hiddenRedRookHtml).not.toMatch(/title=|data-piece|data-camp|data-type/);
+    expect(hiddenRedRookHtml).not.toContain('piece-face-revealed');
+    expect(hiddenRedRookHtml).not.toContain('piece-face-red');
+    expect(hiddenRedRookHtml).not.toContain('piece-face-black');
+    expect(hiddenRedRookHtml).toContain('piece-face-hidden');
+  });
+
+  it('reveals piece identity text and camp class only after the flip', () => {
+    const startingState = createEmptyGameState({
+      pieces: [
+        piece({ id: 'red-king', camp: 'red', type: 'king', position: { x: 4, y: 9 } }),
+        piece({ id: 'black-king', camp: 'black', type: 'king', position: { x: 4, y: 0 } }),
+        piece({ id: 'center-blocker', camp: 'red', type: 'pawn', position: { x: 4, y: 5 } }),
+        piece({ id: 'hidden-black-horse', camp: 'black', type: 'horse', position: { x: 0, y: 5 }, revealed: false }),
+      ],
+    });
+
+    const hiddenCellHtml = (() => {
+      const { container, unmount } = render(
+        <Board gameState={startingState} selectedPosition={null} onCellClick={vi.fn()} />,
+      );
+      const html = container.querySelector('[data-testid="cell-0-5"]')?.outerHTML ?? '';
+      unmount();
+      return html;
+    })();
+
+    expect(hiddenCellHtml).not.toContain('馬');
+
+    const gameState = applyAction(startingState, { type: 'flip', position: { x: 0, y: 5 } });
+    render(<Board gameState={gameState} selectedPosition={null} onCellClick={vi.fn()} />);
+
+    const flippedCell = screen.getByTestId('cell-0-5');
+    expect(flippedCell).toHaveClass('black');
+    expect(flippedCell).toHaveTextContent('馬');
+    expect(flippedCell.querySelector('.piece-text')).toHaveTextContent('馬');
+    expect(flippedCell.querySelector('.piece-face-hidden')).toBeNull();
+    expect(flippedCell.querySelector('.piece-face-revealed')).not.toBeNull();
+  });
 });
