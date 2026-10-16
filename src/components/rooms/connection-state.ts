@@ -9,4 +9,7 @@ export const IDLE_CONNECTION_STATE: ConnectionState = {
   role: null,
   members: [],
   closedReason: null,
+  lobby: null,
+  lastRejection: null,
+  pendingCommand: null,
 };

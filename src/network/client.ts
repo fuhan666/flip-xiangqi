@@ -6,23 +6,35 @@
  * - 取消或再次连接时，旧 socket 与计时器的回调一律忽略（代际计数）。
  */
 import { formatAddress, toWebSocketUrl, type ParsedAddress } from './address';
-import { describeErrorCode, describeRoomClosed } from './errors';
+import { describeErrorCode, describeLobbyReject, describeRoomClosed } from './errors';
 import {
   buildClientHello,
   buildClientLeave,
+  buildClientLobbyLock,
+  buildClientLobbyReady,
+  buildClientLobbySettings,
+  buildClientLobbyStart,
   closeCodeForError,
   encodeMessage,
   parseServerMessage,
   serverErrorCodeForCloseCode,
   PROTOCOL_VERSION,
+  type ClientMessage,
   type ErrorCode,
+  type LobbyRejection,
   type MemberSnapshot,
   type Role,
   type RoomClosedReason,
   type ServerErrorCode,
+  type SidePreference,
+  type TimeControlId,
 } from './protocol';
+import type { LobbyState } from './lobby';
 
 export type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error';
+
+/** 大厅请求类别：同一时刻只保留一个在途请求，用于防连点。 */
+export type LobbyRequestKind = 'settings' | 'lock' | 'ready' | 'start';
 
 export interface ConnectionState {
   status: ConnectionStatus;
@@ -35,6 +47,12 @@ export interface ConnectionState {
   role: Role | null;
   members: MemberSnapshot[];
   closedReason: RoomClosedReason | null;
+  /** 服务端权威大厅快照（welcome 与 lobby.state 携带同一份结构）。 */
+  lobby: LobbyState | null;
+  /** 最近一次大厅操作拒绝（非致命，连接保持）。 */
+  lastRejection: LobbyRejection | null;
+  /** 在途大厅请求；收到权威状态或拒绝后清空。 */
+  pendingCommand: LobbyRequestKind | null;
 }
 
 export interface JoinOptions {
@@ -62,6 +80,14 @@ export interface RoomConnection {
   getState(): ConnectionState;
   /** 当前连接的地址（握手成功或连接中），供「最近房间」记录使用。 */
   getAddress(): string | null;
+  /** 房主修改分先/局时设置（服务端权威校验，客人调用会被非致命拒绝）。 */
+  sendLobbySettings(sidePreference: SidePreference, timeControlId: TimeControlId): void;
+  /** 房主锁定/解锁设置。 */
+  sendLobbyLock(locked: boolean): void;
+  /** 本人准备/取消准备（绑定当前设置版本，服务端拒绝过期准备）。 */
+  sendLobbyReady(ready: boolean): void;
+  /** 房主请求开始对局（服务端执行门禁并一次性冻结开局参数）。 */
+  sendLobbyStart(): void;
 }
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 8_000;
@@ -76,6 +102,9 @@ const IDLE_STATE: ConnectionState = {
   role: null,
   members: [],
   closedReason: null,
+  lobby: null,
+  lastRejection: null,
+  pendingCommand: null,
 };
 
 function defaultWebSocketFactory(url: string): WebSocketLike {
@@ -209,6 +238,53 @@ export class RoomClient implements RoomConnection {
     return this.joinedAddress;
   }
 
+  sendLobbySettings(sidePreference: SidePreference, timeControlId: TimeControlId): void {
+    const roomId = this.state.roomId;
+    if (!roomId) {
+      return;
+    }
+    this.sendLobbyRequest('settings', buildClientLobbySettings(roomId, { sidePreference, timeControlId }));
+  }
+
+  sendLobbyLock(locked: boolean): void {
+    const roomId = this.state.roomId;
+    if (!roomId) {
+      return;
+    }
+    this.sendLobbyRequest('lock', buildClientLobbyLock(roomId, locked));
+  }
+
+  sendLobbyReady(ready: boolean): void {
+    const roomId = this.state.roomId;
+    const settingsVersion = this.state.lobby?.settings.settingsVersion;
+    if (!roomId || typeof settingsVersion !== 'number') {
+      return;
+    }
+    this.sendLobbyRequest('ready', buildClientLobbyReady(roomId, ready, settingsVersion));
+  }
+
+  sendLobbyStart(): void {
+    const roomId = this.state.roomId;
+    if (!roomId) {
+      return;
+    }
+    this.sendLobbyRequest('start', buildClientLobbyStart(roomId));
+  }
+
+  /** 发送大厅请求：记录在途类别供界面防连点；发送失败按本地错误提示，不动连接。 */
+  private sendLobbyRequest(kind: LobbyRequestKind, message: ClientMessage): void {
+    const socket = this.socket;
+    if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
+      return;
+    }
+    try {
+      socket.send(encodeMessage(message));
+    } catch {
+      return;
+    }
+    this.setState({ ...this.state, pendingCommand: kind, lastRejection: null });
+  }
+
   private handleMessage(generation: number, raw: unknown): void {
     if (typeof raw !== 'string') {
       this.fail(generation, 'INVALID_MESSAGE');
@@ -234,12 +310,31 @@ export class RoomClient implements RoomConnection {
         role: message.payload.role,
         members: message.payload.members,
         closedReason: null,
+        lobby: message.payload.lobby,
+        lastRejection: null,
+        pendingCommand: null,
       });
       return;
     }
 
     if (message.type === 'members') {
       this.setState({ ...this.state, members: message.payload.members });
+      return;
+    }
+
+    if (message.type === 'lobby.state') {
+      // 权威状态到达即认为在途请求已有结果，同时清除上一条拒绝提示。
+      this.setState({ ...this.state, lobby: message.payload.lobby, lastRejection: null, pendingCommand: null });
+      return;
+    }
+
+    if (message.type === 'lobby.rejected') {
+      const { code } = message.payload;
+      this.setState({
+        ...this.state,
+        lastRejection: { code, message: describeLobbyReject(code) },
+        pendingCommand: null,
+      });
       return;
     }
 

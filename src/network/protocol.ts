@@ -4,19 +4,36 @@
  * 该文件必须保持纯 TypeScript（不依赖 Node API 与 DOM API），
  * 以便同时被浏览器客户端与 Node 宿主服务引用。
  */
+import {
+  isSidePreference,
+  isTimeControlId,
+  parseLobbyState,
+  type LobbyRejectCode,
+  type LobbyState,
+  type SidePreference,
+  type TimeControlId,
+} from './lobby.js';
 
-export const PROTOCOL_VERSION = 1;
+// 线格式使用的领域类型从协议入口统一再导出，调用方无需两个导入源。
+export type { LobbyRejectCode, LobbyState, SidePreference, TimeControlId } from './lobby.js';
+
+/** v2：welcome 携带完整大厅快照，并新增 lobby.* 消息族。 */
+export const PROTOCOL_VERSION = 2;
 
 /** WebSocket 握手路径（房间服务同时在该路径上提供客人页面）。 */
 export const WS_PATH = '/ws';
 
 export type Role = 'host' | 'guest';
 
+/** 成员离开原因：主动离开或意外掉线，用于卡片上的原因标注。 */
+export type MemberLeaveReason = 'left' | 'dropped';
+
 export interface MemberSnapshot {
   id: string;
   role: Role;
   name: string;
   connected: boolean;
+  leaveReason?: MemberLeaveReason;
 }
 
 export type RoomClosedReason = 'host-closed' | 'host-disconnected' | 'server-stopped';
@@ -85,15 +102,33 @@ export interface HelloPayload {
 
 export type ClientMessage =
   | (Envelope & { type: 'hello'; roomId: null | string; payload: HelloPayload })
-  | (Envelope & { type: 'leave'; roomId: string; payload: Record<string, never> });
+  | (Envelope & { type: 'leave'; roomId: string; payload: Record<string, never> })
+  | (Envelope & { type: 'lobby.settings'; roomId: string; payload: { sidePreference: SidePreference; timeControlId: TimeControlId } })
+  | (Envelope & { type: 'lobby.lock'; roomId: string; payload: { locked: boolean } })
+  | (Envelope & { type: 'lobby.ready'; roomId: string; payload: { ready: boolean; settingsVersion: number } })
+  | (Envelope & { type: 'lobby.start'; roomId: string; payload: Record<string, never> });
+
+export interface LobbyRejection {
+  code: LobbyRejectCode;
+  message: string;
+}
 
 export type ServerMessage =
   | (Envelope & {
       type: 'welcome';
       roomId: string;
-      payload: { roomId: string; memberId: string; role: Role; name: string; members: MemberSnapshot[] };
+      payload: {
+        roomId: string;
+        memberId: string;
+        role: Role;
+        name: string;
+        members: MemberSnapshot[];
+        lobby: LobbyState;
+      };
     })
   | (Envelope & { type: 'members'; roomId: string; payload: { members: MemberSnapshot[] } })
+  | (Envelope & { type: 'lobby.state'; roomId: string; payload: { lobby: LobbyState } })
+  | (Envelope & { type: 'lobby.rejected'; roomId: string; payload: LobbyRejection })
   | (Envelope & { type: 'room.closed'; roomId: string; payload: { reason: RoomClosedReason } })
   | (Envelope & { type: 'error'; roomId: string | null; payload: { code: ServerErrorCode; message: string } });
 
@@ -192,6 +227,58 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
     return { ok: true, message: { ...message, type: 'leave', roomId: message.roomId, payload: {} } };
   }
 
+  if (message.type === 'lobby.settings') {
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'lobby-settings-room-id' };
+    }
+    if (!isSidePreference(payload.sidePreference) || !isTimeControlId(payload.timeControlId)) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'lobby-settings-values' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'lobby.settings',
+        roomId: message.roomId,
+        payload: { sidePreference: payload.sidePreference, timeControlId: payload.timeControlId },
+      },
+    };
+  }
+
+  if (message.type === 'lobby.lock') {
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'lobby-lock-room-id' };
+    }
+    if (typeof payload.locked !== 'boolean') {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'lobby-lock-value' };
+    }
+    return { ok: true, message: { ...message, type: 'lobby.lock', roomId: message.roomId, payload: { locked: payload.locked } } };
+  }
+
+  if (message.type === 'lobby.ready') {
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'lobby-ready-room-id' };
+    }
+    const { ready, settingsVersion } = payload;
+    if (typeof ready !== 'boolean' || typeof settingsVersion !== 'number' || !Number.isInteger(settingsVersion) || settingsVersion < 1) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'lobby-ready-value' };
+    }
+    return {
+      ok: true,
+      message: { ...message, type: 'lobby.ready', roomId: message.roomId, payload: { ready, settingsVersion } },
+    };
+  }
+
+  if (message.type === 'lobby.start') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'lobby-start-room-id' };
+    }
+    return { ok: true, message: { ...message, type: 'lobby.start', roomId: message.roomId, payload: {} } };
+  }
+
   return { ok: false, code: 'INVALID_MESSAGE', detail: `unknown-type=${message.type}` };
 }
 
@@ -213,7 +300,8 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'welcome-role' };
     }
     const members = parseMembers(payload.members);
-    if (!members) {
+    const lobby = parseLobbyState(payload.lobby);
+    if (!members || !lobby) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'welcome-members' };
     }
     return {
@@ -228,7 +316,33 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
           role: payload.role,
           name: typeof payload.name === 'string' ? payload.name : payload.role === 'host' ? '房主' : '客人',
           members,
+          lobby,
         },
+      },
+    };
+  }
+
+  if (message.type === 'lobby.state') {
+    const lobby = parseLobbyState((message.payload as Record<string, unknown>).lobby);
+    if (!lobby || typeof message.roomId !== 'string') {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'lobby-state-payload' };
+    }
+    return { ok: true, message: { ...message, type: 'lobby.state', roomId: message.roomId, payload: { lobby } } };
+  }
+
+  if (message.type === 'lobby.rejected') {
+    const payload = message.payload as Record<string, unknown>;
+    const code = payload.code;
+    if (!isLobbyRejectCode(code)) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'lobby-rejected-code' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'lobby.rejected',
+        roomId: message.roomId ?? '',
+        payload: { code, message: typeof payload.message === 'string' ? payload.message : '' },
       },
     };
   }
@@ -283,6 +397,18 @@ export function isServerErrorCode(value: unknown): value is ServerErrorCode {
   );
 }
 
+export function isLobbyRejectCode(value: unknown): value is LobbyRejectCode {
+  return (
+    value === 'NOT_HOST' ||
+    value === 'LOCKED' ||
+    value === 'INVALID_VALUE' ||
+    value === 'STALE_VERSION' ||
+    value === 'NOT_READY' ||
+    value === 'MEMBER_MISSING' ||
+    value === 'ALREADY_STARTED'
+  );
+}
+
 function parseMembers(value: unknown): MemberSnapshot[] | null {
   if (!Array.isArray(value)) {
     return null;
@@ -292,11 +418,14 @@ function parseMembers(value: unknown): MemberSnapshot[] | null {
     if (!isRecord(entry)) {
       return null;
     }
-    const { id, role, name, connected } = entry;
+    const { id, role, name, connected, leaveReason } = entry;
     if (typeof id !== 'string' || (role !== 'host' && role !== 'guest') || typeof name !== 'string' || typeof connected !== 'boolean') {
       return null;
     }
-    members.push({ id, role, name, connected });
+    if (leaveReason !== undefined && leaveReason !== 'left' && leaveReason !== 'dropped') {
+      return null;
+    }
+    members.push({ id, role, name, connected, ...(leaveReason ? { leaveReason } : {}) });
   }
   return members;
 }
@@ -320,6 +449,30 @@ export function buildClientHello(input: { role: Role; name: string; token?: stri
 
 export function buildClientLeave(roomId: string): ClientMessage {
   return { version: PROTOCOL_VERSION, type: 'leave', roomId, payload: {} };
+}
+
+export function buildClientLobbySettings(
+  roomId: string,
+  input: { sidePreference: SidePreference; timeControlId: TimeControlId },
+): ClientMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'lobby.settings',
+    roomId,
+    payload: { sidePreference: input.sidePreference, timeControlId: input.timeControlId },
+  };
+}
+
+export function buildClientLobbyLock(roomId: string, locked: boolean): ClientMessage {
+  return { version: PROTOCOL_VERSION, type: 'lobby.lock', roomId, payload: { locked } };
+}
+
+export function buildClientLobbyReady(roomId: string, ready: boolean, settingsVersion: number): ClientMessage {
+  return { version: PROTOCOL_VERSION, type: 'lobby.ready', roomId, payload: { ready, settingsVersion } };
+}
+
+export function buildClientLobbyStart(roomId: string): ClientMessage {
+  return { version: PROTOCOL_VERSION, type: 'lobby.start', roomId, payload: {} };
 }
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;

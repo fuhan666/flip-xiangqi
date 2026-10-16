@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { createLobbyState, applyLobbyCommand, type LobbyState } from '../lobby';
 import {
   buildClientHello,
   buildClientLeave,
+  buildClientLobbyReady,
+  buildClientLobbySettings,
   buildServerMessage,
   closeCodeForError,
   encodeMessage,
@@ -12,7 +15,7 @@ import {
   type ServerMessage,
 } from '../protocol';
 
-function welcome(roomId: string, memberId: string): ServerMessage {
+function welcome(roomId: string, memberId: string, lobby: LobbyState = createLobbyState()): ServerMessage {
   return {
     version: PROTOCOL_VERSION,
     type: 'welcome',
@@ -23,6 +26,7 @@ function welcome(roomId: string, memberId: string): ServerMessage {
       role: 'host',
       name: '房主',
       members: [{ id: memberId, role: 'host', name: '房主', connected: true }],
+      lobby,
     },
   };
 }
@@ -122,6 +126,118 @@ describe('protocol envelope', () => {
       payload: { reason: 'host-closed' },
     });
     expect(JSON.parse(raw).version).toBe(PROTOCOL_VERSION);
+  });
+});
+
+describe('lobby messages', () => {
+  it('parses lobby requests with strict payload validation', () => {
+    const settings = parseClientMessage(encodeMessage(buildClientLobbySettings('room-7', { sidePreference: 'host-red', timeControlId: 'blitz' })));
+    expect(settings.ok).toBe(true);
+    if (settings.ok && settings.message.type === 'lobby.settings') {
+      expect(settings.message.roomId).toBe('room-7');
+      expect(settings.message.payload).toEqual({ sidePreference: 'host-red', timeControlId: 'blitz' });
+    }
+
+    const ready = parseClientMessage(encodeMessage(buildClientLobbyReady('room-7', true, 3)));
+    expect(ready.ok).toBe(true);
+    if (ready.ok && ready.message.type === 'lobby.ready') {
+      expect(ready.message.payload).toEqual({ ready: true, settingsVersion: 3 });
+    }
+
+    expect(
+      parseClientMessage(
+        JSON.stringify({ version: PROTOCOL_VERSION, type: 'lobby.settings', roomId: 'room-7', payload: { sidePreference: 'purple', timeControlId: 'none' } }),
+      ),
+    ).toMatchObject({ ok: false, code: 'INVALID_MESSAGE' });
+    expect(
+      parseClientMessage(
+        JSON.stringify({ version: PROTOCOL_VERSION, type: 'lobby.ready', roomId: 'room-7', payload: { ready: true, settingsVersion: 0 } }),
+      ),
+    ).toMatchObject({ ok: false, code: 'INVALID_MESSAGE' });
+    expect(
+      parseClientMessage(
+        JSON.stringify({ version: PROTOCOL_VERSION, type: 'lobby.lock', roomId: 'room-7', payload: { locked: 'yes' } }),
+      ),
+    ).toMatchObject({ ok: false, code: 'INVALID_MESSAGE' });
+    expect(
+      parseClientMessage(JSON.stringify({ version: PROTOCOL_VERSION, type: 'lobby.start', roomId: null, payload: {} })),
+    ).toMatchObject({ ok: false, code: 'INVALID_MESSAGE' });
+  });
+
+  it('requires the lobby snapshot in welcome and round-trips lobby.state', () => {
+    const withoutLobby = JSON.stringify({
+      version: PROTOCOL_VERSION,
+      type: 'welcome',
+      roomId: 'room-7',
+      payload: { roomId: 'room-7', memberId: 'm-1', role: 'host', name: '房主', members: [] },
+    });
+    expect(parseServerMessage(withoutLobby)).toMatchObject({ ok: false, code: 'INVALID_MESSAGE' });
+
+    const started = applyLobbyCommand(
+      {
+        phase: 'lobby',
+        settings: { sidePreference: 'host-red', timeControlId: 'standard', locked: false, settingsVersion: 2 },
+        ready: { host: true, guest: true },
+        presence: { host: true, guest: true },
+        startParameters: null,
+      },
+      {
+        type: 'start',
+        actor: 'host',
+        roomId: 'room-7',
+        host: { memberId: 'host-1', name: '房主' },
+        guest: { memberId: 'guest-1', name: '客人' },
+        hostRedWhenRandom: null,
+      },
+    );
+    if (!started.ok) {
+      throw new Error('start fixture failed');
+    }
+
+    const parsed = parseServerMessage(JSON.stringify(welcome('room-7', 'host-1', started.state)));
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok && parsed.message.type === 'welcome') {
+      expect(parsed.message.payload.lobby).toEqual(started.state);
+      expect(parsed.message.payload.lobby.startParameters).toMatchObject({
+        timeControlId: 'standard',
+        baseTimeSeconds: 1200,
+        incrementSeconds: 60,
+        redMemberId: 'host-1',
+      });
+    }
+
+    const stateMessage = parseServerMessage(
+      JSON.stringify({ version: PROTOCOL_VERSION, type: 'lobby.state', roomId: 'room-7', payload: { lobby: started.state } }),
+    );
+    expect(stateMessage.ok).toBe(true);
+    if (stateMessage.ok && stateMessage.message.type === 'lobby.state') {
+      expect(stateMessage.message.payload.lobby.phase).toBe('started');
+    }
+
+    const brokenState = parseServerMessage(
+      JSON.stringify({ version: PROTOCOL_VERSION, type: 'lobby.state', roomId: 'room-7', payload: { lobby: { phase: 'lobby' } } }),
+    );
+    expect(brokenState).toMatchObject({ ok: false, code: 'INVALID_MESSAGE' });
+  });
+
+  it('round-trips non-fatal lobby rejections', () => {
+    const parsed = parseServerMessage(
+      JSON.stringify({
+        version: PROTOCOL_VERSION,
+        type: 'lobby.rejected',
+        roomId: 'room-7',
+        payload: { code: 'NOT_READY', message: 'not-ready' },
+      }),
+    );
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok && parsed.message.type === 'lobby.rejected') {
+      expect(parsed.message.payload.code).toBe('NOT_READY');
+    }
+
+    const bad = parseServerMessage(
+      JSON.stringify({ version: PROTOCOL_VERSION, type: 'lobby.rejected', roomId: 'room-7', payload: { code: 'NOPE', message: '' } }),
+    );
+    expect(bad).toMatchObject({ ok: false, code: 'INVALID_MESSAGE' });
   });
 });
 

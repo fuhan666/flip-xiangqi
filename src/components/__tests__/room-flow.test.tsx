@@ -5,12 +5,19 @@ import { JoinRoomScreen } from '../rooms/JoinRoomScreen';
 import type { RoomControlApi, RoomCreateResult } from '../../network/control-api';
 import type { ConnectionState, JoinOptions, RoomConnection } from '../../network/client';
 import type { ParsedAddress } from '../../network/address';
-import type { MemberSnapshot } from '../../network/protocol';
+import type { MemberSnapshot, SidePreference, TimeControlId } from '../../network/protocol';
 import type { StorageLike } from '../../network/recent-rooms';
 import { IDLE_CONNECTION_STATE } from '../rooms/connection-state';
+import { applyLobbyCommand, createLobbyState, type LobbyState } from '../../network/lobby';
 
 const HOST_MEMBER: MemberSnapshot = { id: 'host-1', role: 'host', name: '房主', connected: true };
 const GUEST_MEMBER: MemberSnapshot = { id: 'guest-1', role: 'guest', name: '客人', connected: true };
+
+type LobbyCall =
+  | { type: 'settings'; sidePreference: SidePreference; timeControlId: TimeControlId }
+  | { type: 'lock'; locked: boolean }
+  | { type: 'ready'; ready: boolean }
+  | { type: 'start' };
 
 function fakeRoom(overrides: Partial<RoomCreateResult> = {}): RoomCreateResult {
   return {
@@ -52,6 +59,7 @@ class FakeConnection implements RoomConnection {
   listeners = new Set<(state: ConnectionState) => void>();
   connectCalls: Array<{ address: ParsedAddress; options: JoinOptions }> = [];
   disconnectCalls = 0;
+  lobbyCalls: LobbyCall[] = [];
   private savedAddress: string | null = null;
 
   connect(address: ParsedAddress, options: JoinOptions): void {
@@ -79,6 +87,26 @@ class FakeConnection implements RoomConnection {
     return this.savedAddress;
   }
 
+  sendLobbySettings(sidePreference: SidePreference, timeControlId: TimeControlId): void {
+    this.lobbyCalls.push({ type: 'settings', sidePreference, timeControlId });
+    this.setState({ ...this.state, pendingCommand: 'settings', lastRejection: null });
+  }
+
+  sendLobbyLock(locked: boolean): void {
+    this.lobbyCalls.push({ type: 'lock', locked });
+    this.setState({ ...this.state, pendingCommand: 'lock', lastRejection: null });
+  }
+
+  sendLobbyReady(ready: boolean): void {
+    this.lobbyCalls.push({ type: 'ready', ready });
+    this.setState({ ...this.state, pendingCommand: 'ready', lastRejection: null });
+  }
+
+  sendLobbyStart(): void {
+    this.lobbyCalls.push({ type: 'start' });
+    this.setState({ ...this.state, pendingCommand: 'start', lastRejection: null });
+  }
+
   emit(state: Partial<ConnectionState>): void {
     this.setState({ ...this.state, ...state });
   }
@@ -89,6 +117,19 @@ class FakeConnection implements RoomConnection {
       listener(state);
     }
   }
+}
+
+/** 大厅快照夹具：用真实状态机生成，避免与领域逻辑脱节。 */
+function withLobby(state: LobbyState, commands: Parameters<typeof applyLobbyCommand>[1][]): LobbyState {
+  let current = state;
+  for (const command of commands) {
+    const result = applyLobbyCommand(current, command);
+    if (!result.ok) {
+      throw new Error(`lobby fixture rejected: ${result.code}`);
+    }
+    current = result.state;
+  }
+  return current;
 }
 
 function memoryStorage(initial: Record<string, string> = {}): StorageLike & { data: Map<string, string> } {
@@ -399,5 +440,223 @@ describe('join room flow', () => {
     expect(screen.getByTestId('recent-empty')).toBeInTheDocument();
     expect(screen.getByTestId('join-address-input')).toHaveValue('192.168.1.5:8080');
     expect(screen.getByText(/你正在打开房主分享的地址/)).toBeInTheDocument();
+  });
+});
+
+describe('room lobby', () => {
+  async function connectHost(lobby: LobbyState = createLobbyState()): Promise<FakeConnection> {
+    const api = fakeApi();
+    const { connections, createClient } = connectionFactory();
+    render(<RoomApp api={api} createClient={createClient} storage={memoryStorage()} />);
+    fireEvent.click(screen.getByTestId('menu-create'));
+    await waitFor(() => expect(screen.getByTestId('member-host')).toBeInTheDocument());
+    act(() => {
+      connections[0].emit({
+        status: 'connected',
+        memberId: 'host-1',
+        roomId: 'room1234',
+        role: 'host',
+        members: [HOST_MEMBER, GUEST_MEMBER],
+        lobby,
+      });
+    });
+    return connections[0];
+  }
+
+  async function connectGuest(lobby: LobbyState = createLobbyState()): Promise<FakeConnection> {
+    const { connections, createClient } = connectionFactory();
+    render(
+      <JoinRoomScreen
+        createClient={createClient}
+        guestPage={false}
+        initialAddress="192.168.1.5:8080"
+        onExit={() => undefined}
+        storage={memoryStorage()}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('join-submit'));
+    act(() => {
+      connections[0].emit({
+        status: 'connected',
+        memberId: 'guest-1',
+        roomId: 'room1234',
+        role: 'guest',
+        members: [HOST_MEMBER, GUEST_MEMBER],
+        lobby,
+      });
+    });
+    return connections[0];
+  }
+
+  function readyLobbyFixture(sidePreference: 'host-red' | 'random' = 'random'): LobbyState {
+    return withLobby(createLobbyState(), [
+      { type: 'member-joined', role: 'host' },
+      { type: 'member-joined', role: 'guest' },
+      { type: 'update-settings', actor: 'host', sidePreference, timeControlId: 'standard' },
+      { type: 'set-ready', actor: 'host', ready: true, settingsVersion: 2 },
+      { type: 'set-ready', actor: 'guest', ready: true, settingsVersion: 2 },
+    ]);
+  }
+
+  it('lets the host change sides and time control and reflects synced state on both ends', async () => {
+    const connection = await connectHost();
+
+    // 随机分先在开局前显示「待开局确定」。
+    expect(screen.getByTestId('side-summary')).toHaveTextContent('待开局确定');
+
+    fireEvent.click(screen.getByTestId('setting-side-host-red'));
+    expect(connection.lobbyCalls).toEqual([{ type: 'settings', sidePreference: 'host-red', timeControlId: 'none' }]);
+
+    // 服务端权威状态回到两端：分配立即呈现。
+    const afterSide = withLobby(createLobbyState(), [
+      { type: 'member-joined', role: 'host' },
+      { type: 'member-joined', role: 'guest' },
+      { type: 'update-settings', actor: 'host', sidePreference: 'host-red', timeControlId: 'none' },
+    ]);
+    act(() => {
+      connection.emit({ lobby: afterSide, pendingCommand: null });
+    });
+    expect(screen.getByTestId('setting-side-host-red')).toBeChecked();
+    expect(screen.getByTestId('side-summary')).toHaveTextContent('房主：红方 · 客人：黑方');
+    expect(screen.getByTestId('member-side-host')).toHaveTextContent('红方');
+    expect(screen.getByTestId('member-side-guest')).toHaveTextContent('黑方');
+
+    fireEvent.click(screen.getByTestId('setting-time-standard'));
+    expect(connection.lobbyCalls[1]).toEqual({ type: 'settings', sidePreference: 'host-red', timeControlId: 'standard' });
+
+    // 在途请求未回执前锁定按钮防连点；回执后恢复可点。
+    expect(screen.getByTestId('settings-lock')).toBeDisabled();
+    act(() => {
+      connection.emit({ pendingCommand: null });
+    });
+    fireEvent.click(screen.getByTestId('settings-lock'));
+    expect(connection.lobbyCalls[2]).toEqual({ type: 'lock', locked: true });
+    act(() => {
+      connection.emit({ lobby: withLobby(afterSide, [{ type: 'set-locked', actor: 'host', locked: true }]), pendingCommand: null });
+    });
+    expect(screen.getByTestId('settings-locked-note')).toHaveTextContent('设置已锁定');
+  });
+
+  it('shows the guest a read-only synchronized view', async () => {
+    const connection = await connectGuest();
+
+    expect(screen.getByTestId('settings-readonly-note')).toBeInTheDocument();
+    expect(screen.getByTestId('setting-side-host-red')).toBeDisabled();
+    expect(screen.getByTestId('setting-time-none')).toBeDisabled();
+    expect(screen.queryByTestId('settings-lock')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('lobby-start')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('setting-side-host-red'));
+    expect(connection.lobbyCalls).toEqual([]);
+
+    // 房主的改动同步到客人端，只读视图随之更新。
+    const synced = withLobby(createLobbyState(), [
+      { type: 'member-joined', role: 'host' },
+      { type: 'member-joined', role: 'guest' },
+      { type: 'update-settings', actor: 'host', sidePreference: 'host-black', timeControlId: 'blitz' },
+    ]);
+    act(() => {
+      connection.emit({ lobby: synced });
+    });
+    expect(screen.getByTestId('setting-side-host-black')).toBeChecked();
+    expect(screen.getByTestId('setting-time-blitz')).toBeChecked();
+    // 客人文案按自身身份换算：房主执黑 = 你执红。
+    expect(screen.getByTestId('setting-side-host-black')).toHaveAccessibleName('执红先行');
+    expect(screen.getByTestId('side-summary')).toHaveTextContent('房主：黑方 · 客人：红方');
+  });
+
+  it('blocks the start until both players are ready and explains every rejection', async () => {
+    const connection = await connectHost();
+
+    expect(screen.getByTestId('lobby-start-hint')).toHaveTextContent('等待双方准备');
+
+    fireEvent.click(screen.getByTestId('lobby-ready-toggle'));
+    expect(connection.lobbyCalls).toEqual([{ type: 'ready', ready: true }]);
+
+    const hostReady = withLobby(createLobbyState(), [
+      { type: 'member-joined', role: 'host' },
+      { type: 'member-joined', role: 'guest' },
+      { type: 'update-settings', actor: 'host', sidePreference: 'random', timeControlId: 'standard' },
+      { type: 'set-ready', actor: 'host', ready: true, settingsVersion: 2 },
+    ]);
+    act(() => {
+      connection.emit({ lobby: hostReady, pendingCommand: null });
+    });
+    expect(screen.getByTestId('lobby-ready-toggle')).toHaveTextContent('取消准备');
+    expect(screen.getByTestId('member-ready-host')).toHaveTextContent('已准备');
+    expect(screen.getByTestId('lobby-start-hint')).toHaveTextContent('等待双方准备');
+
+    // 开始请求照常发出，由服务端门禁裁决；拒绝以可行动文案呈现。
+    fireEvent.click(screen.getByTestId('lobby-start'));
+    expect(connection.lobbyCalls[1]).toEqual({ type: 'start' });
+    act(() => {
+      connection.emit({
+        pendingCommand: null,
+        lastRejection: { code: 'NOT_READY', message: '还不能开始对局 —— 需要双方都已准备 —— 等待双方准备' },
+      });
+    });
+    expect(screen.getByTestId('lobby-notice')).toHaveTextContent('等待双方准备');
+
+    act(() => {
+      connection.emit({ lobby: readyLobbyFixture('random'), pendingCommand: null, lastRejection: null });
+    });
+    expect(screen.getByTestId('lobby-start-hint')).toHaveTextContent('双方已就绪，可以开始对局');
+    expect(screen.getByTestId('lobby-start')).toHaveClass('panel-action-gold');
+  });
+
+  it('prevents double submits while a request is in flight', async () => {
+    const connection = await connectHost();
+
+    fireEvent.click(screen.getByTestId('lobby-ready-toggle'));
+    expect(screen.getByTestId('lobby-ready-toggle')).toBeDisabled();
+    expect(screen.getByTestId('lobby-start')).toBeDisabled();
+
+    act(() => {
+      connection.emit({ pendingCommand: null });
+    });
+    expect(screen.getByTestId('lobby-ready-toggle')).not.toBeDisabled();
+  });
+
+  it('shows the frozen start parameters once the game begins', async () => {
+    const started = withLobby(createLobbyState(), [
+      { type: 'member-joined', role: 'host' },
+      { type: 'member-joined', role: 'guest' },
+      { type: 'update-settings', actor: 'host', sidePreference: 'host-red', timeControlId: 'standard' },
+      { type: 'set-ready', actor: 'host', ready: true, settingsVersion: 2 },
+      { type: 'set-ready', actor: 'guest', ready: true, settingsVersion: 2 },
+      {
+        type: 'start',
+        actor: 'host',
+        roomId: 'room1234',
+        host: { memberId: 'host-1', name: '房主' },
+        guest: { memberId: 'guest-1', name: '客人' },
+        hostRedWhenRandom: null,
+      },
+    ]);
+    await connectHost(started);
+
+    expect(screen.getByTestId('lobby-started')).toHaveTextContent('你执红，对手执黑 · 局时 20 分 + 60 秒（标准局）');
+    expect(screen.getByTestId('start-snapshot')).toHaveTextContent('房主执红 · 客人执黑');
+    expect(screen.getByTestId('start-snapshot')).toHaveTextContent('设置版本 v2');
+    expect(screen.queryByTestId('lobby-ready-toggle')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('lobby-start')).not.toBeInTheDocument();
+    expect(screen.getByTestId('member-side-host')).toHaveTextContent('红方');
+    expect(screen.getByTestId('setting-side-host-red')).toBeDisabled();
+  });
+
+  it('renders ready lamps and leave reasons on the member cards', async () => {
+    const connection = await connectHost();
+    expect(screen.getByTestId('member-ready-host')).toHaveTextContent('未准备');
+
+    act(() => {
+      connection.emit({
+        lobby: readyLobbyFixture('random'),
+        members: [HOST_MEMBER, { ...GUEST_MEMBER, connected: false, leaveReason: 'dropped' }],
+      });
+    });
+    expect(screen.getByTestId('member-ready-host')).toHaveTextContent('已准备');
+    expect(screen.getByTestId('member-ready-guest')).toHaveTextContent('已准备');
+    expect(screen.getByTestId('member-guest')).toHaveTextContent('已掉线');
+    expect(screen.getByTestId('member-side-guest')).toHaveTextContent('待开局确定');
   });
 });

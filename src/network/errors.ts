@@ -4,7 +4,7 @@
  * 文案遵循「发生了什么 + 为什么 + 现在怎么办」三段式，
  * 不向用户暴露裸错误码。
  */
-import type { ErrorCode, RoomClosedReason } from './protocol';
+import type { ErrorCode, LobbyRejectCode, RoomClosedReason } from './protocol';
 
 const ERROR_COPY: Record<ErrorCode, string> = {
   INVALID_ADDRESS: '地址无法识别 —— 需要「IP:端口」格式，例如 192.168.1.5:8080 —— 请检查是否漏掉端口或有多余字符',
@@ -33,4 +33,19 @@ export function describeRoomClosed(reason: RoomClosedReason): string {
     return '房主已离开房间，房间已关闭';
   }
   return '房间已停止服务';
+}
+
+/** 大厅操作被拒绝（非致命）的三段式文案，不裸报拒绝码。 */
+const LOBBY_REJECT_COPY: Record<LobbyRejectCode, string> = {
+  NOT_HOST: '只有房主可以操作该项 —— 分先与局时由房主统一决定 —— 请让房主在自己的电脑上调整',
+  LOCKED: '设置已被房主锁定 —— 锁定后不再接受修改，保持开局参数稳定 —— 如需调整，请让房主先解锁',
+  INVALID_VALUE: '操作内容不被接受 —— 双方可能运行了不同版本的客户端 —— 请刷新页面后重试',
+  STALE_VERSION: '准备状态已过期 —— 设置刚发生了变化，旧的准备不再有效 —— 请确认最新设置后重新点击准备',
+  NOT_READY: '还不能开始对局 —— 需要双方都已准备 —— 等待双方准备',
+  MEMBER_MISSING: '还不能开始对局 —— 需要双方都在线并留在房间内 —— 请等对手重新加入后再开始',
+  ALREADY_STARTED: '对局已经开始 —— 开局参数已冻结，不能重复开始或修改 —— 如需再来一局，请退出后重新建房',
+};
+
+export function describeLobbyReject(code: LobbyRejectCode): string {
+  return LOBBY_REJECT_COPY[code] ?? LOBBY_REJECT_COPY.INVALID_VALUE;
 }

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocketServer, WebSocket as NodeWebSocket } from 'ws';
 import type { AddressInfo } from 'node:net';
 import { RoomClient, type WebSocketLike } from '../client';
+import { applyLobbyCommand, createLobbyState, type LobbyState } from '../lobby';
 import { buildServerMessage, closeCodeForError, PROTOCOL_VERSION } from '../protocol';
 
 interface TestServer {
@@ -65,7 +66,7 @@ describe('RoomClient', () => {
           buildServerMessage({
             type: 'welcome',
             roomId: 'room-1',
-            payload: { roomId: 'room-1', memberId: 'guest-1', role: 'guest', name: '客人', members },
+            payload: { roomId: 'room-1', memberId: 'guest-1', role: 'guest', name: '客人', members, lobby: createLobbyState() },
           }),
         );
       });
@@ -142,7 +143,7 @@ describe('RoomClient', () => {
           buildServerMessage({
             type: 'welcome',
             roomId: 'room-fast',
-            payload: { roomId: 'room-fast', memberId: 'guest-1', role: 'guest', name: '客人', members },
+            payload: { roomId: 'room-fast', memberId: 'guest-1', role: 'guest', name: '客人', members, lobby: createLobbyState() },
           }),
         );
       });
@@ -168,7 +169,7 @@ describe('RoomClient', () => {
           buildServerMessage({
             type: 'welcome',
             roomId: 'room-1',
-            payload: { roomId: 'room-1', memberId: 'guest-1', role: 'guest', name: '客人', members },
+            payload: { roomId: 'room-1', memberId: 'guest-1', role: 'guest', name: '客人', members, lobby: createLobbyState() },
           }),
         );
         socket.send(
@@ -199,7 +200,7 @@ describe('RoomClient', () => {
             buildServerMessage({
               type: 'welcome',
               roomId: 'room-1',
-              payload: { roomId: 'room-1', memberId: 'guest-1', role: 'guest', name: '客人', members },
+              payload: { roomId: 'room-1', memberId: 'guest-1', role: 'guest', name: '客人', members, lobby: createLobbyState() },
             }),
           );
         }
@@ -227,7 +228,7 @@ describe('RoomClient', () => {
           buildServerMessage({
             type: 'welcome',
             roomId: 'room-1',
-            payload: { roomId: 'room-1', memberId: 'guest-1', role: 'guest', name: '客人', members },
+            payload: { roomId: 'room-1', memberId: 'guest-1', role: 'guest', name: '客人', members, lobby: createLobbyState() },
           }),
         );
       });
@@ -240,5 +241,124 @@ describe('RoomClient', () => {
     client.connect({ host: '127.0.0.1', port: server.port }, { role: 'guest', name: '客人' });
     expect(client.getState().status).toBe('error');
     expect(client.getState().errorCode).toBe('ALREADY_CONNECTED');
+  });
+
+  it('tracks lobby snapshots from welcome and lobby.state broadcasts', async () => {
+    const sockets: NodeWebSocket[] = [];
+    const server = await startServer((socket) => {
+      sockets.push(socket);
+      socket.on('message', () => {
+        socket.send(
+          buildServerMessage({
+            type: 'welcome',
+            roomId: 'room-1',
+            payload: { roomId: 'room-1', memberId: 'guest-1', role: 'guest', name: '客人', members, lobby: createLobbyState() },
+          }),
+        );
+      });
+    });
+
+    const client = makeClient();
+    client.connect({ host: '127.0.0.1', port: server.port }, { role: 'guest', name: '客人' });
+    await waitUntil(() => client.getState().status === 'connected');
+    expect(client.getState().lobby).toMatchObject({ phase: 'lobby', settings: { settingsVersion: 1 }, startParameters: null });
+
+    const next = applyLobbyCommand(client.getState().lobby as LobbyState, {
+      type: 'update-settings',
+      actor: 'host',
+      sidePreference: 'host-black',
+      timeControlId: 'standard',
+    });
+    if (!next.ok) {
+      throw new Error('fixture change failed');
+    }
+    sockets[0]?.send(
+      buildServerMessage({ type: 'lobby.state', roomId: 'room-1', payload: { lobby: next.state } }),
+    );
+
+    await waitUntil(() => client.getState().lobby?.settings.sidePreference === 'host-black');
+    expect(client.getState().lobby).toMatchObject({ settings: { timeControlId: 'standard', settingsVersion: 2 } });
+  });
+
+  it('sends lobby requests bound to the room and clears the pending command on the answer', async () => {
+    const received: Array<Record<string, any>> = [];
+    const sockets: NodeWebSocket[] = [];
+    const server = await startServer((socket) => {
+      sockets.push(socket);
+      socket.on('message', (data) => {
+        const message = JSON.parse(data.toString());
+        if (message.type === 'hello') {
+          socket.send(
+            buildServerMessage({
+              type: 'welcome',
+              roomId: 'room-1',
+              payload: { roomId: 'room-1', memberId: 'host-1', role: 'host', name: '房主', members, lobby: createLobbyState() },
+            }),
+          );
+          return;
+        }
+        received.push(message);
+      });
+    });
+
+    const client = makeClient();
+    client.connect({ host: '127.0.0.1', port: server.port }, { role: 'host', name: '房主', token: 't' });
+    await waitUntil(() => client.getState().status === 'connected');
+
+    client.sendLobbySettings('host-red', 'standard');
+    expect(client.getState().pendingCommand).toBe('settings');
+    client.sendLobbyLock(true);
+    client.sendLobbyReady(true);
+    client.sendLobbyStart();
+    expect(client.getState().pendingCommand).toBe('start');
+
+    await waitUntil(() => received.length === 4);
+    expect(received.map((message) => message.type)).toEqual(['lobby.settings', 'lobby.lock', 'lobby.ready', 'lobby.start']);
+    expect(received[0]).toMatchObject({ roomId: 'room-1', payload: { sidePreference: 'host-red', timeControlId: 'standard' } });
+    expect(received[1]).toMatchObject({ roomId: 'room-1', payload: { locked: true } });
+    expect(received[2]).toMatchObject({ roomId: 'room-1', payload: { ready: true, settingsVersion: 1 } });
+
+    sockets[0]?.send(
+      buildServerMessage({ type: 'lobby.state', roomId: 'room-1', payload: { lobby: createLobbyState() } }),
+    );
+    await waitUntil(() => client.getState().pendingCommand === null);
+  });
+
+  it('keeps the connection alive on a non-fatal lobby rejection and surfaces actionable copy', async () => {
+    const sockets: NodeWebSocket[] = [];
+    const server = await startServer((socket) => {
+      sockets.push(socket);
+      socket.on('message', () => {
+        socket.send(
+          buildServerMessage({
+            type: 'welcome',
+            roomId: 'room-1',
+            payload: { roomId: 'room-1', memberId: 'host-1', role: 'host', name: '房主', members, lobby: createLobbyState() },
+          }),
+        );
+      });
+    });
+
+    const client = makeClient();
+    client.connect({ host: '127.0.0.1', port: server.port }, { role: 'host', name: '房主', token: 't' });
+    await waitUntil(() => client.getState().status === 'connected');
+
+    sockets[0]?.send(
+      buildServerMessage({ type: 'lobby.rejected', roomId: 'room-1', payload: { code: 'NOT_READY', message: 'not-ready' } }),
+    );
+    await waitUntil(() => client.getState().lastRejection !== null);
+    expect(client.getState().status).toBe('connected');
+    expect(client.getState().lastRejection?.code).toBe('NOT_READY');
+    expect(client.getState().lastRejection?.message).toContain('等待双方准备');
+    expect(client.getState().pendingCommand).toBeNull();
+
+    // 拒绝后仍可继续操作：新请求正常发出，权威状态到达时提示被清除。
+    client.sendLobbyStart();
+    expect(client.getState().pendingCommand).toBe('start');
+    sockets[0]?.send(
+      buildServerMessage({ type: 'lobby.state', roomId: 'room-1', payload: { lobby: createLobbyState() } }),
+    );
+    await waitUntil(() => client.getState().lastRejection === null);
+    expect(client.getState().status).toBe('connected');
   });
 });
