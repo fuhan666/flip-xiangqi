@@ -65,9 +65,18 @@ async function expectOpeningCounts(page: Page): Promise<void> {
   expect(counts).toEqual({ hidden: 30, revealed: 2, empty: 58 });
 }
 
+// 翻牌反馈动画（360ms）期间棋盘忽略操作；等待需覆盖该保护期，否则补点会被吞掉。
+const FLIP_GUARD_MS = 480;
+
 async function flipHiddenCell(page: Page, x: number, y: number, glyph: string): Promise<void> {
   const cell = page.getByTestId(`cell-${x}-${y}`);
   await cell.click();
+  await page.waitForTimeout(FLIP_GUARD_MS);
+  if ((await cell.getAttribute('data-cell-state')) !== 'revealed') {
+    // 上一手翻牌动画未结束时点击会被忽略，等待保护期结束后补一次。
+    await cell.click();
+    await page.waitForTimeout(FLIP_GUARD_MS);
+  }
   await expect(cell).toHaveAttribute('data-flip-phase', 'none');
   await expect(cell).toHaveAttribute('data-cell-state', 'revealed');
   await expect(cell.locator('.piece-text')).toHaveText(glyph);
@@ -92,7 +101,7 @@ test.describe('seeded full game flow', () => {
     const health = watchPageHealth(page);
     await page.setViewportSize({ width: 1366, height: 768 });
     await page.addInitScript(SEEDED_RNG);
-    await page.goto('/');
+    await page.goto('/#/local');
 
     const turnIndicator = page.locator('.board-turn-value');
     const turnValue = page.locator('.status-item-turn .status-value');
@@ -220,7 +229,7 @@ test.describe('seeded full game flow', () => {
     await page.setViewportSize({ width: 1366, height: 768 });
     await page.addInitScript(SEEDED_RNG);
 
-    await page.goto('/');
+    await page.goto('/#/local');
     await expectOpeningCounts(page);
     await flipHiddenCell(page, 7, 2, '俥');
 

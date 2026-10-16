@@ -1,5 +1,7 @@
 node_modules/
 dist/
+dist-server/
+.npm-cache/
 *.tsbuildinfo
 vite.config.js
 vite.config.d.ts

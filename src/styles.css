@@ -34,11 +34,32 @@ button:disabled {
 }
 
 .app-shell {
+  position: relative;
   min-height: 100vh;
   max-width: 1480px;
   margin: 0 auto;
   padding: 24px;
   box-sizing: border-box;
+}
+
+.menu-back-link {
+  position: absolute;
+  top: 20px;
+  right: 24px;
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: 12px;
+  background: rgba(36, 18, 5, 0.55);
+  color: rgba(215, 178, 119, 0.9);
+  text-decoration: none;
+  font-size: 14px;
+  letter-spacing: 0.12em;
+}
+
+.menu-back-link:hover {
+  color: #f4dba7;
 }
 
 .layout {
