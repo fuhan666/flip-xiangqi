@@ -1,6 +1,6 @@
-import { render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import App from '../../App';
 import { applyAction, createEmptyGameState } from '../../game';
 import type { GameHistoryEntry, GameState } from '../../game';
@@ -241,5 +241,104 @@ describe('app flow', () => {
     expect(app.getByText('红方')).toBeInTheDocument();
     expect(app.getByTestId('cell-4-1')).toHaveTextContent('俥');
     expect(app.getByTestId('cell-4-0')).toHaveTextContent('将');
+  });
+
+  it('plays the mating move from an ongoing game and settles the checkmate result', async () => {
+    const user = userEvent.setup();
+    const initialState = createEmptyGameState({
+      pieces: [
+        piece({ id: 'red-king', camp: 'red', type: 'king', position: { x: 4, y: 9 } }),
+        piece({ id: 'black-king', camp: 'black', type: 'king', position: { x: 4, y: 0 } }),
+        piece({ id: 'red-rook', camp: 'red', type: 'rook', position: { x: 3, y: 2 } }),
+        piece({ id: 'red-pawn-left', camp: 'red', type: 'pawn', position: { x: 3, y: 1 } }),
+        piece({ id: 'red-pawn-right', camp: 'red', type: 'pawn', position: { x: 5, y: 1 } }),
+        piece({ id: 'red-pawn-center', camp: 'red', type: 'pawn', position: { x: 4, y: 5 } }),
+        piece({ id: 'hidden-red-pawn', camp: 'red', type: 'pawn', position: { x: 0, y: 6 }, revealed: false }),
+        piece({ id: 'black-horse-1', camp: 'black', type: 'horse', position: null, captured: true }),
+      ],
+    });
+
+    const { container } = render(<App initialState={initialState} />);
+    const app = within(container);
+
+    await user.click(app.getByTestId('cell-3-2'));
+    await user.click(app.getByTestId('cell-4-2'));
+
+    expect(app.getByTestId('cell-4-2')).toHaveTextContent('俥');
+    expect(app.getByTestId('cell-4-0')).toHaveTextContent('将');
+    expect(app.getByText('黑方阵亡：馬')).toBeInTheDocument();
+
+    const summary = app
+      .getByRole('heading', { level: 3, name: '本局结果' })
+      .closest('.status-summary-card') as HTMLElement;
+    expect(within(summary).getByText('结束方式')).toBeInTheDocument();
+    expect(within(summary).getByText('将死获胜')).toBeInTheDocument();
+    expect(within(summary).getByText('红方获胜')).toBeInTheDocument();
+
+    expect(app.getByText('当前回合')).toBeInTheDocument();
+    expect(app.getByText('对局结束')).toBeInTheDocument();
+    expect(app.getByText('红方将死对手，获得胜利')).toBeInTheDocument();
+    expect(app.getByText('黑方被将军')).toBeInTheDocument();
+    expect(app.getByText('红方胜利')).toBeInTheDocument();
+
+    expect(app.getByText('第 1 手')).toBeInTheDocument();
+    expect(app.getAllByText('红方移动红方俥')).not.toHaveLength(0);
+    expect(app.getByText('结果：红方胜利（将死）')).toBeInTheDocument();
+
+    const liveFeedback = app.getByTestId('status-live-feedback');
+    expect(within(liveFeedback).getByText('刚刚完成制胜一手')).toBeInTheDocument();
+    expect(within(liveFeedback).getByText('红方获胜（将死获胜）')).toBeInTheDocument();
+
+    await user.click(app.getByTestId('cell-0-6'));
+    expect(app.getByText('非法操作：对局已经结束，请重新开局')).toBeInTheDocument();
+    expect(app.getByText('第 1 手')).toBeInTheDocument();
+    expect(app.getByText('对局结束')).toBeInTheDocument();
+    expect(app.getByTestId('cell-4-2')).toHaveTextContent('俥');
+
+    await user.click(app.getByRole('button', { name: '再来一局' }));
+
+    expect(app.queryByRole('heading', { level: 3, name: '本局结果' })).not.toBeInTheDocument();
+    expect(app.getAllByText('最近结果')).not.toHaveLength(0);
+    expect(app.getAllByText('红方获胜（将死获胜）')).not.toHaveLength(0);
+    expect(app.getByText('当前回合')).toBeInTheDocument();
+    expect(app.getByText('红方')).toBeInTheDocument();
+  });
+
+  it('flips an opponent hidden piece through clicks and passes the turn', () => {
+    vi.useFakeTimers();
+    const initialState = createEmptyGameState({
+      pieces: [
+        piece({ id: 'red-king', camp: 'red', type: 'king', position: { x: 4, y: 9 } }),
+        piece({ id: 'black-king', camp: 'black', type: 'king', position: { x: 4, y: 0 } }),
+        piece({ id: 'center-blocker', camp: 'red', type: 'pawn', position: { x: 4, y: 5 } }),
+        piece({ id: 'hidden-black-pawn', camp: 'black', type: 'pawn', position: { x: 0, y: 5 }, revealed: false }),
+      ],
+    });
+
+    const { container } = render(<App initialState={initialState} />);
+    const app = within(container);
+    const flippingCell = app.getByTestId('cell-0-5');
+
+    fireEvent.click(flippingCell);
+
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
+
+    expect(flippingCell).toHaveTextContent('卒');
+    expect(flippingCell).toHaveClass('black');
+    expect(flippingCell).toHaveAttribute('data-recent-action', 'flip');
+
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
+
+    expect(flippingCell).toHaveAttribute('data-flip-phase', 'none');
+    expect(app.getAllByText('红方翻开了黑方卒')).not.toHaveLength(0);
+    expect(app.getAllByText('位置：第 1 列，第 6 行')).not.toHaveLength(0);
+    expect(app.getAllByText('下一手：黑方')).not.toHaveLength(0);
+    expect(app.getByText('黑方')).toBeInTheDocument();
+    expect(app.getByText('第 1 手')).toBeInTheDocument();
+    vi.useRealTimers();
   });
 });

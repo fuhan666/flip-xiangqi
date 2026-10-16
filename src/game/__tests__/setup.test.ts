@@ -21,6 +21,13 @@ function expectPiecesToAvoidPositions(pieces: Piece[], forbiddenPositions: Set<s
   ).toBe(true);
 }
 
+function layoutSignature(state: { pieces: Piece[] }): string[] {
+  return [...state.pieces]
+    .filter((piece) => piece.position !== null)
+    .map((piece) => `${positionKey(piece.position!)}=${piece.id}`)
+    .sort();
+}
+
 const ROOK_FORBIDDEN_POSITIONS = new Set(['4,6', '4,3', '3,9', '5,9', '3,0', '5,0']);
 const PAWN_FORBIDDEN_POSITIONS = new Set(['3,9', '5,9', '3,0', '5,0']);
 const CANNON_FORBIDDEN_POSITIONS = new Set(['2,9', '6,9', '2,0', '6,0']);
@@ -66,5 +73,24 @@ describe('opening setup', () => {
         CANNON_FORBIDDEN_POSITIONS,
       );
     }
+  });
+
+  it('reproduces the identical piece layout for the same seed', () => {
+    const first = createInitialGameState(createSeededRng(7));
+    const second = createInitialGameState(createSeededRng(7));
+
+    expect(layoutSignature(first)).toEqual(layoutSignature(second));
+  });
+
+  it('shuffles piece identities differently across seeds while keeping the square set', () => {
+    const first = createInitialGameState(createSeededRng(1));
+    const second = createInitialGameState(createSeededRng(2));
+
+    expect(layoutSignature(first)).not.toEqual(layoutSignature(second));
+    expect(
+      layoutSignature(first).map((entry) => entry.split('=')[0]),
+    ).toEqual(layoutSignature(second).map((entry) => entry.split('=')[0]));
+    expect(first.pieces.filter((piece) => !piece.revealed)).toHaveLength(30);
+    expect(second.pieces.filter((piece) => !piece.revealed)).toHaveLength(30);
   });
 });

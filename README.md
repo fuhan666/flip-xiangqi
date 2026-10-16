@@ -2,6 +2,8 @@
 
 翻牌中国象棋本地双人对局。
 
+当前版本：**0.6.0**（纯 2D 对局体验版本，详见 [Changelog](CHANGELOG.md)）。
+
 项目基于标准中国象棋规则，加入“将/帅固定明置，其余 30 枚棋子全局随机暗置、翻牌算一步”的变体玩法。棋盘以标准 9×10 网格做纯 2D DOM 渲染，点击格子完成翻牌与走子。
 
 当前版本已经覆盖：
@@ -32,13 +34,13 @@ npm run build
 
 构建为标准 Vite + React 流程，不包含 3D 相关依赖、拆包清单或特调的 chunk 警告阈值。
 
-浏览器冒烟与视觉检查（需先 `npm run build`）：
+浏览器冒烟、视觉检查与全流程对局回归（需先 `npm run build`）：
 
 ```bash
-npx playwright test
+npm run test:e2e   # 等价于 npx playwright test
 ```
 
-该套件覆盖多分辨率棋盘几何、暗子脱敏等价、reduced-motion、交互流程与字体渲染取证，截图输出到仓库外的 `evidence/` 目录。
+视觉套件覆盖多分辨率棋盘几何、暗子脱敏等价、reduced-motion、交互流程与字体渲染取证；`e2e/game-flow.e2e.ts` 以固定种子随机开局，用合法点击序列覆盖 翻牌 → 己方走子 → 暗子阻挡/非法操作 → 吃子 → 炮翻山吃子 → 真实将死 → 重开 全链路。截图输出到仓库外的 `evidence/` 目录。
 
 ## 交互说明
 
@@ -57,12 +59,12 @@ npx playwright test
 - 全部动效遵循 `prefers-reduced-motion: reduce`：开启后直接呈现最终状态，无翻转、呼吸、轨迹与波纹动画
 - 暗子统一为祥云暗纹木背，未翻开前带轻微呼吸/悬浮动效；`prefers-reduced-motion` 下自动停用
 - 暗子翻开前不渲染任何正面棋子信息，仅显示占位「暗」标记
-- 仍不包含 legal-move / highlighted-targets 提示（除非后续单独改方向）
-- 翻转、走子轨迹、吃子/将军等交互动效留待后续迭代
 - 不包含联网、AI、账号体系
 
 ## 文档
 
+- [Changelog](CHANGELOG.md)
+- [v0.6.0 版本说明](docs/releases/v0.6.0.md)
 - [v0.5.0 版本说明](docs/releases/v0.5.0.md)
 - [v0.4.0 版本说明](docs/releases/v0.4.0.md)
 - [游戏玩法说明](docs/gameplay-rules.md)
