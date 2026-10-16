@@ -194,6 +194,9 @@ export default function App({ initialState }: AppProps) {
       <header>
         <h1>翻牌中国象棋</h1>
         <p>本地双人对局：翻牌、走子、将军与终局结算。</p>
+        <a className="menu-back-link" data-testid="back-to-menu" href="#/">
+          ← 返回菜单
+        </a>
       </header>
 
       <div className="layout">

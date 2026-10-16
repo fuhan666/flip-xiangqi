@@ -31,7 +31,7 @@ test.describe('board visual smoke', () => {
     test(`geometry and screenshot at ${viewport.name}`, async ({ page }) => {
       const consoleErrors = watchConsole(page);
       await page.setViewportSize({ width: viewport.width, height: viewport.height });
-      await page.goto('/');
+      await page.goto('/#/local');
       await expect(page.getByRole('grid', { name: '翻牌中国象棋棋盘' })).toBeVisible();
 
       const counts = await page.evaluate(() => ({
@@ -124,7 +124,7 @@ test.describe('board visual smoke', () => {
   }
 
   test('board artwork contains river text, palaces and broken river lines', async ({ page }) => {
-    await page.goto('/');
+    await page.goto('/#/local');
     const artwork = await page.evaluate(() => {
       const svg = document.querySelector('.board-artwork') as SVGSVGElement;
       const lines = Array.from(document.querySelectorAll('.board-artwork-lines line'));
@@ -159,7 +159,7 @@ test.describe('board visual smoke', () => {
   });
 
   test('hidden pieces expose identical DOM regardless of identity', async ({ page }) => {
-    await page.goto('/');
+    await page.goto('/#/local');
     const hiddenHtml = await page.evaluate(() => {
       const cells = Array.from(document.querySelectorAll('.cell[data-cell-state="hidden"]'));
       return cells.map((cell) => {
@@ -196,7 +196,7 @@ test.describe('board visual smoke', () => {
   test('reduced motion stops the hidden-piece breathing', async ({ browser }) => {
     const context = await browser.newContext({ reducedMotion: 'reduce' });
     const page = await context.newPage();
-    await page.goto('/');
+    await page.goto('/#/local');
     const animationName = await page.evaluate(() => {
       const face = document.querySelector('.piece-face-hidden') as HTMLElement;
       return getComputedStyle(face).animationName;
@@ -208,7 +208,7 @@ test.describe('board visual smoke', () => {
   test('interaction flow: flip, select, move, undo, restart and keyboard', async ({ page }) => {
     const consoleErrors = watchConsole(page);
     await page.setViewportSize({ width: 1366, height: 768 });
-    await page.goto('/');
+    await page.goto('/#/local');
 
     const clickUntil = async (testId: string, attribute: string, value: string) => {
       await expect
@@ -287,7 +287,7 @@ test.describe('board visual smoke', () => {
   test('interaction feedback: flip phases, legal hints, trace and last move', async ({ page }) => {
     const consoleErrors = watchConsole(page);
     await page.setViewportSize({ width: 1366, height: 768 });
-    await page.goto('/');
+    await page.goto('/#/local');
 
     await page.getByTestId('cell-4-9').click();
     await expect(page.locator('.legal-move')).not.toHaveCount(0);
@@ -356,7 +356,7 @@ test.describe('board visual smoke', () => {
   test('reduced motion reveals flipped pieces immediately without transient effects', async ({ browser }) => {
     const context = await browser.newContext({ reducedMotion: 'reduce' });
     const page = await context.newPage();
-    await page.goto('/');
+    await page.goto('/#/local');
 
     await page.getByTestId('cell-4-9').click();
     await page.getByTestId('cell-4-8').click();
@@ -371,7 +371,7 @@ test.describe('board visual smoke', () => {
 
   test('calligraphy font rendering evidence', async ({ page }) => {
     await page.setViewportSize({ width: 1366, height: 768 });
-    await page.goto('/');
+    await page.goto('/#/local');
     await expect(page.getByRole('grid', { name: '翻牌中国象棋棋盘' })).toBeVisible();
 
     const client = await page.context().newCDPSession(page);
