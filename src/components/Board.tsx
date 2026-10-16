@@ -2,11 +2,24 @@ import { BOARD_HEIGHT, BOARD_WIDTH, PIECE_SYMBOLS, getPieceAt } from '../game';
 import type { Camp, GameState, Piece, Position } from '../game';
 import { BoardArtwork } from './BoardArtwork';
 import { PieceFace } from './PieceFace';
+import type {
+  CaptureGhostFeedback,
+  CheckPulseFeedback,
+  FlipFeedback,
+  FlipPhase,
+  LegalMoveHint,
+  TraceFeedback,
+} from './useBoardFeedback';
 
 interface BoardProps {
   gameState: GameState;
   selectedPosition: Position | null;
   onCellClick: (position: Position) => void;
+  captureGhost?: CaptureGhostFeedback | null;
+  checkPulse?: CheckPulseFeedback | null;
+  flip?: FlipFeedback | null;
+  legalMoves?: ReadonlyMap<string, LegalMoveHint>;
+  trace?: TraceFeedback | null;
 }
 
 type CellState = 'empty' | 'hidden' | 'revealed';
@@ -16,15 +29,22 @@ type RecentAction = 'none' | 'flip' | 'move-from' | 'move-to' | 'capture';
 interface BoardCellModel {
   cellState: CellState;
   coordinateLabel: string;
+  flipPhase: FlipPhase | null;
   isFaceDown: boolean;
   isSelected: boolean;
   key: string;
+  legalMove: LegalMoveHint | 'none';
   pieceCamp: Camp | null;
   pieceLabel: string;
   position: Position;
   recentAction: RecentAction;
   testId: string;
   turnState: TurnState;
+}
+
+interface LastMoveMarker {
+  from: Position;
+  to: Position;
 }
 
 interface RecentActionMarkers {
@@ -89,7 +109,27 @@ function getRecentActionMarkers(gameState: GameState): RecentActionMarkers {
   };
 }
 
-function buildBoardCells(gameState: GameState, selectedPosition: Position | null): BoardCellModel[] {
+function findLastMove(gameState: GameState): LastMoveMarker | null {
+  for (let index = gameState.actionHistory.length - 1; index >= 0; index -= 1) {
+    const entry = gameState.actionHistory[index];
+    if (entry.action.type === 'move') {
+      return { from: entry.action.from, to: entry.action.to };
+    }
+  }
+
+  return null;
+}
+
+function intersectionPoint(position: Position): { cx: number; cy: number } {
+  return { cx: 50 + 100 * position.x, cy: 50 + 100 * position.y };
+}
+
+function buildBoardCells(
+  gameState: GameState,
+  selectedPosition: Position | null,
+  legalMoves: ReadonlyMap<string, LegalMoveHint> | undefined,
+  flip: FlipFeedback | null | undefined,
+): BoardCellModel[] {
   const markers = getRecentActionMarkers(gameState);
   const cells: BoardCellModel[] = [];
 
@@ -110,9 +150,11 @@ function buildBoardCells(gameState: GameState, selectedPosition: Position | null
       cells.push({
         cellState,
         coordinateLabel: `${x},${y}`,
+        flipPhase: flip && flip.cellKey === key ? flip.phase : null,
         isFaceDown: cellState === 'hidden',
         isSelected: position.x === selectedPosition?.x && position.y === selectedPosition?.y,
         key,
+        legalMove: legalMoves?.get(key) ?? 'none',
         pieceCamp: piece?.revealed ? piece.camp : null,
         pieceLabel: piece ? (piece.revealed ? PIECE_SYMBOLS[piece.camp][piece.type] : '暗') : '',
         position,
@@ -126,8 +168,19 @@ function buildBoardCells(gameState: GameState, selectedPosition: Position | null
   return cells;
 }
 
-export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) {
-  const cells = buildBoardCells(gameState, selectedPosition);
+export function Board({
+  captureGhost = null,
+  checkPulse = null,
+  flip = null,
+  gameState,
+  legalMoves,
+  onCellClick,
+  selectedPosition,
+  trace = null,
+}: BoardProps) {
+  const cells = buildBoardCells(gameState, selectedPosition, legalMoves, flip);
+  const lastMove = findLastMove(gameState);
+  const checkBanner = !gameState.winner && gameState.checkedCamp ? '将军警示：请立即应将' : null;
 
   return (
     <section className="board-shell" data-turn={gameState.winner ? 'finished' : gameState.currentTurn}>
@@ -148,9 +201,38 @@ export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) 
           <li className="board-legend-item board-legend-item-recent">最近动作</li>
         </ul>
       </div>
-      <div className="board-frame">
+      {checkBanner ? <p className="board-check-banner">{checkBanner}</p> : null}
+      <div className="board-frame" data-check={gameState.winner ? 'none' : gameState.checkedCamp ?? 'none'}>
+        {checkPulse ? <span aria-hidden="true" className="board-check-ripple" data-testid="check-ripple" /> : null}
         <div className="board" role="grid" aria-label="翻牌中国象棋棋盘">
           <BoardArtwork />
+          <svg aria-hidden="true" className="board-trace-layer" focusable="false" viewBox="0 0 900 1000">
+            {lastMove ? (
+              <>
+                <circle
+                  className="board-last-move-ring board-last-move-from"
+                  cx={intersectionPoint(lastMove.from).cx}
+                  cy={intersectionPoint(lastMove.from).cy}
+                  r="44"
+                />
+                <circle
+                  className="board-last-move-ring board-last-move-to"
+                  cx={intersectionPoint(lastMove.to).cx}
+                  cy={intersectionPoint(lastMove.to).cy}
+                  r="48"
+                />
+              </>
+            ) : null}
+            {trace ? (
+              <line
+                className="board-trace-line"
+                x1={intersectionPoint(trace.from).cx}
+                y1={intersectionPoint(trace.from).cy}
+                x2={intersectionPoint(trace.to).cx}
+                y2={intersectionPoint(trace.to).cy}
+              />
+            ) : null}
+          </svg>
           {cells.map((cell) => {
             const classes = ['cell'];
             if (cell.pieceCamp) {
@@ -170,6 +252,8 @@ export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) 
                 aria-pressed={cell.isSelected}
                 className={classes.join(' ')}
                 data-cell-state={cell.cellState}
+                data-flip-phase={cell.flipPhase ?? 'none'}
+                data-legal-move={cell.legalMove}
                 data-recent-action={cell.recentAction}
                 data-testid={cell.testId}
                 data-turn-state={cell.turnState}
@@ -177,12 +261,35 @@ export function Board({ gameState, selectedPosition, onCellClick }: BoardProps) 
                 type="button"
               >
                 <span className="coordinate">{cell.coordinateLabel}</span>
-                <PieceFace cellState={cell.cellState} pieceCamp={cell.pieceCamp} pieceLabel={cell.pieceLabel} />
                 <span aria-hidden="true" className="state-ring" />
-                <span className="piece-text">{cell.pieceLabel}</span>
+                <span className={`piece-visual${cell.flipPhase ? ` flip-${cell.flipPhase}` : ''}`}>
+                  <PieceFace cellState={cell.cellState} pieceCamp={cell.pieceCamp} pieceLabel={cell.pieceLabel} />
+                  <span className="piece-text">{cell.pieceLabel}</span>
+                </span>
+                {cell.legalMove === 'none' ? null : (
+                  <span aria-hidden="true" className={`legal-move legal-move-${cell.legalMove}`} />
+                )}
               </button>
             );
           })}
+          {captureGhost ? (
+            <span
+              aria-hidden="true"
+              className="capture-ghost"
+              data-testid="capture-ghost"
+              style={{
+                left: `${((50 + 100 * captureGhost.position.x) / 900) * 100}%`,
+                top: `${((50 + 100 * captureGhost.position.y) / 1000) * 100}%`,
+              }}
+            >
+              <PieceFace
+                cellState="revealed"
+                pieceCamp={captureGhost.camp}
+                pieceLabel={PIECE_SYMBOLS[captureGhost.camp][captureGhost.pieceType]}
+              />
+              <span className="piece-text">{PIECE_SYMBOLS[captureGhost.camp][captureGhost.pieceType]}</span>
+            </span>
+          ) : null}
         </div>
       </div>
     </section>

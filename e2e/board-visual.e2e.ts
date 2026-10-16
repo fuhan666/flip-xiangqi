@@ -284,6 +284,91 @@ test.describe('board visual smoke', () => {
     expect(consoleErrors).toEqual([]);
   });
 
+  test('interaction feedback: flip phases, legal hints, trace and last move', async ({ page }) => {
+    const consoleErrors = watchConsole(page);
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await page.goto('/');
+
+    await page.getByTestId('cell-4-9').click();
+    await expect(page.locator('.legal-move')).not.toHaveCount(0);
+    await page.getByTestId('cell-4-9').click();
+    await expect(page.locator('.legal-move')).toHaveCount(0);
+
+    await page.getByTestId('cell-4-9').click();
+    await page.getByTestId('cell-4-8').click();
+    await expect(page.locator('.board-trace-line')).toHaveCount(1);
+    await expect(page.locator('.board-last-move-ring')).toHaveCount(2);
+    await expect(page.locator('.board-trace-line')).toHaveCount(0, { timeout: 4_000 });
+    await expect(page.locator('.board-last-move-ring')).toHaveCount(2);
+
+    await page.evaluate(() => {
+      const target = document.querySelector('[data-testid="cell-4-3"]') as HTMLElement;
+      const samples: Array<{ phase: string | null; cellState: string | null; campClass: boolean }> = [];
+      (window as unknown as { __flipSamples: typeof samples }).__flipSamples = samples;
+      const tick = () => {
+        const phase = target.getAttribute('data-flip-phase');
+        if (samples.length === 0 || samples[samples.length - 1].phase !== phase) {
+          samples.push({
+            phase,
+            cellState: target.getAttribute('data-cell-state'),
+            campClass: target.classList.contains('red') || target.classList.contains('black'),
+          });
+        }
+        if (samples.length < 4) {
+          requestAnimationFrame(tick);
+        }
+      };
+      tick();
+    });
+
+    await page.getByTestId('cell-4-3').click();
+    await expect
+      .poll(async () => page.evaluate(() => (window as unknown as { __flipSamples: unknown[] }).__flipSamples.length), {
+        intervals: [50, 100, 200],
+        timeout: 5_000,
+      })
+      .toBeGreaterThanOrEqual(3);
+
+    const samples = await page.evaluate(
+      () =>
+        (window as unknown as { __flipSamples: Array<{ phase: string | null; cellState: string | null; campClass: boolean }> })
+          .__flipSamples,
+    );
+    const back = samples.find((sample) => sample.phase === 'back');
+    const front = samples.find((sample) => sample.phase === 'front');
+    expect(back, JSON.stringify(samples)).toBeTruthy();
+    expect(front, JSON.stringify(samples)).toBeTruthy();
+    expect(back?.cellState).toBe('hidden');
+    expect(back?.campClass).toBe(false);
+    expect(front?.cellState).toBe('revealed');
+    await expect(page.getByTestId('cell-4-3')).toHaveAttribute('data-recent-action', 'flip');
+    await expect(page.getByTestId('cell-4-3')).toHaveAttribute('data-flip-phase', 'none');
+    await expect(page.locator('.board-last-move-ring')).toHaveCount(2);
+
+    await page.screenshot({
+      fullPage: true,
+      path: path.join(EVIDENCE_DIR, 'board-feedback-hints-trace.png'),
+    });
+
+    expect(consoleErrors).toEqual([]);
+  });
+
+  test('reduced motion reveals flipped pieces immediately without transient effects', async ({ browser }) => {
+    const context = await browser.newContext({ reducedMotion: 'reduce' });
+    const page = await context.newPage();
+    await page.goto('/');
+
+    await page.getByTestId('cell-4-9').click();
+    await page.getByTestId('cell-4-8').click();
+    await expect(page.locator('.board-trace-line')).toHaveCount(0);
+    await expect(page.locator('.board-last-move-ring')).toHaveCount(2);
+
+    await page.getByTestId('cell-4-3').click();
+    await expect(page.getByTestId('cell-4-3')).toHaveAttribute('data-cell-state', 'revealed');
+    await expect(page.getByTestId('cell-4-3')).toHaveAttribute('data-flip-phase', 'none');
+    await context.close();
+  });
+
   test('calligraphy font rendering evidence', async ({ page }) => {
     await page.setViewportSize({ width: 1366, height: 768 });
     await page.goto('/');

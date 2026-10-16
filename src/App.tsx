@@ -1,11 +1,20 @@
 import { useMemo, useState } from 'react';
-import { applyAction, createInitialGameState, getPieceAt, restartGame, undoLastAction } from './game';
+import {
+  applyAction,
+  createInitialGameState,
+  getPieceAt,
+  listLegalMoves,
+  restartGame,
+  undoLastAction,
+} from './game';
 import type { GameHistoryConsequence, GameHistoryEndgameReason, GameState, Position } from './game';
 import { Board } from './components/Board';
 import { CapturedPieces } from './components/CapturedPieces';
 import { MoveHistory, actionSummary, campLabel } from './components/MoveHistory';
 import { GameControls } from './components/GameControls';
 import { StatusPanel } from './components/StatusPanel';
+import { useBoardFeedback } from './components/useBoardFeedback';
+import type { LegalMoveHint } from './components/useBoardFeedback';
 
 interface GameResultSummary {
   archiveLabel: string;
@@ -76,10 +85,37 @@ export default function App({ initialState }: AppProps) {
   const [recentCompletedGames, setRecentCompletedGames] = useState<GameResultSummary[]>([]);
   const [selectedPosition, setSelectedPosition] = useState<Position | null>(null);
   const [interactionMessage, setInteractionMessage] = useState<string | null>(null);
+  const feedback = useBoardFeedback(gameState);
+  const displayState = feedback.displayState;
   const canUndo = gameState.undoStack.length > 0;
   const currentGameSummary = buildGameResultSummary(gameState);
+  const displayedGameSummary = buildGameResultSummary(displayState);
+
+  const legalMoves = useMemo(() => {
+    const hints = new Map<string, LegalMoveHint>();
+
+    if (gameState.winner || !selectedPosition) {
+      return hints;
+    }
+
+    const piece = getPieceAt(gameState, selectedPosition);
+    if (!piece || !piece.revealed || piece.captured || piece.camp !== gameState.currentTurn) {
+      return hints;
+    }
+
+    for (const target of listLegalMoves(gameState, piece.id)) {
+      const occupant = getPieceAt(gameState, target);
+      hints.set(`${target.x}-${target.y}`, occupant ? 'capture' : 'empty');
+    }
+
+    return hints;
+  }, [gameState, selectedPosition]);
 
   const handleCellClick = (position: Position) => {
+    if (feedback.flip) {
+      return;
+    }
+
     const piece = getPieceAt(gameState, position);
 
     if (piece && !piece.revealed) {
@@ -161,16 +197,25 @@ export default function App({ initialState }: AppProps) {
       </header>
 
       <div className="layout">
-        <Board gameState={gameState} selectedPosition={selectedPosition} onCellClick={handleCellClick} />
+        <Board
+          captureGhost={feedback.captureGhost}
+          checkPulse={feedback.checkPulse}
+          flip={feedback.flip}
+          gameState={displayState}
+          legalMoves={legalMoves}
+          onCellClick={handleCellClick}
+          selectedPosition={selectedPosition}
+          trace={feedback.trace}
+        />
         <aside className="sidebar">
-          <MoveHistory recentAction={gameState.recentAction} />
+          <MoveHistory recentAction={displayState.recentAction} />
           <StatusPanel
-            currentGameSummary={currentGameSummary}
-            gameState={gameState}
+            currentGameSummary={displayedGameSummary}
+            gameState={displayState}
             interactionMessage={interactionMessage}
             recentCompletedGames={recentCompletedGames}
           />
-          <CapturedPieces gameState={gameState} />
+          <CapturedPieces gameState={displayState} />
           <GameControls
             canUndo={canUndo}
             isGameOver={Boolean(gameState.winner)}
