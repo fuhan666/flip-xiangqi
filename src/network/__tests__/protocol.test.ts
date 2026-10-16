@@ -5,6 +5,8 @@ import {
   buildClientLeave,
   buildClientLobbyReady,
   buildClientLobbySettings,
+  buildPing,
+  buildPong,
   buildServerMessage,
   closeCodeForError,
   encodeMessage,
@@ -257,3 +259,65 @@ describe('error code and close code mapping', () => {
     expect(serverErrorCodeForCloseCode(1006)).toBeNull();
   });
 });
+
+describe('heartbeat and session resumption envelopes', () => {
+  it('encodes and parses client and server ping/pong messages with seq numbers', () => {
+    const clientPing = encodeMessage(buildPing('room-1', 42));
+    const parsedClientPing = parseClientMessage(clientPing);
+    expect(parsedClientPing.ok).toBe(true);
+    if (parsedClientPing.ok) {
+      expect(parsedClientPing.message.type).toBe('ping');
+      expect(parsedClientPing.message.roomId).toBe('room-1');
+      expect(parsedClientPing.message.payload).toEqual({ seq: 42 });
+    }
+
+    const serverPong = encodeMessage(buildPong('room-1', 42));
+    const parsedServerPong = parseServerMessage(serverPong);
+    expect(parsedServerPong.ok).toBe(true);
+    if (parsedServerPong.ok) {
+      expect(parsedServerPong.message.type).toBe('pong');
+      expect(parsedServerPong.message.roomId).toBe('room-1');
+      expect(parsedServerPong.message.payload).toEqual({ seq: 42 });
+    }
+  });
+
+  it('rejects invalid ping/pong with missing or non-integer seq', () => {
+    const badSeq = JSON.stringify({ version: PROTOCOL_VERSION, type: 'ping', roomId: 'r1', payload: { seq: -1 } });
+    expect(parseClientMessage(badSeq)).toMatchObject({ ok: false, code: 'INVALID_MESSAGE' });
+    expect(parseServerMessage(badSeq)).toMatchObject({ ok: false, code: 'INVALID_MESSAGE' });
+
+    const nonNumberSeq = JSON.stringify({ version: PROTOCOL_VERSION, type: 'pong', roomId: 'r1', payload: { seq: '1' } });
+    expect(parseClientMessage(nonNumberSeq)).toMatchObject({ ok: false, code: 'INVALID_MESSAGE' });
+    expect(parseServerMessage(nonNumberSeq)).toMatchObject({ ok: false, code: 'INVALID_MESSAGE' });
+  });
+
+  it('preserves resumeToken in hello and welcome payloads', () => {
+    const hello = buildClientHello({ role: 'guest', name: '客人', roomId: 'room-1', resumeToken: 'token-abc' });
+    const parsedHello = parseClientMessage(encodeMessage(hello));
+    expect(parsedHello.ok).toBe(true);
+    if (parsedHello.ok && parsedHello.message.type === 'hello') {
+      expect(parsedHello.message.payload.resumeToken).toBe('token-abc');
+      expect(parsedHello.message.roomId).toBe('room-1');
+    }
+
+    const welcomeMsg = buildServerMessage({
+      type: 'welcome',
+      roomId: 'room-1',
+      payload: {
+        roomId: 'room-1',
+        memberId: 'guest-1',
+        role: 'guest',
+        name: '客人',
+        members: [{ id: 'guest-1', role: 'guest', name: '客人', connected: true }],
+        lobby: createLobbyState(),
+        resumeToken: 'token-xyz',
+      },
+    });
+    const parsedWelcome = parseServerMessage(welcomeMsg);
+    expect(parsedWelcome.ok).toBe(true);
+    if (parsedWelcome.ok && parsedWelcome.message.type === 'welcome') {
+      expect(parsedWelcome.message.payload.resumeToken).toBe('token-xyz');
+    }
+  });
+});
+

@@ -17,5 +17,7 @@ export default defineConfig({
     url: 'http://127.0.0.1:4173',
     reuseExistingServer: true,
     timeout: 60_000,
+    stdout: 'pipe',
+    stderr: 'pipe',
   },
 });

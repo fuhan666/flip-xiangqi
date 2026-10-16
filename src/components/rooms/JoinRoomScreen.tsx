@@ -6,7 +6,10 @@ import { loadRecentRooms, rememberRoom } from '../../network/recent-rooms';
 import type { RecentRoom } from '../../network/recent-rooms';
 import { IDLE_CONNECTION_STATE } from './connection-state';
 import { ConfirmDialog } from './ConfirmDialog';
+import { ConnectionBanner } from './ConnectionBanner';
+import { ConnectionStatus } from './ConnectionStatus';
 import { RoomLobby } from './RoomLobby';
+import { Toast } from './Toast';
 
 interface JoinRoomScreenProps {
   createClient: () => RoomConnection;
@@ -100,22 +103,32 @@ export function JoinRoomScreen({ createClient, storage, initialAddress, guestPag
     setConnection(IDLE_CONNECTION_STATE);
   }, []);
 
-  const connected = connection.status === 'connected';
+  const inLobby = connection.status === 'connected' || connection.status === 'reconnecting';
   const connecting = connection.status === 'connecting';
 
   return (
     <main className="app-shell room-shell">
-      <header className="room-header">
-        <h1>加入房间</h1>
-        <p>{guestPage ? '你正在打开房主分享的地址，确认后即可加入。' : '输入房主分享的地址，加入同一局域网的对局房间。'}</p>
+      {connection.status === 'reconnecting' ? (
+        <ConnectionBanner onReconnect={() => clientRef.current?.reconnect()} />
+      ) : null}
+      {connection.justReconnected ? <Toast message="已重新连接 ✓" /> : null}
+
+      <header className="room-header room-header-row">
+        <div>
+          <h1>加入房间</h1>
+          <p>{guestPage ? '你正在打开房主分享的地址，确认后即可加入。' : '输入房主分享的地址，加入同一局域网的对局房间。'}</p>
+        </div>
+        {inLobby ? (
+          <ConnectionStatus rtt={connection.rtt} status={connection.status} />
+        ) : null}
       </header>
 
-      {connected ? (
+      {inLobby ? (
         <>
           <RoomLobby
             connectionHint={
               <p className="room-hint" data-testid="join-connection-state">
-                已连接 · 房间号 {connection.roomId}
+                {connection.status === 'reconnecting' ? '正在重连…' : `已连接 · 房间号 ${connection.roomId}`}
               </p>
             }
             lastRejection={connection.lastRejection}
@@ -128,6 +141,7 @@ export function JoinRoomScreen({ createClient, storage, initialAddress, guestPag
             }
             onStart={() => clientRef.current?.sendLobbyStart()}
             pendingCommand={connection.pendingCommand}
+            reconnecting={connection.reconnecting}
             selfId={connection.memberId}
             viewerRole={connection.role ?? 'guest'}
           />

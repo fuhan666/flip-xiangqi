@@ -613,9 +613,176 @@
   line-height: 1.7;
 }
 
+.room-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.connection-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgba(36, 18, 5, 0.65);
+  border: 1px solid rgba(215, 178, 119, 0.35);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  font-size: 13px;
+  color: #f3ede0;
+  letter-spacing: 0.06em;
+}
+
+.connection-lamp {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.connection-lamp-green {
+  background: #7fc46a;
+  box-shadow: 0 0 6px rgba(127, 196, 106, 0.7);
+}
+
+.connection-lamp-yellow {
+  background: #e8c47c;
+  box-shadow: 0 0 6px rgba(232, 196, 124, 0.7);
+}
+
+.connection-lamp-red {
+  background: #e06c55;
+  box-shadow: 0 0 6px rgba(224, 108, 85, 0.7);
+}
+
+.connection-label {
+  font-weight: 500;
+}
+
+.connection-rtt {
+  color: rgba(243, 237, 224, 0.7);
+  font-variant-numeric: tabular-nums;
+}
+
+.connection-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 18px;
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(140, 42, 28, 0.32), rgba(100, 28, 18, 0.42));
+  border: 1px solid rgba(224, 108, 85, 0.65);
+  color: #fca5a5;
+  font-size: 14px;
+  width: 100%;
+  box-sizing: border-box;
+  animation: bannerSlideIn 0.2s ease;
+}
+
+.connection-banner-text {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  line-height: 1.5;
+}
+
+.connection-banner-icon {
+  font-size: 16px;
+}
+
+.connection-banner-action {
+  min-height: 44px;
+  padding: 8px 18px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.2s ease, transform 0.2s ease;
+}
+
+.connection-banner-action:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.22);
+  transform: translateY(-1px);
+}
+
+.room-toast {
+  position: fixed;
+  top: 24px;
+  right: 24px;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 20px;
+  border-radius: 12px;
+  background: rgba(30, 70, 32, 0.92);
+  border: 1px solid rgba(127, 196, 106, 0.6);
+  color: #ecfdf5;
+  font-size: 14px;
+  font-weight: 500;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  animation: toastFadeIn 0.2s ease;
+}
+
+.room-toast .toast-icon {
+  color: #86efac;
+  font-weight: bold;
+}
+
+@keyframes bannerSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes toastFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 680px) {
+  .connection-banner {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .connection-banner-action {
+    width: 100%;
+  }
+
+  .room-header-row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .setting-option,
-  .panel-action-gold {
+  .panel-action-gold,
+  .connection-banner-action {
     transition: none;
+  }
+  .connection-banner,
+  .room-toast {
+    animation: none;
   }
 }

@@ -5,6 +5,7 @@ import type { MemberSnapshot } from '../../network/protocol';
 import { IDLE_CONNECTION_STATE } from './connection-state';
 import { copyText } from './clipboard';
 import { ConfirmDialog } from './ConfirmDialog';
+import { ConnectionStatus } from './ConnectionStatus';
 import { RoomLobby } from './RoomLobby';
 
 interface CreateRoomScreenProps {
@@ -152,9 +153,12 @@ export function CreateRoomScreen({ api, createClient, preferredPort, onExit }: C
 
   return (
     <main className="app-shell room-shell">
-      <header className="room-header">
-        <h1>等待对手加入</h1>
-        <p>请让对手与你连接同一 Wi-Fi/局域网，再输入上面的地址加入。</p>
+      <header className="room-header room-header-row">
+        <div>
+          <h1>等待对手加入</h1>
+          <p>请让对手与你连接同一 Wi-Fi/局域网，再输入上面的地址加入。</p>
+        </div>
+        <ConnectionStatus rtt={connection.rtt} status={connection.status} />
       </header>
 
       <section className="room-panel">
@@ -249,6 +253,7 @@ export function CreateRoomScreen({ api, createClient, preferredPort, onExit }: C
         onSettingsChange={(sidePreference, timeControlId) => sessionRef.current?.client.sendLobbySettings(sidePreference, timeControlId)}
         onStart={() => sessionRef.current?.client.sendLobbyStart()}
         pendingCommand={connection.pendingCommand}
+        reconnecting={connection.reconnecting}
         selfId={connection.memberId}
         viewerRole={connection.role ?? 'host'}
       />

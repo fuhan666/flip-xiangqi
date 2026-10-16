@@ -11,6 +11,7 @@ import {
   buildClientLobbyReady,
   buildClientLobbySettings,
   buildClientLobbyStart,
+  buildPong,
   encodeMessage,
   PROTOCOL_VERSION,
   type HelloPayload,
@@ -115,6 +116,54 @@ function occupyPort(port: number): Promise<Server> {
     // 与房间监听同样绑定 0.0.0.0，确保端口占用真实冲突。
     server.listen(port, '0.0.0.0', () => resolve(server));
   });
+}
+
+function enableAutoPong(client: TestClient, roomId: string): void {
+  client.socket.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === 'ping') {
+        client.send(encodeMessage(buildPong(roomId, msg.payload.seq)));
+      }
+    } catch {
+      // 忽略解析错误
+    }
+  });
+}
+
+interface ConnectedPair {
+  room: RoomServer;
+  host: TestClient;
+  guest: TestClient;
+  hostId: string;
+  guestId: string;
+}
+
+async function connectedPair(overrides: Partial<RoomServerOptions> = {}): Promise<ConnectedPair> {
+  const room = await startRoom(overrides);
+  const host = await openClient(room.actualPort);
+  await hello(host, { role: 'host', name: '房主', token: room.hostToken });
+  const hostWelcome = await host.waitForType('welcome');
+  const guest = await openClient(room.actualPort);
+  await hello(guest, { role: 'guest', name: '客人' });
+  const guestWelcome = await guest.waitForType('welcome');
+  return {
+    room,
+    host,
+    guest,
+    hostId: hostWelcome.payload.memberId,
+    guestId: guestWelcome.payload.memberId,
+  };
+}
+
+async function readyBoth(pair: ConnectedPair, settingsVersion: number): Promise<void> {
+  pair.host.send(encodeMessage(buildClientLobbyReady(pair.room.roomId, true, settingsVersion)));
+  await pair.host.waitForType('lobby.state', (message) => message.payload.lobby.ready.host === true);
+  pair.guest.send(encodeMessage(buildClientLobbyReady(pair.room.roomId, true, settingsVersion)));
+  await pair.host.waitForType(
+    'lobby.state',
+    (message) => message.payload.lobby.ready.host === true && message.payload.lobby.ready.guest === true,
+  );
 }
 
 afterEach(async () => {
@@ -394,41 +443,6 @@ describe('startRoomServer helper', () => {
 });
 
 describe('lobby synchronization and start gate', () => {
-  interface ConnectedPair {
-    room: RoomServer;
-    host: TestClient;
-    guest: TestClient;
-    hostId: string;
-    guestId: string;
-  }
-
-  async function connectedPair(overrides: Partial<RoomServerOptions> = {}): Promise<ConnectedPair> {
-    const room = await startRoom(overrides);
-    const host = await openClient(room.actualPort);
-    await hello(host, { role: 'host', name: '房主', token: room.hostToken });
-    const hostWelcome = await host.waitForType('welcome');
-    const guest = await openClient(room.actualPort);
-    await hello(guest, { role: 'guest', name: '客人' });
-    const guestWelcome = await guest.waitForType('welcome');
-    return {
-      room,
-      host,
-      guest,
-      hostId: hostWelcome.payload.memberId,
-      guestId: guestWelcome.payload.memberId,
-    };
-  }
-
-  async function readyBoth(pair: ConnectedPair, settingsVersion: number): Promise<void> {
-    pair.host.send(encodeMessage(buildClientLobbyReady(pair.room.roomId, true, settingsVersion)));
-    await pair.host.waitForType('lobby.state', (message) => message.payload.lobby.ready.host === true);
-    pair.guest.send(encodeMessage(buildClientLobbyReady(pair.room.roomId, true, settingsVersion)));
-    await pair.host.waitForType(
-      'lobby.state',
-      (message) => message.payload.lobby.ready.host === true && message.payload.lobby.ready.guest === true,
-    );
-  }
-
   it('sends the authoritative lobby snapshot in welcome and broadcasts every change', async () => {
     const pair = await connectedPair();
     expect(pair.guest.messages.find((message) => message.type === 'welcome')?.payload.lobby).toMatchObject({
@@ -641,5 +655,113 @@ describe('lobby synchronization and start gate', () => {
       redMemberId: pair.guestId,
       blackMemberId: pair.hostId,
     });
+  });
+});
+
+describe('heartbeat and reconnection', () => {
+  it('terminates silent socket when heartbeat pong is not received within timeout', async () => {
+    const room = await startRoom({ heartbeatIntervalMs: 50, heartbeatTimeoutMs: 50 });
+    const host = await openClient(room.actualPort);
+    enableAutoPong(host, room.roomId);
+    await hello(host, { role: 'host', name: '房主', token: room.hostToken });
+    await host.waitForType('welcome');
+
+    const guest = await openClient(room.actualPort);
+    await hello(guest, { role: 'guest', name: '客人' });
+    await guest.waitForType('welcome');
+
+    const ping = await guest.waitForType('ping');
+    expect(ping.payload.seq).toBeGreaterThanOrEqual(1);
+
+    const closeCode = await guest.closed;
+    expect(closeCode).toBe(1006);
+
+    const members = await host.waitForType(
+      'members',
+      (m) => m.payload.members.some((member: { role: string; connected: boolean }) => member.role === 'guest' && !member.connected),
+    );
+    expect(members.payload.members.find((m: { role: string }) => m.role === 'guest').connected).toBe(false);
+  });
+
+  it('keeps socket alive when client responds to ping with pong', async () => {
+    const room = await startRoom({ heartbeatIntervalMs: 50, heartbeatTimeoutMs: 80 });
+    const guest = await openClient(room.actualPort);
+    await hello(guest, { role: 'guest', name: '客人' });
+    await guest.waitForType('welcome');
+
+    const ping1 = await guest.waitForType('ping');
+    guest.send(encodeMessage(buildPong(room.roomId, ping1.payload.seq)));
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(guest.closeCode()).toBeNull();
+  });
+
+  it('allows guest reconnection with valid resumeToken and re-attaches existing member', async () => {
+    const room = await startRoom();
+    const host = await openClient(room.actualPort);
+    await hello(host, { role: 'host', name: '房主', token: room.hostToken });
+    await host.waitForType('welcome');
+
+    const guest1 = await openClient(room.actualPort);
+    await hello(guest1, { role: 'guest', name: '客人' });
+    const welcome1 = await guest1.waitForType('welcome');
+    const guestMemberId = welcome1.payload.memberId;
+    const resumeToken = welcome1.payload.resumeToken;
+    expect(typeof resumeToken).toBe('string');
+    expect(resumeToken.length).toBeGreaterThan(0);
+
+    guest1.socket.terminate();
+    await host.waitForType(
+      'members',
+      (m) => m.payload.members.some((member: { role: string; connected: boolean }) => member.role === 'guest' && !member.connected),
+    );
+
+    const guest2 = await openClient(room.actualPort);
+    await hello(guest2, { role: 'guest', name: '客人', resumeToken });
+    const welcome2 = await guest2.waitForType('welcome');
+    expect(welcome2.payload.memberId).toBe(guestMemberId);
+    expect(welcome2.payload.resumeToken).toBe(resumeToken);
+
+    const hostMembers = await host.waitForType(
+      'members',
+      (m) => m.payload.members.some((member: { role: string; connected: boolean }) => member.role === 'guest' && member.connected),
+    );
+    expect(hostMembers.payload.members.find((m: { role: string }) => m.role === 'guest').connected).toBe(true);
+  });
+
+  it('rejects reconnection with invalid or expired resumeToken with UNAUTHORIZED (4002)', async () => {
+    const room = await startRoom();
+    const guest = await openClient(room.actualPort);
+    await hello(guest, { role: 'guest', name: '客人', resumeToken: 'invalid-token-12345' });
+
+    const error = await guest.waitForType('error');
+    expect(error.payload.code).toBe('UNAUTHORIZED');
+    expect(await guest.closed).toBe(4002);
+  });
+
+  it('allows original guest with resumeToken to reconnect after game started, rejecting strangers', async () => {
+    const pair = await connectedPair();
+    await readyBoth(pair, 1);
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    await pair.guest.waitForType('lobby.state', (message) => message.payload.lobby.phase === 'started');
+
+    const resumeToken = pair.guest.messages.find((m) => m.type === 'welcome')?.payload.resumeToken;
+    expect(resumeToken).toBeDefined();
+
+    pair.guest.socket.terminate();
+    await pair.host.waitForType(
+      'members',
+      (m) => m.payload.members.some((member: { role: string; connected: boolean }) => member.role === 'guest' && !member.connected),
+    );
+
+    const stranger = await openClient(pair.room.actualPort);
+    await hello(stranger, { role: 'guest', name: '陌生人' });
+    expect(await stranger.closed).toBe(4003);
+
+    const reconnectedGuest = await openClient(pair.room.actualPort);
+    await hello(reconnectedGuest, { role: 'guest', name: '客人', resumeToken });
+    const reconnectedWelcome = await reconnectedGuest.waitForType('welcome');
+    expect(reconnectedWelcome.payload.memberId).toBe(pair.guestId);
+    expect(reconnectedWelcome.payload.lobby.phase).toBe('started');
   });
 });

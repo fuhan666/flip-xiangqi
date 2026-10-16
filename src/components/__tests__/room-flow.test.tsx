@@ -59,6 +59,7 @@ class FakeConnection implements RoomConnection {
   listeners = new Set<(state: ConnectionState) => void>();
   connectCalls: Array<{ address: ParsedAddress; options: JoinOptions }> = [];
   disconnectCalls = 0;
+  reconnectCalls = 0;
   lobbyCalls: LobbyCall[] = [];
   private savedAddress: string | null = null;
 
@@ -71,6 +72,10 @@ class FakeConnection implements RoomConnection {
   disconnect(): void {
     this.disconnectCalls += 1;
     this.setState({ ...IDLE_CONNECTION_STATE, status: 'disconnected' });
+  }
+
+  reconnect(): void {
+    this.reconnectCalls += 1;
   }
 
   subscribe(listener: (state: ConnectionState) => void): () => void {
@@ -440,6 +445,75 @@ describe('join room flow', () => {
     expect(screen.getByTestId('recent-empty')).toBeInTheDocument();
     expect(screen.getByTestId('join-address-input')).toHaveValue('192.168.1.5:8080');
     expect(screen.getByText(/你正在打开房主分享的地址/)).toBeInTheDocument();
+  });
+
+  it('displays connection banner and disables lobby controls during reconnection while keeping exit available', async () => {
+    const { connections, createClient } = connectionFactory();
+
+    render(
+      <JoinRoomScreen
+        createClient={createClient}
+        guestPage={false}
+        initialAddress="192.168.1.5:8080"
+        onExit={() => undefined}
+        storage={memoryStorage()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('join-submit'));
+    act(() => {
+      connections[0].emit({
+        status: 'connected',
+        memberId: 'guest-1',
+        roomId: 'room1234',
+        role: 'guest',
+        members: [HOST_MEMBER, GUEST_MEMBER],
+        lobby: createLobbyState(),
+      });
+    });
+
+    expect(screen.queryByTestId('connection-banner')).not.toBeInTheDocument();
+    expect(screen.getByTestId('lobby-ready-toggle')).not.toBeDisabled();
+
+    // 触发重连中状态
+    act(() => {
+      connections[0].emit({
+        status: 'reconnecting',
+        reconnecting: true,
+      });
+    });
+
+    // 横幅展示
+    expect(screen.getByTestId('connection-banner')).toBeInTheDocument();
+    expect(screen.getByTestId('connection-banner')).toHaveTextContent('与房间的连接已断开，正在重连…');
+
+    // 指示灯显示断线红灯
+    expect(screen.getByTestId('connection-lamp')).toHaveClass('connection-lamp-red');
+
+    // 大厅准备等操作控件被禁用
+    expect(screen.getByTestId('lobby-ready-toggle')).toBeDisabled();
+
+    // 点击手动重连按钮调用 reconnect
+    fireEvent.click(screen.getByTestId('reconnect-button'));
+    expect(connections[0].reconnectCalls).toBe(1);
+
+    // 退出房间入口依然可用
+    expect(screen.getByTestId('leave-room')).not.toBeDisabled();
+
+    // 重连成功后横幅消失，出现已重新连接 toast 与绿灯
+    act(() => {
+      connections[0].emit({
+        status: 'connected',
+        reconnecting: false,
+        justReconnected: true,
+        rtt: 45,
+      });
+    });
+
+    expect(screen.queryByTestId('connection-banner')).not.toBeInTheDocument();
+    expect(screen.getByTestId('reconnected-toast')).toHaveTextContent('已重新连接 ✓');
+    expect(screen.getByTestId('connection-rtt')).toHaveTextContent('45ms');
+    expect(screen.getByTestId('connection-lamp')).toHaveClass('connection-lamp-green');
   });
 });
 
