@@ -19,6 +19,10 @@ import {
   type LobbyState,
 } from '../src/network/lobby.js';
 import {
+  DEFAULT_HEARTBEAT_INTERVAL_MS,
+  DEFAULT_HEARTBEAT_TIMEOUT_MS,
+} from '../src/network/heartbeat.js';
+import {
   buildServerMessage,
   closeCodeForError,
   parseClientMessage,
@@ -48,6 +52,8 @@ export interface RoomServerOptions {
   preferredPort: number;
   maxPortAttempts?: number;
   handshakeTimeoutMs?: number;
+  heartbeatIntervalMs?: number;
+  heartbeatTimeoutMs?: number;
   /** 客人页面（开发为 Vite middleware，生产为静态 dist）。 */
   requestListener?: (request: IncomingMessage, response: ServerResponse) => void;
   logger?: Logger;
@@ -94,17 +100,26 @@ function generateId(): string {
   return randomBytes(8).toString('hex');
 }
 
+interface SocketWatchdog {
+  intervalTimer: NodeJS.Timeout | null;
+  timeoutTimer: NodeJS.Timeout | null;
+  pendingPongSeq: number | null;
+  seq: number;
+}
+
 export class RoomServer {
   readonly roomId: string;
   readonly hostToken: string;
 
-  private readonly options: Required<Pick<RoomServerOptions, 'maxPortAttempts' | 'handshakeTimeoutMs'>> & RoomServerOptions;
+  private readonly options: Required<Pick<RoomServerOptions, 'maxPortAttempts' | 'handshakeTimeoutMs' | 'heartbeatIntervalMs' | 'heartbeatTimeoutMs'>> & RoomServerOptions;
   private readonly logger: Logger;
   private readonly drawHostRed: () => boolean;
   private readonly server: Server;
   private readonly wss: WebSocketServer;
   private readonly tcpSockets = new Set<Socket>();
   private readonly openSockets = new Set<WebSocket>();
+  private readonly watchdogs = new Map<WebSocket, SocketWatchdog>();
+  private guestResumeToken: string | null = null;
   private host: RoomMember | null = null;
   private guest: RoomMember | null = null;
   private lobby: LobbyState;
@@ -116,6 +131,8 @@ export class RoomServer {
       ...options,
       maxPortAttempts: options.maxPortAttempts ?? DEFAULT_MAX_PORT_ATTEMPTS,
       handshakeTimeoutMs: options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS,
+      heartbeatIntervalMs: options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
+      heartbeatTimeoutMs: options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS,
     };
     this.logger = options.logger ?? defaultLogger;
     this.drawHostRed = options.drawHostRed ?? defaultDrawHostRed;
@@ -253,8 +270,77 @@ export class RoomServer {
       this.guest.socket = null;
     }
 
+    this.clearAllWatchdogs();
+    this.guestResumeToken = null;
+
     await this.stopListener();
     this.logger('room.closed', { room: this.roomId, reason });
+  }
+
+  private startWatchdog(socket: WebSocket): void {
+    this.clearSocketWatchdog(socket);
+    const watchdog: SocketWatchdog = {
+      intervalTimer: null,
+      timeoutTimer: null,
+      pendingPongSeq: null,
+      seq: 0,
+    };
+    this.watchdogs.set(socket, watchdog);
+
+    watchdog.intervalTimer = setInterval(() => {
+      // 1 === WebSocket.OPEN
+      if (socket.readyState !== 1) {
+        this.clearSocketWatchdog(socket);
+        return;
+      }
+      if (watchdog.pendingPongSeq !== null) {
+        // 等待旧探测的应答中，既有超时计时器已在计时，不发送新探测
+        return;
+      }
+      watchdog.seq += 1;
+      const seq = watchdog.seq;
+      watchdog.pendingPongSeq = seq;
+      try {
+        socket.send(buildServerMessage({ type: 'ping', roomId: this.roomId, payload: { seq } }));
+      } catch {
+        // 忽略发送失败
+      }
+      watchdog.timeoutTimer = setTimeout(() => {
+        if (watchdog.pendingPongSeq === seq) {
+          this.logger('ws.heartbeat_timeout', { room: this.roomId, seq });
+          this.clearSocketWatchdog(socket);
+          try {
+            socket.terminate();
+          } catch {
+            // socket 可能已关闭
+          }
+        }
+      }, this.options.heartbeatTimeoutMs);
+      watchdog.timeoutTimer.unref?.();
+    }, this.options.heartbeatIntervalMs);
+    watchdog.intervalTimer.unref?.();
+  }
+
+  private clearSocketWatchdog(socket: WebSocket): void {
+    const wd = this.watchdogs.get(socket);
+    if (!wd) {
+      return;
+    }
+    if (wd.intervalTimer) {
+      clearInterval(wd.intervalTimer);
+      wd.intervalTimer = null;
+    }
+    if (wd.timeoutTimer) {
+      clearTimeout(wd.timeoutTimer);
+      wd.timeoutTimer = null;
+    }
+    this.watchdogs.delete(socket);
+  }
+
+  private clearAllWatchdogs(): void {
+    for (const socket of [...this.watchdogs.keys()]) {
+      this.clearSocketWatchdog(socket);
+    }
   }
 
   private listenOn(port: number): Promise<void> {
@@ -358,16 +444,47 @@ export class RoomServer {
               name: member.name,
               members: this.getMembers(),
               lobby: this.getLobby(),
+              ...(member.role === 'guest' && this.guestResumeToken ? { resumeToken: this.guestResumeToken } : {}),
             },
           }),
         );
         this.broadcastMembers();
+        this.startWatchdog(socket);
         this.logger('ws.joined', { room: this.roomId, member: member.id, role: member.role });
         return;
       }
 
       if (!joinedMember) {
         this.reject(socket, connectionId, 'INVALID_MESSAGE', 'not-handshaked');
+        return;
+      }
+
+      if (message.type === 'ping') {
+        if (message.roomId !== this.roomId) {
+          this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
+          return;
+        }
+        try {
+          socket.send(buildServerMessage({ type: 'pong', roomId: this.roomId, payload: { seq: message.payload.seq } }));
+        } catch {
+          // 忽略发送失败
+        }
+        return;
+      }
+
+      if (message.type === 'pong') {
+        if (message.roomId !== this.roomId) {
+          this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
+          return;
+        }
+        const wd = this.watchdogs.get(socket);
+        if (wd && wd.pendingPongSeq === message.payload.seq) {
+          wd.pendingPongSeq = null;
+          if (wd.timeoutTimer) {
+            clearTimeout(wd.timeoutTimer);
+            wd.timeoutTimer = null;
+          }
+        }
         return;
       }
 
@@ -396,12 +513,24 @@ export class RoomServer {
       this.reject(socket, connectionId, 'INVALID_MESSAGE', 'unexpected-type');
     });
 
-    socket.on('close', () => {
+    socket.on('close', (code, reason) => {
       clearTimeout(handshakeTimer);
+      this.clearSocketWatchdog(socket);
       this.openSockets.delete(socket);
-      this.logger('ws.disconnected', { room: this.roomId, conn: connectionId });
+      this.logger('ws.disconnected', {
+        room: this.roomId,
+        conn: connectionId,
+        code,
+        reason: reason.toString(),
+        role: joinedMember?.role,
+      });
 
       if (!joinedMember) {
+        return;
+      }
+
+      // 若当前席位已被同会话重连的新 socket 替换，旧 close 不能将新连接标为离线
+      if (joinedMember.socket !== socket) {
         return;
       }
 
@@ -415,7 +544,7 @@ export class RoomServer {
     });
   }
 
-  private admitMember(socket: WebSocket, payload: { role: Role; name: string; token?: string }): RoomMember | null {
+  private admitMember(socket: WebSocket, payload: { role: Role; name: string; token?: string; resumeToken?: string }): RoomMember | null {
     if (payload.role === 'host') {
       if (!payload.token || payload.token !== this.hostToken) {
         this.reject(socket, 'host', 'UNAUTHORIZED', 'bad-host-token');
@@ -437,6 +566,27 @@ export class RoomServer {
       return member;
     }
 
+    if (payload.resumeToken) {
+      if (!this.guestResumeToken || payload.resumeToken !== this.guestResumeToken || !this.guest) {
+        this.reject(socket, 'guest', 'UNAUTHORIZED', 'bad-resume-token');
+        return null;
+      }
+      const member = this.guest;
+      const oldSocket = member.socket;
+      if (oldSocket && oldSocket !== socket) {
+        this.clearSocketWatchdog(oldSocket);
+        try {
+          oldSocket.terminate();
+        } catch {
+          // 忽略关闭失败
+        }
+      }
+      member.socket = socket;
+      member.connected = true;
+      member.leaveReason = null;
+      return member;
+    }
+
     if (this.guest?.connected) {
       this.reject(socket, 'guest', 'ROOM_FULL', 'guest-slot-taken');
       return null;
@@ -447,6 +597,7 @@ export class RoomServer {
       return null;
     }
 
+    this.guestResumeToken = generateToken();
     const member: RoomMember = {
       id: generateId(),
       role: 'guest',
@@ -589,6 +740,9 @@ export class RoomServer {
       return;
     }
 
+    if (member.socket) {
+      this.clearSocketWatchdog(member.socket);
+    }
     member.connected = false;
     member.socket = null;
     member.leaveReason = 'dropped';
@@ -603,7 +757,14 @@ export class RoomServer {
       return;
     }
 
+    if (member.role === 'guest') {
+      this.guestResumeToken = null;
+    }
+
     const socket = member.socket;
+    if (socket) {
+      this.clearSocketWatchdog(socket);
+    }
     member.connected = false;
     member.socket = null;
     member.leaveReason = 'left';

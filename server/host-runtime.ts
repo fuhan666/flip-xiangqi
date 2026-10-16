@@ -26,6 +26,8 @@ export interface HostRuntimeOptions {
   staticDir?: string;
   maxPortAttempts?: number;
   handshakeTimeoutMs?: number;
+  heartbeatIntervalMs?: number;
+  heartbeatTimeoutMs?: number;
   logger?: Logger;
 }
 
@@ -167,6 +169,8 @@ export class HostRuntime {
       preferredPort: port,
       maxPortAttempts: this.options.maxPortAttempts,
       handshakeTimeoutMs: this.options.handshakeTimeoutMs,
+      heartbeatIntervalMs: this.options.heartbeatIntervalMs,
+      heartbeatTimeoutMs: this.options.heartbeatTimeoutMs,
       logger: this.logger,
       requestListener: (request, response) => {
         void this.handleRoomPageRequest(request, response);

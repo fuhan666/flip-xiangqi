@@ -98,11 +98,14 @@ export interface HelloPayload {
   role: Role;
   name: string;
   token?: string;
+  resumeToken?: string;
 }
 
 export type ClientMessage =
   | (Envelope & { type: 'hello'; roomId: null | string; payload: HelloPayload })
   | (Envelope & { type: 'leave'; roomId: string; payload: Record<string, never> })
+  | (Envelope & { type: 'ping'; roomId: string; payload: { seq: number } })
+  | (Envelope & { type: 'pong'; roomId: string; payload: { seq: number } })
   | (Envelope & { type: 'lobby.settings'; roomId: string; payload: { sidePreference: SidePreference; timeControlId: TimeControlId } })
   | (Envelope & { type: 'lobby.lock'; roomId: string; payload: { locked: boolean } })
   | (Envelope & { type: 'lobby.ready'; roomId: string; payload: { ready: boolean; settingsVersion: number } })
@@ -124,9 +127,12 @@ export type ServerMessage =
         name: string;
         members: MemberSnapshot[];
         lobby: LobbyState;
+        resumeToken?: string;
       };
     })
   | (Envelope & { type: 'members'; roomId: string; payload: { members: MemberSnapshot[] } })
+  | (Envelope & { type: 'ping'; roomId: string; payload: { seq: number } })
+  | (Envelope & { type: 'pong'; roomId: string; payload: { seq: number } })
   | (Envelope & { type: 'lobby.state'; roomId: string; payload: { lobby: LobbyState } })
   | (Envelope & { type: 'lobby.rejected'; roomId: string; payload: LobbyRejection })
   | (Envelope & { type: 'room.closed'; roomId: string; payload: { reason: RoomClosedReason } })
@@ -197,6 +203,7 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
     const role = payload.role;
     const name = payload.name;
     const token = payload.token;
+    const resumeToken = payload.resumeToken;
     if (role !== 'host' && role !== 'guest') {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'hello-role' };
     }
@@ -205,6 +212,9 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
     }
     if (token !== undefined && typeof token !== 'string') {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'hello-token' };
+    }
+    if (resumeToken !== undefined && typeof resumeToken !== 'string') {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'hello-resume-token' };
     }
     return {
       ok: true,
@@ -215,8 +225,23 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
           role,
           name,
           ...(typeof token === 'string' ? { token } : {}),
+          ...(typeof resumeToken === 'string' ? { resumeToken } : {}),
         },
       },
+    };
+  }
+
+  if (message.type === 'ping' || message.type === 'pong') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: `${message.type}-room-id` };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof payload.seq !== 'number' || !Number.isInteger(payload.seq) || payload.seq < 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: `${message.type}-seq` };
+    }
+    return {
+      ok: true,
+      message: { ...message, type: message.type, roomId: message.roomId, payload: { seq: payload.seq } },
     };
   }
 
@@ -317,8 +342,23 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
           name: typeof payload.name === 'string' ? payload.name : payload.role === 'host' ? '房主' : '客人',
           members,
           lobby,
+          ...(typeof payload.resumeToken === 'string' ? { resumeToken: payload.resumeToken } : {}),
         },
       },
+    };
+  }
+
+  if (message.type === 'ping' || message.type === 'pong') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: `${message.type}-room-id` };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof payload.seq !== 'number' || !Number.isInteger(payload.seq) || payload.seq < 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: `${message.type}-seq` };
+    }
+    return {
+      ok: true,
+      message: { ...message, type: message.type, roomId: message.roomId, payload: { seq: payload.seq } },
     };
   }
 
@@ -434,7 +474,13 @@ export function encodeMessage(message: ClientMessage | ServerMessage): string {
   return JSON.stringify(message);
 }
 
-export function buildClientHello(input: { role: Role; name: string; token?: string; roomId?: string | null }): ClientMessage {
+export function buildClientHello(input: {
+  role: Role;
+  name: string;
+  token?: string;
+  resumeToken?: string;
+  roomId?: string | null;
+}): ClientMessage {
   return {
     version: PROTOCOL_VERSION,
     type: 'hello',
@@ -443,8 +489,17 @@ export function buildClientHello(input: { role: Role; name: string; token?: stri
       role: input.role,
       name: input.name,
       ...(input.token ? { token: input.token } : {}),
+      ...(input.resumeToken ? { resumeToken: input.resumeToken } : {}),
     },
   };
+}
+
+export function buildPing(roomId: string, seq: number): ClientMessage & ServerMessage {
+  return { version: PROTOCOL_VERSION, type: 'ping', roomId, payload: { seq } };
+}
+
+export function buildPong(roomId: string, seq: number): ClientMessage & ServerMessage {
+  return { version: PROTOCOL_VERSION, type: 'pong', roomId, payload: { seq } };
 }
 
 export function buildClientLeave(roomId: string): ClientMessage {

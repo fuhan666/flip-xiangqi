@@ -361,4 +361,279 @@ describe('RoomClient', () => {
     await waitUntil(() => client.getState().lastRejection === null);
     expect(client.getState().status).toBe('connected');
   });
+
+  it('measures round-trip latency upon receiving pong from server', async () => {
+    const server = await startServer((socket) => {
+      socket.on('message', (data) => {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'hello') {
+          socket.send(
+            buildServerMessage({
+              type: 'welcome',
+              roomId: 'room-1',
+              payload: {
+                roomId: 'room-1',
+                memberId: 'guest-1',
+                role: 'guest',
+                name: '客人',
+                members,
+                lobby: createLobbyState(),
+                resumeToken: 'res-token-1',
+              },
+            }),
+          );
+        } else if (msg.type === 'ping') {
+          socket.send(
+            buildServerMessage({
+              type: 'pong',
+              roomId: 'room-1',
+              payload: { seq: msg.payload.seq },
+            }),
+          );
+        }
+      });
+    });
+
+    const client = new RoomClient({
+      webSocketFactory: (url) => new NodeWebSocket(url) as unknown as WebSocketLike,
+      connectTimeoutMs: 2000,
+      heartbeatIntervalMs: 50,
+      heartbeatTimeoutMs: 200,
+    });
+    client.connect({ host: '127.0.0.1', port: server.port }, { role: 'guest', name: '客人' });
+
+    await waitUntil(() => client.getState().status === 'connected');
+    await waitUntil(() => typeof client.getState().rtt === 'number');
+    expect(client.getState().rtt).toBeGreaterThanOrEqual(0);
+    client.disconnect();
+  });
+
+  it('detects silent disconnection via heartbeat timeout and enters reconnecting state', async () => {
+    let dropPings = false;
+    const server = await startServer((socket) => {
+      socket.on('message', (data) => {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'hello') {
+          socket.send(
+            buildServerMessage({
+              type: 'welcome',
+              roomId: 'room-1',
+              payload: {
+                roomId: 'room-1',
+                memberId: 'guest-1',
+                role: 'guest',
+                name: '客人',
+                members,
+                lobby: createLobbyState(),
+                resumeToken: 'res-token-2',
+              },
+            }),
+          );
+        } else if (msg.type === 'ping' && !dropPings) {
+          socket.send(
+            buildServerMessage({
+              type: 'pong',
+              roomId: 'room-1',
+              payload: { seq: msg.payload.seq },
+            }),
+          );
+        }
+      });
+    });
+
+    const client = new RoomClient({
+      webSocketFactory: (url) => new NodeWebSocket(url) as unknown as WebSocketLike,
+      connectTimeoutMs: 2000,
+      heartbeatIntervalMs: 50,
+      heartbeatTimeoutMs: 100,
+      reconnectDelays: [50, 100],
+    });
+    client.connect({ host: '127.0.0.1', port: server.port }, { role: 'guest', name: '客人' });
+
+    await waitUntil(() => client.getState().status === 'connected');
+    dropPings = true;
+
+    await waitUntil(() => client.getState().status === 'reconnecting', 2000);
+    expect(client.getState().reconnecting).toBe(true);
+    expect(client.getState().rtt).toBeNull();
+    client.disconnect();
+  });
+
+  it('reconnects successfully and restores connected state with session resume credentials', async () => {
+    let reconnectAttempts = 0;
+    const server = await startServer((socket) => {
+      socket.on('message', (data) => {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'hello') {
+          if (msg.payload.resumeToken === 'token-res-3') {
+            reconnectAttempts += 1;
+            socket.send(
+              buildServerMessage({
+                type: 'welcome',
+                roomId: 'room-1',
+                payload: {
+                  roomId: 'room-1',
+                  memberId: 'guest-1',
+                  role: 'guest',
+                  name: '客人',
+                  members,
+                  lobby: createLobbyState(),
+                  resumeToken: 'token-res-3',
+                },
+              }),
+            );
+          } else {
+            socket.send(
+              buildServerMessage({
+                type: 'welcome',
+                roomId: 'room-1',
+                payload: {
+                  roomId: 'room-1',
+                  memberId: 'guest-1',
+                  role: 'guest',
+                  name: '客人',
+                  members,
+                  lobby: createLobbyState(),
+                  resumeToken: 'token-res-3',
+                },
+              }),
+            );
+          }
+        }
+      });
+    });
+
+    const client = new RoomClient({
+      webSocketFactory: (url) => new NodeWebSocket(url) as unknown as WebSocketLike,
+      connectTimeoutMs: 2000,
+      heartbeatIntervalMs: 50,
+      heartbeatTimeoutMs: 80,
+      reconnectDelays: [30, 60],
+    });
+    client.connect({ host: '127.0.0.1', port: server.port }, { role: 'guest', name: '客人' });
+
+    await waitUntil(() => client.getState().status === 'connected');
+
+    // 终止当前服务器连接（模拟连接突发中断）
+    for (const ws of server.wss.clients) {
+      ws.terminate();
+    }
+
+    // 客户端应自动重连并成功
+    await waitUntil(() => reconnectAttempts >= 1 && client.getState().status === 'connected', 3000);
+    expect(client.getState().status).toBe('connected');
+    expect(client.getState().reconnecting).toBe(false);
+    expect(client.getState().justReconnected).toBe(true);
+    client.disconnect();
+  });
+
+  it('exhausts reconnect budget and transitions to disconnected with actionable copy', async () => {
+    let allowJoin = true;
+    const server = await startServer((socket) => {
+      if (!allowJoin) {
+        socket.terminate();
+        return;
+      }
+      socket.on('message', (data) => {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'hello') {
+          socket.send(
+            buildServerMessage({
+              type: 'welcome',
+              roomId: 'room-1',
+              payload: {
+                roomId: 'room-1',
+                memberId: 'guest-1',
+                role: 'guest',
+                name: '客人',
+                members,
+                lobby: createLobbyState(),
+                resumeToken: 'token-res-budget',
+              },
+            }),
+          );
+        }
+      });
+    });
+
+    const client = new RoomClient({
+      webSocketFactory: (url) => new NodeWebSocket(url) as unknown as WebSocketLike,
+      connectTimeoutMs: 50,
+      heartbeatIntervalMs: 50,
+      heartbeatTimeoutMs: 50,
+      reconnectDelays: [30, 30],
+      reconnectBudgetMs: 100, // 短预算
+    });
+    client.connect({ host: '127.0.0.1', port: server.port }, { role: 'guest', name: '客人' });
+
+    await waitUntil(() => client.getState().status === 'connected');
+    allowJoin = false;
+    for (const ws of server.wss.clients) {
+      ws.terminate();
+    }
+
+    await waitUntil(() => client.getState().status === 'disconnected', 3000);
+    expect(client.getState().reconnecting).toBe(false);
+    expect(client.getState().message).toContain('房间不可达，可能网络断开或房主退出');
+    client.disconnect();
+  });
+
+  it('stops reconnecting on room.closed or fatal UNAUTHORIZED rejection', async () => {
+    let reconnectTries = 0;
+    const server = await startServer((socket) => {
+      socket.on('message', (data) => {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'hello') {
+          if (reconnectTries === 0) {
+            socket.send(
+              buildServerMessage({
+                type: 'welcome',
+                roomId: 'room-1',
+                payload: {
+                  roomId: 'room-1',
+                  memberId: 'guest-1',
+                  role: 'guest',
+                  name: '客人',
+                  members,
+                  lobby: createLobbyState(),
+                  resumeToken: 'token-fatal',
+                },
+              }),
+            );
+          } else {
+            // 重连时拒绝（例如凭据失效）
+            socket.send(
+              buildServerMessage({
+                type: 'error',
+                roomId: 'room-1',
+                payload: { code: 'UNAUTHORIZED', message: 'bad-resume-token' },
+              }),
+            );
+            socket.close(closeCodeForError('UNAUTHORIZED'), 'UNAUTHORIZED');
+          }
+        }
+      });
+    });
+
+    const client = new RoomClient({
+      webSocketFactory: (url) => new NodeWebSocket(url) as unknown as WebSocketLike,
+      connectTimeoutMs: 2000,
+      heartbeatIntervalMs: 50,
+      heartbeatTimeoutMs: 50,
+      reconnectDelays: [30, 50],
+    });
+    client.connect({ host: '127.0.0.1', port: server.port }, { role: 'guest', name: '客人' });
+
+    await waitUntil(() => client.getState().status === 'connected');
+    reconnectTries = 1;
+    for (const ws of server.wss.clients) {
+      ws.terminate();
+    }
+
+    await waitUntil(() => client.getState().status === 'error', 3000);
+    expect(client.getState().errorCode).toBe('UNAUTHORIZED');
+    expect(client.getState().reconnecting).toBe(false);
+    client.disconnect();
+  });
 });
+

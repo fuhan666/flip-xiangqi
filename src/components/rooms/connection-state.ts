@@ -12,4 +12,7 @@ export const IDLE_CONNECTION_STATE: ConnectionState = {
   lobby: null,
   lastRejection: null,
   pendingCommand: null,
+  rtt: null,
+  reconnecting: false,
+  justReconnected: false,
 };

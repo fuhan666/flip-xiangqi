@@ -1,12 +1,21 @@
 /**
  * 房间连接客户端：独立于 React 的连接层封装。
  *
- * - 提供 connect / disconnect、连接状态与成员快照订阅；
+ * - 提供 connect / disconnect / reconnect、连接状态与成员快照订阅；
  * - 握手（hello → welcome）完成后才算加入成功；
+ * - 心跳保活与往返延迟监测（ping/pong）；
+ * - 临时掉线自动重连（指数退避，上限与总预算）与手动立即重连；
  * - 取消或再次连接时，旧 socket 与计时器的回调一律忽略（代际计数）。
  */
 import { formatAddress, toWebSocketUrl, type ParsedAddress } from './address';
 import { describeErrorCode, describeLobbyReject, describeRoomClosed } from './errors';
+import {
+  computeBackoffDelay,
+  DEFAULT_HEARTBEAT_INTERVAL_MS,
+  DEFAULT_HEARTBEAT_TIMEOUT_MS,
+  DEFAULT_RECONNECT_BUDGET_MS,
+  DEFAULT_RECONNECT_DELAYS,
+} from './heartbeat';
 import {
   buildClientHello,
   buildClientLeave,
@@ -14,6 +23,8 @@ import {
   buildClientLobbyReady,
   buildClientLobbySettings,
   buildClientLobbyStart,
+  buildPing,
+  buildPong,
   closeCodeForError,
   encodeMessage,
   parseServerMessage,
@@ -31,7 +42,7 @@ import {
 } from './protocol';
 import type { LobbyState } from './lobby';
 
-export type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error';
+export type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'error';
 
 /** 大厅请求类别：同一时刻只保留一个在途请求，用于防连点。 */
 export type LobbyRequestKind = 'settings' | 'lock' | 'ready' | 'start';
@@ -53,6 +64,12 @@ export interface ConnectionState {
   lastRejection: LobbyRejection | null;
   /** 在途大厅请求；收到权威状态或拒绝后清空。 */
   pendingCommand: LobbyRequestKind | null;
+  /** 当前往返延迟（毫秒）；未测得或断线时为 null。 */
+  rtt: number | null;
+  /** 是否处于断线重连中。 */
+  reconnecting: boolean;
+  /** 最近一次是否为刚重连成功（触发 3 秒 toast）。 */
+  justReconnected: boolean;
 }
 
 export interface JoinOptions {
@@ -76,6 +93,8 @@ export type WebSocketFactory = (url: string) => WebSocketLike;
 export interface RoomConnection {
   connect(address: ParsedAddress, options: JoinOptions): void;
   disconnect(): void;
+  /** 手动取消等待退避并立即尝试重连。 */
+  reconnect(): void;
   subscribe(listener: (state: ConnectionState) => void): () => void;
   getState(): ConnectionState;
   /** 当前连接的地址（握手成功或连接中），供「最近房间」记录使用。 */
@@ -105,6 +124,9 @@ const IDLE_STATE: ConnectionState = {
   lobby: null,
   lastRejection: null,
   pendingCommand: null,
+  rtt: null,
+  reconnecting: false,
+  justReconnected: false,
 };
 
 function defaultWebSocketFactory(url: string): WebSocketLike {
@@ -114,21 +136,54 @@ function defaultWebSocketFactory(url: string): WebSocketLike {
 export interface RoomClientOptions {
   webSocketFactory?: WebSocketFactory;
   connectTimeoutMs?: number;
+  heartbeatIntervalMs?: number;
+  heartbeatTimeoutMs?: number;
+  reconnectDelays?: readonly number[];
+  reconnectBudgetMs?: number;
+  clock?: { now(): number };
 }
 
 export class RoomClient implements RoomConnection {
   private readonly webSocketFactory: WebSocketFactory;
   private readonly connectTimeoutMs: number;
+  private readonly heartbeatIntervalMs: number;
+  private readonly heartbeatTimeoutMs: number;
+  private readonly reconnectDelays: readonly number[];
+  private readonly reconnectBudgetMs: number;
+  private readonly clock?: { now(): number };
   private readonly listeners = new Set<(state: ConnectionState) => void>();
   private state: ConnectionState = IDLE_STATE;
   private socket: WebSocketLike | null = null;
   private generation = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private justReconnectedTimer: ReturnType<typeof setTimeout> | null = null;
   private joinedAddress: string | null = null;
+  private savedAddress: ParsedAddress | null = null;
+  private savedJoinOptions: JoinOptions | null = null;
+  private savedRoomId: string | null = null;
+  private savedResumeToken: string | null = null;
+  private pingSeq = 0;
+  private pendingPingSeq: number | null = null;
+  private pingSentAt = 0;
+  private reconnectStartTime: number | null = null;
+  private reconnectAttempt = 0;
+  private reconnecting = false;
 
   constructor(options: RoomClientOptions = {}) {
     this.webSocketFactory = options.webSocketFactory ?? defaultWebSocketFactory;
     this.connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+    this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS;
+    this.reconnectDelays = options.reconnectDelays ?? DEFAULT_RECONNECT_DELAYS;
+    this.reconnectBudgetMs = options.reconnectBudgetMs ?? DEFAULT_RECONNECT_BUDGET_MS;
+    this.clock = options.clock;
+  }
+
+  private now(): number {
+    return this.clock ? this.clock.now() : Date.now();
   }
 
   getState(): ConnectionState {
@@ -154,9 +209,17 @@ export class RoomClient implements RoomConnection {
       return;
     }
 
-    if (this.state.status === 'connecting') {
+    if (this.state.status === 'connecting' || this.reconnecting) {
       this.teardown();
     }
+
+    this.reconnecting = false;
+    this.savedAddress = address;
+    this.savedJoinOptions = options;
+    this.savedRoomId = null;
+    this.savedResumeToken = options.token ?? null;
+    this.reconnectStartTime = null;
+    this.reconnectAttempt = 0;
 
     const generation = ++this.generation;
     this.joinedAddress = formatAddress(address);
@@ -228,9 +291,20 @@ export class RoomClient implements RoomConnection {
       }
     }
 
+    this.reconnecting = false;
+    this.savedRoomId = null;
+    this.savedResumeToken = null;
     this.teardown();
     this.generation += 1;
     this.setState({ ...IDLE_STATE, status: 'disconnected' });
+  }
+
+  /** 手动取消等待退避并立即尝试重连。 */
+  reconnect(): void {
+    if (!this.reconnecting && this.state.status !== 'reconnecting') {
+      return;
+    }
+    this.attemptReconnect();
   }
 
   /** 当前连接的地址（握手成功或连接中），供「最近房间」记录使用。 */
@@ -301,6 +375,20 @@ export class RoomClient implements RoomConnection {
 
     if (message.type === 'welcome') {
       this.clearTimer();
+      const wasReconnecting = this.reconnecting;
+      this.reconnecting = false;
+      this.reconnectStartTime = null;
+      this.reconnectAttempt = 0;
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+
+      this.savedRoomId = message.payload.roomId;
+      if (message.payload.resumeToken) {
+        this.savedResumeToken = message.payload.resumeToken;
+      }
+
       this.setState({
         status: 'connected',
         errorCode: null,
@@ -313,7 +401,43 @@ export class RoomClient implements RoomConnection {
         lobby: message.payload.lobby,
         lastRejection: null,
         pendingCommand: null,
+        rtt: this.state.rtt,
+        reconnecting: false,
+        justReconnected: wasReconnecting,
       });
+
+      if (wasReconnecting) {
+        if (this.justReconnectedTimer) {
+          clearTimeout(this.justReconnectedTimer);
+        }
+        this.justReconnectedTimer = setTimeout(() => {
+          this.setState({ ...this.state, justReconnected: false });
+        }, 3_000);
+      }
+
+      this.startHeartbeat(generation);
+      return;
+    }
+
+    if (message.type === 'ping') {
+      try {
+        this.socket?.send(encodeMessage(buildPong(message.roomId, message.payload.seq)));
+      } catch {
+        // 忽略单个 pong 发送失败
+      }
+      return;
+    }
+
+    if (message.type === 'pong') {
+      if (this.pendingPingSeq === message.payload.seq) {
+        this.pendingPingSeq = null;
+        if (this.heartbeatTimeoutTimer) {
+          clearTimeout(this.heartbeatTimeoutTimer);
+          this.heartbeatTimeoutTimer = null;
+        }
+        const rtt = Math.max(0, Math.round(this.now() - this.pingSentAt));
+        this.setState({ ...this.state, rtt });
+      }
       return;
     }
 
@@ -340,10 +464,18 @@ export class RoomClient implements RoomConnection {
 
     if (message.type === 'room.closed') {
       this.clearTimer();
+      this.stopHeartbeat();
+      this.reconnecting = false;
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
       const reason = message.payload.reason;
       this.setState({
         ...this.state,
         status: 'disconnected',
+        reconnecting: false,
+        rtt: null,
         closedReason: reason,
         message: describeRoomClosed(reason),
       });
@@ -353,7 +485,15 @@ export class RoomClient implements RoomConnection {
     }
 
     if (message.type === 'error') {
-      this.fail(generation, message.payload.code);
+      const code = message.payload.code;
+      if (code === 'UNAUTHORIZED' || code === 'ROOM_CLOSED' || code === 'VERSION_MISMATCH') {
+        this.reconnecting = false;
+        if (this.reconnectTimer) {
+          clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = null;
+        }
+      }
+      this.fail(generation, code);
     }
   }
 
@@ -363,19 +503,264 @@ export class RoomClient implements RoomConnection {
     }
 
     this.clearTimer();
+    this.stopHeartbeat();
     this.socket = null;
 
-    if (this.state.status === 'connected') {
+    const serverCode = serverErrorCodeForCloseCode(code);
+
+    if (serverCode === 'ROOM_CLOSED') {
+      this.reconnecting = false;
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      this.generation += 1;
       this.setState({
         ...this.state,
         status: 'disconnected',
-        message: '与房间的连接已断开 —— 网络波动或房主端关闭了连接 —— 请返回重新加入',
+        reconnecting: false,
+        rtt: null,
+        closedReason: 'host-closed',
+        message: describeErrorCode('ROOM_CLOSED'),
       });
       return;
     }
 
-    const serverCode = serverErrorCodeForCloseCode(code);
+    if (serverCode === 'UNAUTHORIZED' || serverCode === 'VERSION_MISMATCH') {
+      this.reconnecting = false;
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      this.fail(generation, serverCode);
+      return;
+    }
+
+    if (this.reconnecting) {
+      this.scheduleReconnect();
+      return;
+    }
+
+    if (this.state.status === 'connected') {
+      this.handleConnectionLost(generation, 'SOCKET_CLOSED');
+      return;
+    }
+
     this.fail(generation, serverCode ?? 'CONNECT_FAILED');
+  }
+
+  private handleConnectionLost(generation: number, _reason: string): void {
+    if (generation !== this.generation) {
+      return;
+    }
+
+    this.clearTimer();
+    this.stopHeartbeat();
+    this.teardownSocket();
+
+    // 仅已入房客人且有恢复凭据支持自动重连
+    if (
+      this.savedJoinOptions?.role === 'guest' &&
+      this.savedRoomId &&
+      this.savedResumeToken &&
+      this.savedAddress
+    ) {
+      this.reconnecting = true;
+      if (this.reconnectStartTime === null) {
+        this.reconnectStartTime = this.now();
+        this.reconnectAttempt = 0;
+      }
+      this.setState({
+        ...this.state,
+        status: 'reconnecting',
+        reconnecting: true,
+        rtt: null,
+        pendingCommand: null,
+        lastRejection: null,
+      });
+      this.scheduleReconnect();
+      return;
+    }
+
+    this.generation += 1;
+    this.setState({
+      ...this.state,
+      status: 'disconnected',
+      reconnecting: false,
+      rtt: null,
+      message: '与房间的连接已断开 —— 网络波动或房主端关闭了连接 —— 请返回重新加入',
+    });
+  }
+
+  private scheduleReconnect(): void {
+    if (!this.reconnecting) {
+      return;
+    }
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    const elapsed = this.now() - (this.reconnectStartTime ?? this.now());
+    const delay = computeBackoffDelay(this.reconnectAttempt, this.reconnectDelays);
+
+    if (elapsed + delay >= this.reconnectBudgetMs) {
+      this.reconnecting = false;
+      this.generation += 1;
+      this.teardown();
+      this.setState({
+        ...this.state,
+        status: 'disconnected',
+        reconnecting: false,
+        rtt: null,
+        errorCode: 'HOST_UNAVAILABLE',
+        message: '房间不可达，可能网络断开或房主退出，请检查网络后重新加入',
+      });
+      return;
+    }
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.attemptReconnect();
+    }, delay);
+  }
+
+  private attemptReconnect(): void {
+    if (
+      !this.reconnecting ||
+      !this.savedAddress ||
+      !this.savedJoinOptions ||
+      !this.savedRoomId ||
+      !this.savedResumeToken
+    ) {
+      return;
+    }
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    this.teardownSocket();
+    const generation = ++this.generation;
+    this.reconnectAttempt += 1;
+
+    let socket: WebSocketLike;
+    try {
+      socket = this.webSocketFactory(toWebSocketUrl(this.savedAddress));
+    } catch {
+      this.scheduleReconnect();
+      return;
+    }
+    this.socket = socket;
+
+    this.timer = setTimeout(() => {
+      if (generation !== this.generation) {
+        return;
+      }
+      this.teardownSocket();
+      this.scheduleReconnect();
+    }, this.connectTimeoutMs);
+
+    socket.onopen = () => {
+      if (generation !== this.generation) {
+        return;
+      }
+      try {
+        socket.send(
+          encodeMessage(
+            buildClientHello({
+              role: 'guest',
+              name: this.savedJoinOptions!.name,
+              roomId: this.savedRoomId,
+              resumeToken: this.savedResumeToken!,
+            }),
+          ),
+        );
+      } catch {
+        this.teardownSocket();
+        this.scheduleReconnect();
+      }
+    };
+
+    socket.onmessage = (event) => {
+      if (generation !== this.generation) {
+        return;
+      }
+      this.handleMessage(generation, event.data);
+    };
+
+    socket.onerror = () => {
+      // 交由 onclose 处理
+    };
+
+    socket.onclose = (event) => {
+      if (generation !== this.generation) {
+        return;
+      }
+      this.handleClose(generation, event.code);
+    };
+  }
+
+  private startHeartbeat(generation: number): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setTimeout(() => {
+      this.runHeartbeat(generation);
+    }, this.heartbeatIntervalMs);
+  }
+
+  private runHeartbeat(generation: number): void {
+    if (generation !== this.generation || this.state.status !== 'connected') {
+      return;
+    }
+
+    const socket = this.socket;
+    const roomId = this.state.roomId;
+    if (!socket || socket.readyState !== SOCKET_OPEN || !roomId) {
+      return;
+    }
+
+    this.heartbeatTimer = setTimeout(() => {
+      this.runHeartbeat(generation);
+    }, this.heartbeatIntervalMs);
+
+    if (this.pendingPingSeq !== null) {
+      // 正在等待上一轮 ping 的 pong，已有超时定时器在监控
+      return;
+    }
+
+    this.pingSeq += 1;
+    const seq = this.pingSeq;
+    this.pendingPingSeq = seq;
+    this.pingSentAt = this.now();
+
+    try {
+      socket.send(encodeMessage(buildPing(roomId, seq)));
+    } catch {
+      // 忽略发送失败
+    }
+
+    this.heartbeatTimeoutTimer = setTimeout(() => {
+      if (generation !== this.generation) {
+        return;
+      }
+      if (this.pendingPingSeq === seq) {
+        this.handleConnectionLost(generation, 'HEARTBEAT_TIMEOUT');
+      }
+    }, this.heartbeatTimeoutMs);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer !== null) {
+      clearTimeout(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (this.heartbeatTimeoutTimer !== null) {
+      clearTimeout(this.heartbeatTimeoutTimer);
+      this.heartbeatTimeoutTimer = null;
+    }
+    this.pendingPingSeq = null;
   }
 
   private fail(generation: number, code: ErrorCode): void {
@@ -393,22 +778,34 @@ export class RoomClient implements RoomConnection {
     });
   }
 
-  private teardown(): void {
-    this.clearTimer();
+  private teardownSocket(): void {
     const socket = this.socket;
     this.socket = null;
     if (socket) {
       socket.onopen = null;
       socket.onmessage = null;
       socket.onclose = null;
-      // 保留错误吞掉回调：握手未完成时 close 会触发 error 事件，清空监听会导致未捕获异常。
       socket.onerror = () => undefined;
       try {
         socket.close(closeCodeForError('INTERNAL_ERROR'), 'client-teardown');
       } catch {
-        // socket 可能已处于关闭态。
+        // socket 可能已处于关闭态
       }
     }
+  }
+
+  private teardown(): void {
+    this.clearTimer();
+    this.stopHeartbeat();
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.justReconnectedTimer !== null) {
+      clearTimeout(this.justReconnectedTimer);
+      this.justReconnectedTimer = null;
+    }
+    this.teardownSocket();
   }
 
   private clearTimer(): void {
@@ -439,6 +836,8 @@ export function describeStatus(state: ConnectionState): string {
       return '连接中…';
     case 'connected':
       return '已连接';
+    case 'reconnecting':
+      return '正在重连…';
     case 'disconnected':
       return '已断开';
     case 'error':

@@ -25,6 +25,8 @@ interface RoomLobbyProps {
   onStart: () => void;
   /** 成员区下方的连接状态说明（建房/加入两端各自文案）。 */
   connectionHint?: ReactNode;
+  /** 是否处于断线重连中（重连期间禁用设置/准备/开始发送动作，退出入口保持可用）。 */
+  reconnecting?: boolean;
 }
 
 /** 双方归属摘要：随机分先在开局前显示「待开局确定」。 */
@@ -70,12 +72,13 @@ export function RoomLobby({
   onReadyToggle,
   onStart,
   connectionHint,
+  reconnecting = false,
 }: RoomLobbyProps) {
   const started = lobby?.phase === 'started';
-  const settingsEditable = Boolean(lobby && viewerRole === 'host' && !lobby.settings.locked && !started);
+  const settingsEditable = Boolean(lobby && viewerRole === 'host' && !lobby.settings.locked && !started && !reconnecting);
   const ownReady = Boolean(viewerRole && lobby?.ready[viewerRole]);
   const allReady = Boolean(lobby && lobby.ready.host && lobby.ready.guest && lobby.presence.host && lobby.presence.guest);
-  const busy = pendingCommand !== null;
+  const busy = pendingCommand !== null || reconnecting;
   const startHint =
     !lobby || started
       ? null
