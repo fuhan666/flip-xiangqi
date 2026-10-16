@@ -7,6 +7,10 @@ import { RoomServerError, RoomServer, startRoomServer, type RoomServerOptions } 
 import {
   buildClientHello,
   buildClientLeave,
+  buildClientLobbyLock,
+  buildClientLobbyReady,
+  buildClientLobbySettings,
+  buildClientLobbyStart,
   encodeMessage,
   PROTOCOL_VERSION,
   type HelloPayload,
@@ -386,5 +390,256 @@ describe('startRoomServer helper', () => {
     expect(started.hostToken).toHaveLength(32);
     expect(started.port).toBe(started.server.actualPort);
     await started.server.closeRoom('server-stopped');
+  });
+});
+
+describe('lobby synchronization and start gate', () => {
+  interface ConnectedPair {
+    room: RoomServer;
+    host: TestClient;
+    guest: TestClient;
+    hostId: string;
+    guestId: string;
+  }
+
+  async function connectedPair(overrides: Partial<RoomServerOptions> = {}): Promise<ConnectedPair> {
+    const room = await startRoom(overrides);
+    const host = await openClient(room.actualPort);
+    await hello(host, { role: 'host', name: '房主', token: room.hostToken });
+    const hostWelcome = await host.waitForType('welcome');
+    const guest = await openClient(room.actualPort);
+    await hello(guest, { role: 'guest', name: '客人' });
+    const guestWelcome = await guest.waitForType('welcome');
+    return {
+      room,
+      host,
+      guest,
+      hostId: hostWelcome.payload.memberId,
+      guestId: guestWelcome.payload.memberId,
+    };
+  }
+
+  async function readyBoth(pair: ConnectedPair, settingsVersion: number): Promise<void> {
+    pair.host.send(encodeMessage(buildClientLobbyReady(pair.room.roomId, true, settingsVersion)));
+    await pair.host.waitForType('lobby.state', (message) => message.payload.lobby.ready.host === true);
+    pair.guest.send(encodeMessage(buildClientLobbyReady(pair.room.roomId, true, settingsVersion)));
+    await pair.host.waitForType(
+      'lobby.state',
+      (message) => message.payload.lobby.ready.host === true && message.payload.lobby.ready.guest === true,
+    );
+  }
+
+  it('sends the authoritative lobby snapshot in welcome and broadcasts every change', async () => {
+    const pair = await connectedPair();
+    expect(pair.guest.messages.find((message) => message.type === 'welcome')?.payload.lobby).toMatchObject({
+      phase: 'lobby',
+      settings: { sidePreference: 'random', timeControlId: 'none', locked: false, settingsVersion: 1 },
+      ready: { host: false, guest: false },
+      presence: { host: true, guest: true },
+      startParameters: null,
+    });
+
+    pair.host.send(
+      encodeMessage(buildClientLobbySettings(pair.room.roomId, { sidePreference: 'host-red', timeControlId: 'standard' })),
+    );
+    const broadcast = await pair.guest.waitForType('lobby.state');
+    expect(broadcast.payload.lobby.settings).toMatchObject({
+      sidePreference: 'host-red',
+      timeControlId: 'standard',
+      settingsVersion: 2,
+    });
+    await pair.host.waitForType('lobby.state', (message) => message.payload.lobby.settings.settingsVersion === 2);
+    expect(pair.room.getLobby().settings.settingsVersion).toBe(2);
+  });
+
+  it('hands a late joiner the latest settings snapshot', async () => {
+    const room = await startRoom();
+    const host = await openClient(room.actualPort);
+    await hello(host, { role: 'host', name: '房主', token: room.hostToken });
+    await host.waitForType('welcome');
+
+    host.send(encodeMessage(buildClientLobbySettings(room.roomId, { sidePreference: 'host-black', timeControlId: 'blitz' })));
+    await host.waitForType('lobby.state', (message) => message.payload.lobby.settings.settingsVersion === 2);
+
+    const guest = await openClient(room.actualPort);
+    await hello(guest, { role: 'guest', name: '客人' });
+    const welcome = await guest.waitForType('welcome');
+    expect(welcome.payload.lobby.settings).toMatchObject({
+      sidePreference: 'host-black',
+      timeControlId: 'blitz',
+      settingsVersion: 2,
+    });
+  });
+
+  it('rejects guest-side changes and malformed payloads as specified', async () => {
+    const pair = await connectedPair();
+
+    // 权限拒绝非致命：客人只读，连接保持并可继续其他操作。
+    pair.guest.send(encodeMessage(buildClientLobbySettings(pair.room.roomId, { sidePreference: 'host-red', timeControlId: 'none' })));
+    pair.guest.send(encodeMessage(buildClientLobbyLock(pair.room.roomId, true)));
+    pair.guest.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    const rejection = await pair.guest.waitForType('lobby.rejected');
+    expect(rejection.payload.code).toBe('NOT_HOST');
+
+    pair.guest.send(encodeMessage(buildClientLobbyReady(pair.room.roomId, true, 1)));
+    await pair.guest.waitForType('lobby.state', (message) => message.payload.lobby.ready.guest === true);
+
+    // 结构非法载荷按协议违规处理：明确错误码并断开。
+    pair.guest.send(
+      JSON.stringify({ version: PROTOCOL_VERSION, type: 'lobby.ready', roomId: pair.room.roomId, payload: { ready: true, settingsVersion: 0 } }),
+    );
+    expect(await pair.guest.closed).toBe(4000);
+  });
+
+  it('freezes the settings while locked and clears ready after unlocking', async () => {
+    const pair = await connectedPair();
+    await readyBoth(pair, 1);
+
+    pair.host.send(encodeMessage(buildClientLobbyLock(pair.room.roomId, true)));
+    const locked = await pair.guest.waitForType('lobby.state', (message) => message.payload.lobby.settings.locked === true);
+    expect(locked.payload.lobby.ready).toEqual({ host: true, guest: true });
+
+    pair.host.send(
+      encodeMessage(buildClientLobbySettings(pair.room.roomId, { sidePreference: 'random', timeControlId: 'none' })),
+    );
+    const rejection = await pair.host.waitForType('lobby.rejected');
+    expect(rejection.payload.code).toBe('LOCKED');
+
+    pair.host.send(encodeMessage(buildClientLobbyLock(pair.room.roomId, false)));
+    const unlocked = await pair.guest.waitForType(
+      'lobby.state',
+      (message) => message.payload.lobby.settings.locked === false && message.payload.lobby.ready.host === false,
+    );
+    expect(unlocked.payload.lobby.ready).toEqual({ host: false, guest: false });
+  });
+
+  it('clears ready on real settings changes, dedupes repeat ready and rejects stale versions', async () => {
+    const pair = await connectedPair();
+    await readyBoth(pair, 1);
+    const broadcastsAfterReady = pair.host.messages.filter((message) => message.type === 'lobby.state').length;
+
+    // 重复准备幂等：不产生新广播；随后一次锁定作为同步屏障。
+    pair.guest.send(encodeMessage(buildClientLobbyReady(pair.room.roomId, true, 1)));
+    pair.host.send(encodeMessage(buildClientLobbyLock(pair.room.roomId, true)));
+    await pair.host.waitForType('lobby.state', (message) => message.payload.lobby.settings.locked === true);
+    expect(pair.host.messages.filter((message) => message.type === 'lobby.state').length).toBe(broadcastsAfterReady + 1);
+
+    pair.host.send(encodeMessage(buildClientLobbyLock(pair.room.roomId, false)));
+    await pair.host.waitForType(
+      'lobby.state',
+      (message) => message.payload.lobby.settings.locked === false && message.payload.lobby.ready.host === false,
+    );
+    pair.host.send(
+      encodeMessage(buildClientLobbySettings(pair.room.roomId, { sidePreference: 'host-red', timeControlId: 'blitz' })),
+    );
+    const changed = await pair.guest.waitForType('lobby.state', (message) => message.payload.lobby.settings.settingsVersion === 2);
+    expect(changed.payload.lobby.ready).toEqual({ host: false, guest: false });
+
+    // 过期准备被拒绝，只有绑定当前版本的准备生效。
+    pair.guest.send(encodeMessage(buildClientLobbyReady(pair.room.roomId, true, 1)));
+    const stale = await pair.guest.waitForType('lobby.rejected');
+    expect(stale.payload.code).toBe('STALE_VERSION');
+
+    pair.guest.send(encodeMessage(buildClientLobbyReady(pair.room.roomId, true, 2)));
+    await pair.guest.waitForType(
+      'lobby.state',
+      (message) => message.payload.lobby.settings.settingsVersion === 2 && message.payload.lobby.ready.guest === true,
+    );
+  });
+
+  it('clears ready and blocks the start while the guest is offline', async () => {
+    const pair = await connectedPair();
+    await readyBoth(pair, 1);
+
+    pair.guest.socket.terminate();
+    const dropped = await pair.host.waitForType(
+      'lobby.state',
+      (message) => message.payload.lobby.presence.guest === false,
+    );
+    expect(dropped.payload.lobby.ready).toEqual({ host: false, guest: false });
+
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    const rejection = await pair.host.waitForType('lobby.rejected');
+    expect(rejection.payload.code).toBe('MEMBER_MISSING');
+  });
+
+  it('blocks the start until both sides are ready and keeps serving after the rejection', async () => {
+    const pair = await connectedPair();
+
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    const rejection = await pair.host.waitForType('lobby.rejected');
+    expect(rejection.payload.code).toBe('NOT_READY');
+
+    await readyBoth(pair, 1);
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    const started = await pair.host.waitForType('lobby.state', (message) => message.payload.lobby.phase === 'started');
+    expect(started.payload.lobby.startParameters).toMatchObject({ roomId: pair.room.roomId, settingsVersion: 1 });
+  });
+
+  it('draws random sides exactly once and freezes the parameters against repeat starts', async () => {
+    let draws = 0;
+    const pair = await connectedPair({
+      drawHostRed: () => {
+        draws += 1;
+        return false;
+      },
+    });
+    await readyBoth(pair, 1);
+
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    const started = await pair.guest.waitForType('lobby.state', (message) => message.payload.lobby.phase === 'started');
+    expect(draws).toBe(1);
+    expect(started.payload.lobby.startParameters).toMatchObject({
+      sidePreference: 'random',
+      timeControlId: 'none',
+      baseTimeSeconds: null,
+      incrementSeconds: 0,
+      settingsVersion: 1,
+      redMemberId: pair.guestId,
+      blackMemberId: pair.hostId,
+    });
+
+    const frozen = pair.room.getLobby().startParameters;
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    const repeat = await pair.host.waitForType('lobby.rejected');
+    expect(repeat.payload.code).toBe('ALREADY_STARTED');
+    expect(draws).toBe(1);
+    expect(pair.room.getLobby().startParameters).toEqual(frozen);
+
+    // 冻结后设置与就绪一律拒绝。
+    pair.host.send(encodeMessage(buildClientLobbySettings(pair.room.roomId, { sidePreference: 'random', timeControlId: 'none' })));
+    pair.host.send(encodeMessage(buildClientLobbyReady(pair.room.roomId, false, 1)));
+    const afterFreeze = await pair.host.waitForType('lobby.rejected', (message) => message.payload.code === 'ALREADY_STARTED');
+    expect(afterFreeze.payload.code).toBe('ALREADY_STARTED');
+
+    // 新成员替换也被拒绝，保持已冻结身份。
+    const replacement = await openClient(pair.room.actualPort);
+    await hello(replacement, { role: 'guest', name: '客人' });
+    expect(await replacement.closed).toBe(4003);
+  });
+
+  it('resolves fixed side preferences without any draw', async () => {
+    const pair = await connectedPair({
+      drawHostRed: () => {
+        throw new Error('fixed side preferences must not draw');
+      },
+    });
+    pair.host.send(
+      encodeMessage(buildClientLobbySettings(pair.room.roomId, { sidePreference: 'host-black', timeControlId: 'standard' })),
+    );
+    await pair.host.waitForType('lobby.state', (message) => message.payload.lobby.settings.settingsVersion === 2);
+    await readyBoth(pair, 2);
+
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    const started = await pair.host.waitForType('lobby.state', (message) => message.payload.lobby.phase === 'started');
+    expect(started.payload.lobby.startParameters).toMatchObject({
+      sidePreference: 'host-black',
+      timeControlId: 'standard',
+      baseTimeSeconds: 1200,
+      incrementSeconds: 60,
+      settingsVersion: 2,
+      redMemberId: pair.guestId,
+      blackMemberId: pair.hostId,
+    });
   });
 });

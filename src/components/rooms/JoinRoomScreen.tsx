@@ -6,7 +6,7 @@ import { loadRecentRooms, rememberRoom } from '../../network/recent-rooms';
 import type { RecentRoom } from '../../network/recent-rooms';
 import { IDLE_CONNECTION_STATE } from './connection-state';
 import { ConfirmDialog } from './ConfirmDialog';
-import { MemberList } from './MemberList';
+import { RoomLobby } from './RoomLobby';
 
 interface JoinRoomScreenProps {
   createClient: () => RoomConnection;
@@ -112,13 +112,25 @@ export function JoinRoomScreen({ createClient, storage, initialAddress, guestPag
 
       {connected ? (
         <>
-          <section className="room-panel">
-            <h2>房间成员</h2>
-            <MemberList members={connection.members} selfId={connection.memberId} />
-            <p className="room-hint" data-testid="join-connection-state">
-              已连接 · 房间号 {connection.roomId}
-            </p>
-          </section>
+          <RoomLobby
+            connectionHint={
+              <p className="room-hint" data-testid="join-connection-state">
+                已连接 · 房间号 {connection.roomId}
+              </p>
+            }
+            lastRejection={connection.lastRejection}
+            lobby={connection.lobby}
+            members={connection.members}
+            onLockChange={(locked) => clientRef.current?.sendLobbyLock(locked)}
+            onReadyToggle={(ready) => clientRef.current?.sendLobbyReady(ready)}
+            onSettingsChange={(sidePreference, timeControlId) =>
+              clientRef.current?.sendLobbySettings(sidePreference, timeControlId)
+            }
+            onStart={() => clientRef.current?.sendLobbyStart()}
+            pendingCommand={connection.pendingCommand}
+            selfId={connection.memberId}
+            viewerRole={connection.role ?? 'guest'}
+          />
           <div className="panel-actions">
             <button className="panel-action-secondary" data-testid="leave-room" onClick={() => setConfirmLeave(true)} type="button">
               离开房间

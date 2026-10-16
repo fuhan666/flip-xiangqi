@@ -11,11 +11,21 @@ import { createServer } from 'node:http';
 import type { Socket } from 'node:net';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
+  applyLobbyCommand,
+  createLobbyState,
+  snapshotLobbyState,
+  type LobbyCommand,
+  type LobbyRejectCode,
+  type LobbyState,
+} from '../src/network/lobby.js';
+import {
   buildServerMessage,
   closeCodeForError,
   parseClientMessage,
   WS_PATH,
+  type ClientMessage,
   type MemberSnapshot,
+  type MemberLeaveReason,
   type Role,
   type RoomClosedReason,
   type ServerErrorCode,
@@ -41,6 +51,8 @@ export interface RoomServerOptions {
   /** 客人页面（开发为 Vite middleware，生产为静态 dist）。 */
   requestListener?: (request: IncomingMessage, response: ServerResponse) => void;
   logger?: Logger;
+  /** 随机分先的一次性裁决（true = 房主执红），默认用密码学随机数，测试可注入。 */
+  drawHostRed?: () => boolean;
 }
 
 interface RoomMember {
@@ -49,7 +61,10 @@ interface RoomMember {
   name: string;
   socket: WebSocket | null;
   connected: boolean;
+  leaveReason: MemberLeaveReason | null;
 }
+
+type LobbyClientMessage = Extract<ClientMessage, { type: `lobby.${string}` }>;
 
 const HOST_NAME = '房主';
 const GUEST_NAME = '客人';
@@ -58,7 +73,17 @@ const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 const CLOSE_DRAIN_TIMEOUT_MS = 1_000;
 
 function memberSnapshot(member: RoomMember): MemberSnapshot {
-  return { id: member.id, role: member.role, name: member.name, connected: member.connected };
+  return {
+    id: member.id,
+    role: member.role,
+    name: member.name,
+    connected: member.connected,
+    ...(member.connected || !member.leaveReason ? {} : { leaveReason: member.leaveReason }),
+  };
+}
+
+function defaultDrawHostRed(): boolean {
+  return randomBytes(1)[0] % 2 === 0;
 }
 
 function generateToken(): string {
@@ -75,12 +100,14 @@ export class RoomServer {
 
   private readonly options: Required<Pick<RoomServerOptions, 'maxPortAttempts' | 'handshakeTimeoutMs'>> & RoomServerOptions;
   private readonly logger: Logger;
+  private readonly drawHostRed: () => boolean;
   private readonly server: Server;
   private readonly wss: WebSocketServer;
   private readonly tcpSockets = new Set<Socket>();
   private readonly openSockets = new Set<WebSocket>();
   private host: RoomMember | null = null;
   private guest: RoomMember | null = null;
+  private lobby: LobbyState;
   private closed = false;
   private port = 0;
 
@@ -91,8 +118,10 @@ export class RoomServer {
       handshakeTimeoutMs: options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS,
     };
     this.logger = options.logger ?? defaultLogger;
+    this.drawHostRed = options.drawHostRed ?? defaultDrawHostRed;
     this.roomId = generateId();
     this.hostToken = generateToken();
+    this.lobby = createLobbyState();
     this.wss = new WebSocketServer({ noServer: true });
 
     this.server = createServer((request, response) => {
@@ -144,6 +173,11 @@ export class RoomServer {
       members.push(memberSnapshot(this.guest));
     }
     return members;
+  }
+
+  /** 当前权威大厅快照（独立副本，测试与内部状态隔离）。 */
+  getLobby(): LobbyState {
+    return snapshotLobbyState(this.lobby);
   }
 
   async start(): Promise<number> {
@@ -310,6 +344,9 @@ export class RoomServer {
         joinedMember = member;
         clearTimeout(handshakeTimer);
 
+        // 先落座再发 welcome：快照里带上本人 presence，其他成员收 lobby.state。
+        this.applyLobby({ type: 'member-joined', role: member.role }, socket);
+
         socket.send(
           buildServerMessage({
             type: 'welcome',
@@ -320,6 +357,7 @@ export class RoomServer {
               role: member.role,
               name: member.name,
               members: this.getMembers(),
+              lobby: this.getLobby(),
             },
           }),
         );
@@ -342,6 +380,16 @@ export class RoomServer {
         const member = joinedMember;
         joinedMember = null;
         this.depart(member, 'leave');
+        return;
+      }
+
+      if (
+        message.type === 'lobby.settings' ||
+        message.type === 'lobby.lock' ||
+        message.type === 'lobby.ready' ||
+        message.type === 'lobby.start'
+      ) {
+        this.handleLobbyMessage(socket, connectionId, joinedMember, message);
         return;
       }
 
@@ -383,6 +431,7 @@ export class RoomServer {
         name: HOST_NAME,
         socket,
         connected: true,
+        leaveReason: null,
       };
       this.host = member;
       return member;
@@ -392,6 +441,11 @@ export class RoomServer {
       this.reject(socket, 'guest', 'ROOM_FULL', 'guest-slot-taken');
       return null;
     }
+    if (this.lobby.phase === 'started' && this.guest) {
+      // 开局后保持已冻结身份，不接受新成员替换。
+      this.reject(socket, 'guest', 'ROOM_FULL', 'guest-replace-after-start');
+      return null;
+    }
 
     const member: RoomMember = {
       id: generateId(),
@@ -399,10 +453,133 @@ export class RoomServer {
       name: GUEST_NAME,
       socket,
       connected: true,
+      leaveReason: null,
     };
     // 只保留一个客人席位：离线客人卡片被新成员替换，不累积幽灵成员。
+    if (this.guest) {
+      this.applyLobby({ type: 'member-left', role: 'guest' }, socket);
+    }
     this.guest = member;
     return member;
+  }
+
+  private handleLobbyMessage(
+    socket: WebSocket,
+    connectionId: string,
+    member: RoomMember,
+    message: LobbyClientMessage,
+  ): void {
+    if (message.roomId !== this.roomId) {
+      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
+      return;
+    }
+
+    let command: LobbyCommand;
+    switch (message.type) {
+      case 'lobby.settings':
+        command = {
+          type: 'update-settings',
+          actor: member.role,
+          sidePreference: message.payload.sidePreference,
+          timeControlId: message.payload.timeControlId,
+        };
+        break;
+      case 'lobby.lock':
+        command = { type: 'set-locked', actor: member.role, locked: message.payload.locked };
+        break;
+      case 'lobby.ready':
+        command = {
+          type: 'set-ready',
+          actor: member.role,
+          ready: message.payload.ready,
+          settingsVersion: message.payload.settingsVersion,
+        };
+        break;
+      default: {
+        const host = this.host;
+        const guest = this.guest;
+        if (!host || !guest) {
+          this.sendLobbyRejection(socket, 'MEMBER_MISSING', 'start-identity');
+          return;
+        }
+        // 随机分先只在真正冻结时抽取一次；重复开始在状态机里先被拒绝，不会再抽。
+        const needsDraw = this.lobby.phase === 'lobby' && this.lobby.settings.sidePreference === 'random';
+        command = {
+          type: 'start',
+          actor: member.role,
+          roomId: this.roomId,
+          host: { memberId: host.id, name: host.name },
+          guest: { memberId: guest.id, name: guest.name },
+          hostRedWhenRandom: needsDraw ? this.drawHostRed() : null,
+        };
+        break;
+      }
+    }
+
+    const result = applyLobbyCommand(this.lobby, command);
+    if (!result.ok) {
+      this.logger('lobby.rejected', { room: this.roomId, member: member.id, code: result.code, detail: result.detail });
+      // 操作拒绝一律非致命：提示原因但保持连接，可继续其他操作。
+      this.sendLobbyRejection(socket, result.code, result.detail);
+      return;
+    }
+
+    if (result.changed) {
+      this.lobby = result.state;
+      this.logger('lobby.changed', {
+        room: this.roomId,
+        member: member.id,
+        command: command.type,
+        phase: result.state.phase,
+        settingsVersion: result.state.settings.settingsVersion,
+      });
+      // 发起者同样收到权威状态：既确认操作成功，也清除在途请求。
+      this.broadcastLobby();
+    }
+  }
+
+  private applyLobby(command: LobbyCommand, exclude?: WebSocket): void {
+    const result = applyLobbyCommand(this.lobby, command);
+    if (result.ok && result.changed) {
+      this.lobby = result.state;
+      this.broadcastLobby(exclude);
+    }
+  }
+
+  /** 广播权威大厅快照（welcome 与 lobby.state 携带同一份结构）。 */
+  private broadcastLobby(exclude?: WebSocket): void {
+    const text = buildServerMessage({
+      type: 'lobby.state',
+      roomId: this.roomId,
+      payload: { lobby: this.getLobby() },
+    });
+    for (const socket of this.openSockets) {
+      if (socket === exclude) {
+        continue;
+      }
+      // 1 === WebSocket.OPEN
+      if (socket.readyState === 1) {
+        try {
+          socket.send(text);
+        } catch {
+          // 忽略单个连接的发送失败。
+        }
+      }
+    }
+  }
+
+  private sendLobbyRejection(socket: WebSocket, code: LobbyRejectCode, detail: string): void {
+    try {
+      socket.send(
+        buildServerMessage({
+          type: 'lobby.rejected',
+          roomId: this.roomId,
+          payload: { code, message: detail },
+        }),
+      );
+    } catch {
+      // socket 已关闭。
+    }
   }
 
   private handleMemberDrop(member: RoomMember): void {
@@ -414,7 +591,9 @@ export class RoomServer {
 
     member.connected = false;
     member.socket = null;
+    member.leaveReason = 'dropped';
     this.logger('ws.guest_dropped', { room: this.roomId, member: member.id });
+    this.applyLobby({ type: 'member-left', role: 'guest' });
     this.broadcastMembers();
   }
 
@@ -427,6 +606,8 @@ export class RoomServer {
     const socket = member.socket;
     member.connected = false;
     member.socket = null;
+    member.leaveReason = 'left';
+    this.applyLobby({ type: 'member-left', role: 'guest' });
     this.broadcastMembers();
     this.logger('ws.guest_left', { room: this.roomId, member: member.id, reason });
     try {

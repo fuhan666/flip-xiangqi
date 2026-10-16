@@ -187,6 +187,7 @@
 .menu-actions button:focus-visible,
 .panel-action-primary:focus-visible,
 .panel-action-secondary:focus-visible,
+.panel-action-gold:focus-visible,
 .address-copy:focus-visible,
 .recent-entry:focus-visible,
 .candidate-item button:focus-visible,
@@ -277,6 +278,7 @@
 .member-card {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
   padding: 14px 16px;
   border-radius: 14px;
@@ -465,5 +467,155 @@
 
   .menu-actions button:hover:not(:disabled) {
     transform: none;
+  }
+}
+
+/* —— 房间大厅：设置面板与就绪/开始操作区 —— */
+.setting-group {
+  margin: 0;
+  padding: 0;
+  border: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.setting-group legend {
+  padding: 0;
+  font-size: 13px;
+  letter-spacing: 0.14em;
+  color: rgba(243, 237, 224, 0.72);
+}
+
+.setting-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+}
+
+.setting-option {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 64px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.setting-option:has(input:checked) {
+  background: rgba(215, 178, 119, 0.18);
+  border-color: rgba(215, 178, 119, 0.6);
+}
+
+.setting-option:has(input:disabled) {
+  cursor: default;
+  opacity: 0.72;
+}
+
+.setting-option:has(input:focus-visible) {
+  outline: 2px solid #f4dba7;
+  outline-offset: 2px;
+}
+
+.setting-option input[type='radio'] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.setting-option-label {
+  font-size: 16px;
+  letter-spacing: 0.1em;
+  color: #f3ede0;
+}
+
+.setting-option-desc {
+  font-size: 12px;
+  line-height: 1.6;
+  color: rgba(243, 237, 224, 0.62);
+}
+
+.member-side {
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+}
+
+.member-side-red {
+  color: #f2c4b4;
+  background: rgba(214, 110, 84, 0.16);
+  border: 1px solid rgba(214, 110, 84, 0.42);
+}
+
+.member-side-black {
+  color: #cfd6e4;
+  background: rgba(96, 106, 128, 0.28);
+  border: 1px solid rgba(150, 160, 180, 0.34);
+}
+
+.member-side-pending {
+  color: rgba(243, 237, 224, 0.62);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.member-ready {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: rgba(243, 237, 224, 0.62);
+}
+
+.ready-lamp {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.24);
+}
+
+.member-ready-on {
+  color: #a9d18e;
+}
+
+.member-ready-on .ready-lamp {
+  background: #7fc46a;
+  border-color: #a9d18e;
+}
+
+.panel-action-gold {
+  background: #e8c47c;
+  border: 1px solid #d7b277;
+  color: #241205;
+  font-weight: 700;
+  transition: background 0.2s ease, transform 0.2s ease;
+}
+
+.panel-action-gold:hover:not(:disabled) {
+  background: #f4dba7;
+}
+
+.room-notice {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(215, 178, 119, 0.16);
+  border: 1px solid rgba(215, 178, 119, 0.5);
+  color: #f4dba7;
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .setting-option,
+  .panel-action-gold {
+    transition: none;
   }
 }

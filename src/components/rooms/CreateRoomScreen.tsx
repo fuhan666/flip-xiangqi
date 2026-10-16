@@ -5,7 +5,7 @@ import type { MemberSnapshot } from '../../network/protocol';
 import { IDLE_CONNECTION_STATE } from './connection-state';
 import { copyText } from './clipboard';
 import { ConfirmDialog } from './ConfirmDialog';
-import { MemberList } from './MemberList';
+import { RoomLobby } from './RoomLobby';
 
 interface CreateRoomScreenProps {
   api: RoomControlApi;
@@ -235,13 +235,23 @@ export function CreateRoomScreen({ api, createClient, preferredPort, onExit }: C
         )}
       </section>
 
-      <section className="room-panel">
-        <h2>房间成员</h2>
-        <MemberList members={hostFallbackMembers(connection)} selfId={connection.memberId} />
-        <p className="room-hint" data-testid="host-connection-state">
-          {describeHostConnection(connection)}
-        </p>
-      </section>
+      <RoomLobby
+        connectionHint={
+          <p className="room-hint" data-testid="host-connection-state">
+            {describeHostConnection(connection)}
+          </p>
+        }
+        lastRejection={connection.lastRejection}
+        lobby={connection.lobby}
+        members={hostFallbackMembers(connection)}
+        onLockChange={(locked) => sessionRef.current?.client.sendLobbyLock(locked)}
+        onReadyToggle={(ready) => sessionRef.current?.client.sendLobbyReady(ready)}
+        onSettingsChange={(sidePreference, timeControlId) => sessionRef.current?.client.sendLobbySettings(sidePreference, timeControlId)}
+        onStart={() => sessionRef.current?.client.sendLobbyStart()}
+        pendingCommand={connection.pendingCommand}
+        selfId={connection.memberId}
+        viewerRole={connection.role ?? 'host'}
+      />
 
       <div className="panel-actions">
         <button className="panel-action-secondary" data-testid="close-room" onClick={() => setConfirmClose(true)} type="button">
