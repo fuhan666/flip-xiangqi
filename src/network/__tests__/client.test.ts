@@ -3,7 +3,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocketServer, WebSocket as NodeWebSocket } from 'ws';
 import type { AddressInfo } from 'node:net';
 import { RoomClient, type WebSocketLike } from '../client';
-import { applyLobbyCommand, createLobbyState, type LobbyState } from '../lobby';
+import { applyLobbyCommand, buildStartParameters, createLobbyState, type LobbyState } from '../lobby';
+import { createMatch, snapshotMatch } from '../match';
 import { buildServerMessage, closeCodeForError, PROTOCOL_VERSION } from '../protocol';
 
 interface TestServer {
@@ -634,6 +635,156 @@ describe('RoomClient', () => {
     expect(client.getState().errorCode).toBe('UNAUTHORIZED');
     expect(client.getState().reconnecting).toBe(false);
     client.disconnect();
+  });
+
+  describe('online match action coordination', () => {
+    it('handles optimistic action, duplicate step preservation, rejection requestId matching, and hydration', async () => {
+      let serverSocket: NodeWebSocket | null = null;
+      const startParameters = buildStartParameters({
+        roomId: 'room-1',
+        host: { memberId: 'host-1', name: '房主' },
+        guest: { memberId: 'guest-1', name: '客人' },
+        settings: { sidePreference: 'host-red', timeControlId: 'standard', locked: true, settingsVersion: 1 },
+        hostSide: 'red',
+      });
+      const match = createMatch({ matchId: 'm1', seed: 42, startParameters });
+      const snap0 = snapshotMatch(match);
+
+      const server = await startServer((socket) => {
+        serverSocket = socket;
+        socket.on('message', (raw) => {
+          const parsed = JSON.parse(raw.toString());
+          if (parsed.type === 'hello') {
+            socket.send(
+              buildServerMessage({
+                type: 'welcome',
+                roomId: 'room-1',
+                payload: {
+                  roomId: 'room-1',
+                  memberId: 'host-1',
+                  role: 'host',
+                  name: '房主',
+                  members: [
+                    { id: 'host-1', role: 'host', name: '房主', connected: true },
+                    { id: 'guest-1', role: 'guest', name: '客人', connected: true },
+                  ],
+                  lobby: {
+                    phase: 'started',
+                    settings: { sidePreference: 'host-red', timeControlId: 'standard', locked: true, settingsVersion: 1 },
+                    ready: { host: true, guest: true },
+                    presence: { host: true, guest: true },
+                    startParameters,
+                  },
+                  game: snap0,
+                },
+              }),
+            );
+          }
+        });
+      });
+
+      const client = makeClient();
+      client.connect({ host: '127.0.0.1', port: server.port }, { role: 'host', name: '房主', token: 'token' });
+      await waitUntil(() => client.getState().game !== null);
+
+      const initialGame = client.getState().game!;
+      expect(initialGame.stepNumber).toBe(0);
+      expect(initialGame.pendingAction).toBeNull();
+      expect(initialGame.lastAcceptedAction).toBeNull();
+
+      // 1. 本地执行乐观翻牌 (0, 6)
+      const res = client.sendGameAction({ type: 'flip', position: { x: 0, y: 6 } });
+      expect(res.ok).toBe(true);
+
+      const afterAction = client.getState().game!;
+      expect(afterAction.pendingAction).not.toBeNull();
+      expect(afterAction.pendingAction?.stepNumber).toBe(0);
+      expect(afterAction.lastAcceptedAction?.source).toBe('local');
+      const pendingReqId = afterAction.pendingAction!.requestId;
+
+      // 2. 服务端重发第 0 步快照（重复广播）-> 不得撤销在途 pendingAction，不得覆盖 displayState
+      serverSocket!.send(
+        buildServerMessage({
+          type: 'game.state',
+          roomId: 'room-1',
+          payload: {
+            matchId: snap0.matchId,
+            seed: snap0.seed,
+            stepNumber: 0,
+            state: snap0.gameState,
+            startParameters: snap0.startParameters,
+          },
+        }),
+      );
+      await new Promise((r) => setTimeout(r, 50));
+      expect(client.getState().game?.pendingAction?.requestId).toBe(pendingReqId);
+
+      // 3. 服务端发送旧 requestId 的延迟拒绝 -> 不得撤销当前 pendingAction
+      serverSocket!.send(
+        buildServerMessage({
+          type: 'game.rejected',
+          roomId: 'room-1',
+          requestId: 'old-stale-req-id',
+          payload: {
+            matchId: snap0.matchId,
+            stepNumber: 0,
+            reason: '过期的旧请求拒绝',
+            state: snap0.gameState,
+          },
+        }),
+      );
+      await new Promise((r) => setTimeout(r, 50));
+      expect(client.getState().game?.pendingAction?.requestId).toBe(pendingReqId);
+
+      // 4. 服务端发送匹配 pendingReqId 的真实拒绝 -> 回滚 displayState 至 confirmedState，设置 notice
+      serverSocket!.send(
+        buildServerMessage({
+          type: 'game.rejected',
+          roomId: 'room-1',
+          requestId: pendingReqId,
+          payload: {
+            matchId: snap0.matchId,
+            stepNumber: 0,
+            reason: '你的操作未被采纳，请重新操作',
+            state: snap0.gameState,
+          },
+        }),
+      );
+      await waitUntil(() => client.getState().game?.pendingAction === null);
+      const rejectedGame = client.getState().game!;
+      expect(rejectedGame.statusNotice).toBe('你的操作未被采纳，请重新操作');
+      expect(rejectedGame.displayState.pieces).toEqual(snap0.gameState.pieces);
+      expect(rejectedGame.displayState.currentTurn).toBe(snap0.gameState.currentTurn);
+      expect(rejectedGame.lastAcceptedAction).toBeNull();
+
+      // 5. 同一步重试翻牌 (0, 6) -> 再次产生新 pendingAction 并可正常发送
+      const retryRes = client.sendGameAction({ type: 'flip', position: { x: 0, y: 6 } });
+      expect(retryRes.ok).toBe(true);
+      expect(client.getState().game?.pendingAction).not.toBeNull();
+      expect(client.getState().game?.pendingAction?.requestId).not.toBe(pendingReqId);
+
+      // 6. 服务端跳步快照（步数跳到 3）以 hydration 处理 -> 清理 pendingAction 且不补播动画
+      serverSocket!.send(
+        buildServerMessage({
+          type: 'game.state',
+          roomId: 'room-1',
+          payload: {
+            matchId: snap0.matchId,
+            seed: snap0.seed,
+            stepNumber: 3,
+            state: snap0.gameState,
+            startParameters: snap0.startParameters,
+            actorMemberId: 'guest-1',
+            action: { type: 'flip', position: { x: 0, y: 3 } },
+          },
+        }),
+      );
+      await waitUntil(() => client.getState().game?.stepNumber === 3);
+      expect(client.getState().game?.pendingAction).toBeNull();
+      expect(client.getState().game?.lastAcceptedAction).toBeNull();
+
+      client.disconnect();
+    });
   });
 });
 

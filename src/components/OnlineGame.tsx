@@ -242,14 +242,19 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
           {startSnapshotText}
         </p>
 
-        <div style={{ display: 'none' }}>
+        <div className="online-players-bar">
           {connection.members.map((member) => (
-            <div
+            <span
               key={member.id}
+              className={`online-player-badge ${member.connected ? 'online' : 'offline'}`}
               data-testid={member.role === 'host' ? 'member-host' : 'member-guest'}
             >
-              {member.name} {member.connected ? '在线' : '已掉线'}
-            </div>
+              <span className="online-player-role">{member.role === 'host' ? '房主' : '客人'}</span>
+              <span className="online-player-name">{member.name}</span>
+              <span className={`online-player-status ${member.connected ? 'status-connected' : 'status-dropped'}`}>
+                {member.connected ? '在线' : '已掉线'}
+              </span>
+            </span>
           ))}
         </div>
 

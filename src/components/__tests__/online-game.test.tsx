@@ -167,4 +167,86 @@ describe('OnlineGame component', () => {
     expect(mockClient.sendGameAction).not.toHaveBeenCalled();
     expect(screen.getByRole('status')).toHaveTextContent('当前非己方回合，请等待对方行动');
   });
+
+  it('covers full pending -> reject -> retry interaction chain and visible players bar', () => {
+    const { startParameters, snapshot } = createTestMatch(true);
+    const lobby = createLobbyState();
+    lobby.phase = 'started';
+    lobby.startParameters = startParameters;
+
+    const mockClient = {
+      sendGameAction: vi.fn().mockReturnValue({ ok: true }),
+      requestGameSync: vi.fn(),
+    } as unknown as RoomConnection;
+
+    let connection: ConnectionState = {
+      ...IDLE_CONNECTION_STATE,
+      status: 'connected',
+      roomId: 'room-1',
+      memberId: 'host-1',
+      role: 'host',
+      members: [
+        { id: 'host-1', role: 'host', name: '房主', connected: true },
+        { id: 'guest-1', role: 'guest', name: '客人', connected: true },
+      ],
+      lobby,
+      game: {
+        matchId: 'm1',
+        seed: 12345,
+        stepNumber: 0,
+        startParameters,
+        confirmedState: snapshot.gameState,
+        displayState: snapshot.gameState,
+        pendingAction: null,
+        lastError: null,
+        lastRejectedReason: null,
+        statusNotice: null,
+        lastAcceptedAction: null,
+      },
+    };
+
+    const { rerender } = render(<OnlineGame client={mockClient} connection={connection} onExit={vi.fn()} />);
+
+    // 验证真实可见的席位卡片
+    expect(screen.getByTestId('member-host')).toBeVisible();
+    expect(screen.getByTestId('member-guest')).toBeVisible();
+    expect(screen.getByTestId('member-host')).toHaveTextContent('在线');
+    expect(screen.getByTestId('member-guest')).toHaveTextContent('在线');
+
+    // 1. 用户翻开暗子 -> 触发 sendGameAction
+    const hiddenPiece = snapshot.gameState.pieces.find((p) => !p.revealed && p.position !== null)!;
+    const cellBtn = screen.getByTestId(`cell-${hiddenPiece.position!.x}-${hiddenPiece.position!.y}`);
+    fireEvent.click(cellBtn);
+    expect(mockClient.sendGameAction).toHaveBeenCalledWith({ type: 'flip', position: hiddenPiece.position! });
+
+    // 2. 模拟进入 pending 状态
+    connection = {
+      ...connection,
+      game: {
+        ...connection.game!,
+        pendingAction: { requestId: 'req-1', stepNumber: 0, action: { type: 'flip', position: hiddenPiece.position! } },
+      },
+    };
+    rerender(<OnlineGame client={mockClient} connection={connection} onExit={vi.fn()} />);
+    expect(screen.getByTestId('online-busy-hint')).toHaveTextContent('正在提交…');
+
+    // 3. 模拟服务端下发拒绝回滚
+    connection = {
+      ...connection,
+      game: {
+        ...connection.game!,
+        pendingAction: null,
+        statusNotice: '你的操作未被采纳，请重新操作',
+        lastRejectedReason: '校验失败',
+        lastAcceptedAction: null,
+      },
+    };
+    rerender(<OnlineGame client={mockClient} connection={connection} onExit={vi.fn()} />);
+    expect(screen.getByTestId('online-rejection-notice')).toHaveTextContent('你的操作未被采纳，请重新操作');
+    expect(screen.queryByTestId('online-busy-hint')).not.toBeInTheDocument();
+
+    // 4. 用户重试操作 -> 再次允许发送
+    fireEvent.click(cellBtn);
+    expect(mockClient.sendGameAction).toHaveBeenCalledTimes(2);
+  });
 });

@@ -814,6 +814,60 @@
 .online-rejection-notice {
   margin: 0;
   padding: 10px 14px;
+  background: rgba(220, 53, 69, 0.18);
+  border: 1px solid rgba(220, 53, 69, 0.45);
+  border-radius: 8px;
+  color: #ff6b6b;
+  font-weight: 600;
+  animation: online-rollback-fade 0.3s ease-out;
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+@keyframes online-rollback-fade {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.online-players-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 6px 0;
+}
+
+.online-player-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+
+.online-player-role {
+  color: #d8c29d;
+  font-weight: 600;
+}
+
+.online-player-name {
+  color: #f1f2f6;
+}
+
+.online-player-status.status-connected {
+  color: #2ed573;
+}
+
+.online-player-status.status-dropped {
+  color: #ffa502;
 }
 
 .online-meta-bar {
@@ -841,4 +895,11 @@
   font-size: 14px;
   color: #e5a742;
   font-style: italic;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .online-rejection-notice {
+    animation: none;
+    transition: none;
+  }
 }
