@@ -10,6 +10,7 @@ import {
   buildClientLeave,
   buildClientLobbyLock,
   buildClientLobbyReady,
+  buildClientLobbyReturn,
   buildClientLobbySettings,
   buildClientLobbyStart,
   buildPong,
@@ -1019,13 +1020,111 @@ describe('heartbeat and reconnection', () => {
     await pair.host.waitForType('game.state');
 
     // 1. 错误的 matchId (返回 game.rejected，不破坏连接)
-    pair.host.send(JSON.stringify({ version: 3, type: 'game.sync', roomId: pair.room.roomId, requestId: 'sync-bad-match', payload: { matchId: 'non-existent-match' } }));
+    pair.host.send(JSON.stringify({ version: PROTOCOL_VERSION, type: 'game.sync', roomId: pair.room.roomId, requestId: 'sync-bad-match', payload: { matchId: 'non-existent-match' } }));
     const rej = await pair.host.waitForType('game.rejected', (m) => m.requestId === 'sync-bad-match');
     expect(rej.payload.reason).toContain('对局标识不匹配');
 
     // 2. 错误的 roomId (协议层错误，返回 error 并关闭)
-    pair.host.send(JSON.stringify({ version: 3, type: 'game.sync', roomId: 'wrong-room', payload: {} }));
+    pair.host.send(JSON.stringify({ version: PROTOCOL_VERSION, type: 'game.sync', roomId: 'wrong-room', payload: {} }));
     const err = await pair.host.waitForType('error');
     expect(err.payload.message).toContain('room-id-mismatch');
+  });
+
+  it('broadcasts game.clock and triggers timeout when step time expires', async () => {
+    let simulatedTime = 10_000;
+    const pair = await connectedPair({
+      nowFn: () => simulatedTime,
+      clockIntervalMs: 50,
+    });
+    enableAutoPong(pair.host, pair.room.roomId);
+    enableAutoPong(pair.guest, pair.room.roomId);
+
+    // 设置为快棋 (10 分 + 30 秒)
+    pair.host.send(encodeMessage(buildClientLobbySettings(pair.room.roomId, { sidePreference: 'host-red', timeControlId: 'blitz' })));
+    await pair.host.waitForType('lobby.state', (m) => m.payload.lobby.settings.timeControlId === 'blitz');
+
+    await readyBoth(pair, 2);
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    const initialGameState = await pair.host.waitForType('game.state');
+    expect(initialGameState.payload.clock.turn).toBe('red');
+    expect(initialGameState.payload.clock.red.stepTimeRemainingMs).toBe(30_000);
+
+    // 收到定期 1Hz / 50ms 的 game.clock 广播
+    const clockMsg = await pair.host.waitForType('game.clock');
+    expect(clockMsg.payload.clock.turn).toBe('red');
+
+    // 步时超时：推进 31 秒
+    simulatedTime += 31_000;
+    const timeoutState = await pair.host.waitForType('game.state', (m) => m.payload.settlement !== undefined);
+    expect(timeoutState.payload.settlement.winner).toBe('black');
+    expect(timeoutState.payload.settlement.reason).toBe('step-timeout');
+  });
+
+  it('triggers 90-second disconnect grace when guest drops, and settles on expiration', async () => {
+    let simulatedTime = 10_000;
+    const pair = await connectedPair({
+      nowFn: () => simulatedTime,
+      clockIntervalMs: 50,
+      drawHostRed: () => true,
+    });
+    enableAutoPong(pair.host, pair.room.roomId);
+    enableAutoPong(pair.guest, pair.room.roomId);
+
+    await readyBoth(pair, 1);
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    await pair.host.waitForType('game.state');
+
+    // 客人掉线
+    pair.guest.socket.close();
+    const pausedState = await pair.host.waitForType('game.state', (m) => m.payload.clock?.paused === true);
+    expect(pausedState.payload.clock.disconnectGrace.guestDeadlineMs).toBe(simulatedTime + 90_000);
+
+    // 90秒耗尽
+    simulatedTime += 90_001;
+    // 触发时钟检查（可通过定期 broadcast 或手动检查）
+    const endedState = await pair.host.waitForType('game.state', (m) => m.payload.settlement !== undefined);
+    expect(endedState.payload.settlement.reason).toBe('disconnect-timeout');
+    expect(endedState.payload.settlement.winner).toBe('red');
+  });
+
+  it('handles rematch and return to lobby flow', async () => {
+    const pair = await connectedPair({
+      drawHostRed: () => true,
+    });
+    enableAutoPong(pair.host, pair.room.roomId);
+    enableAutoPong(pair.guest, pair.room.roomId);
+
+    await readyBoth(pair, 1);
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    const startedState = await pair.host.waitForType('game.state');
+    const matchId = startedState.payload.matchId;
+
+    // 行动一次
+    const hiddenPiece = startedState.payload.state.pieces.find((p: any) => !p.revealed && p.position !== null);
+    pair.host.send(
+      encodeMessage(
+        buildClientGameAction(pair.room.roomId, {
+          matchId,
+          stepNumber: 0,
+          requestId: 'act-1',
+          action: { type: 'flip', position: hiddenPiece.position },
+        }),
+      ),
+    );
+    await pair.host.waitForType('game.state', (m) => m.payload.stepNumber === 1);
+
+    // 客人主动离开当前局，客人判负终局
+    pair.guest.send(encodeMessage(buildClientLeave(pair.room.roomId)));
+    const endedState = await pair.host.waitForType('game.state', (m) => m.payload.settlement !== undefined);
+    expect(endedState.payload.settlement.reason).toBe('disconnect-timeout');
+
+    // 房主点击再来一局
+    pair.host.send(encodeMessage(buildClientLobbyReturn(pair.room.roomId, { matchId, intent: 'rematch' })));
+    const lobbyReset = await pair.host.waitForType(
+      'lobby.state',
+      (m) => m.payload.lobby.phase === 'lobby' && m.payload.lobby.ready.guest === false,
+    );
+    expect(lobbyReset.payload.lobby.ready.host).toBe(true);
+    expect(lobbyReset.payload.lobby.ready.guest).toBe(false);
   });
 });

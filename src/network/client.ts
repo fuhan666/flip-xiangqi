@@ -23,6 +23,7 @@ import {
   buildClientLeave,
   buildClientLobbyLock,
   buildClientLobbyReady,
+  buildClientLobbyReturn,
   buildClientLobbySettings,
   buildClientLobbyStart,
   buildPing,
@@ -36,6 +37,8 @@ import {
   type ErrorCode,
   type LobbyRejection,
   type MatchAction,
+  type MatchClockSnapshot,
+  type MatchSettlement,
   type MemberSnapshot,
   type Role,
   type RoomClosedReason,
@@ -64,9 +67,13 @@ export interface GameClientState {
   matchId: string;
   seed: number;
   stepNumber: number;
+  revision: number;
   startParameters: StartParameters;
   confirmedState: GameStateSnapshot;
   displayState: GameStateSnapshot;
+  clock: MatchClockSnapshot | null;
+  settlement: MatchSettlement | null;
+  clockOffsetMs: number;
   pendingAction: {
     requestId: string;
     stepNumber: number;
@@ -140,6 +147,8 @@ export interface RoomConnection {
   sendLobbyReady(ready: boolean): void;
   /** 房主请求开始对局（服务端执行门禁并一次性冻结开局参数）。 */
   sendLobbyStart(): void;
+  /** 结算后选择再来一局或返回大厅。 */
+  sendLobbyReturn(intent: 'return-lobby' | 'rematch'): void;
   /** 发送对局动作（翻牌/移动/吃子），本地先乐观执行。 */
   sendGameAction(action: MatchAction): { ok: boolean; reason?: string };
   /** 显式请求权威对局同步。 */
@@ -210,6 +219,7 @@ export class RoomClient implements RoomConnection {
   private pingSeq = 0;
   private pendingPingSeq: number | null = null;
   private pingSentAt = 0;
+  private clockOffsetMs = 0;
   private reconnectStartTime: number | null = null;
   private reconnectAttempt = 0;
   private reconnecting = false;
@@ -388,6 +398,23 @@ export class RoomClient implements RoomConnection {
     this.sendLobbyRequest('start', buildClientLobbyStart(roomId));
   }
 
+  sendLobbyReturn(intent: 'return-lobby' | 'rematch'): void {
+    const socket = this.socket;
+    if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
+      return;
+    }
+    const matchId = this.state.game?.matchId;
+    const roomId = this.state.roomId;
+    if (!matchId || !roomId) {
+      return;
+    }
+    try {
+      socket.send(encodeMessage(buildClientLobbyReturn(roomId, { matchId, intent })));
+    } catch {
+      // 忽略发送失败
+    }
+  }
+
   sendGameAction(action: MatchAction): { ok: boolean; reason?: string } {
     const socket = this.socket;
     if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
@@ -550,9 +577,13 @@ export class RoomClient implements RoomConnection {
           matchId: incomingGame.matchId,
           seed: incomingGame.seed,
           stepNumber: incomingGame.stepNumber,
+          revision: incomingGame.revision ?? 0,
           startParameters: incomingGame.startParameters,
           confirmedState: incomingGame.gameState,
           displayState: incomingGame.gameState,
+          clock: incomingGame.clock ?? null,
+          settlement: incomingGame.settlement ?? null,
+          clockOffsetMs: this.clockOffsetMs,
           pendingAction: null,
           lastError: null,
           lastRejectedReason: null,
@@ -610,8 +641,23 @@ export class RoomClient implements RoomConnection {
           clearTimeout(this.heartbeatTimeoutTimer);
           this.heartbeatTimeoutTimer = null;
         }
-        const rtt = Math.max(0, Math.round(this.now() - this.pingSentAt));
-        this.setState({ ...this.state, rtt });
+        const now = this.now();
+        const rtt = Math.max(0, Math.round(now - this.pingSentAt));
+        if (
+          typeof message.payload.serverReceiveTime === 'number' &&
+          typeof message.payload.serverSendTime === 'number'
+        ) {
+          const t0 = this.pingSentAt;
+          const t1 = message.payload.serverReceiveTime;
+          const t2 = message.payload.serverSendTime;
+          const t3 = now;
+          this.clockOffsetMs = Math.round(((t1 - t0) + (t2 - t3)) / 2);
+        }
+        this.setState({
+          ...this.state,
+          rtt,
+          game: this.state.game ? { ...this.state.game, clockOffsetMs: this.clockOffsetMs } : null,
+        });
       }
       return;
     }
@@ -622,8 +668,15 @@ export class RoomClient implements RoomConnection {
     }
 
     if (message.type === 'lobby.state') {
+      const isLobbyPhase = message.payload.lobby.phase === 'lobby';
       // 权威状态到达即认为在途请求已有结果，同时清除上一条拒绝提示。
-      this.setState({ ...this.state, lobby: message.payload.lobby, lastRejection: null, pendingCommand: null });
+      this.setState({
+        ...this.state,
+        lobby: message.payload.lobby,
+        lastRejection: null,
+        pendingCommand: null,
+        ...(isLobbyPhase ? { game: null } : {}),
+      });
       return;
     }
 
@@ -634,6 +687,23 @@ export class RoomClient implements RoomConnection {
         lastRejection: { code, message: describeLobbyReject(code) },
         pendingCommand: null,
       });
+      return;
+    }
+
+    if (message.type === 'game.clock') {
+      const { matchId, clock, revision } = message.payload;
+      const currentGame = this.state.game;
+      if (currentGame && currentGame.matchId === matchId) {
+        this.setState({
+          ...this.state,
+          game: {
+            ...currentGame,
+            clock,
+            revision,
+            clockOffsetMs: this.clockOffsetMs,
+          },
+        });
+      }
       return;
     }
 
@@ -663,6 +733,9 @@ export class RoomClient implements RoomConnection {
             game: {
               ...currentGame,
               confirmedState: incoming.state,
+              clock: incoming.clock ?? currentGame.clock,
+              settlement: incoming.settlement ?? currentGame.settlement,
+              revision: incoming.revision ?? currentGame.revision,
             },
           });
           return;
@@ -719,9 +792,13 @@ export class RoomClient implements RoomConnection {
           matchId: incoming.matchId,
           seed: incoming.seed,
           stepNumber: incoming.stepNumber,
+          revision: incoming.revision ?? incoming.stepNumber * 10,
           startParameters,
           confirmedState: incoming.state,
           displayState: incoming.state,
+          clock: incoming.clock ?? currentGame?.clock ?? null,
+          settlement: incoming.settlement ?? null,
+          clockOffsetMs: this.clockOffsetMs,
           pendingAction,
           lastError: null,
           lastRejectedReason: null,
@@ -944,8 +1021,11 @@ export class RoomClient implements RoomConnection {
 
     const elapsed = this.now() - (this.reconnectStartTime ?? this.now());
     const delay = computeBackoffDelay(this.reconnectAttempt, this.reconnectDelays);
+    const effectiveBudget = (this.state.game || this.state.lobby?.phase === 'started')
+      ? Math.max(this.reconnectBudgetMs, 95_000)
+      : this.reconnectBudgetMs;
 
-    if (elapsed + delay >= this.reconnectBudgetMs) {
+    if (elapsed + delay >= effectiveBudget) {
       this.reconnecting = false;
       this.generation += 1;
       this.teardown();
@@ -1084,7 +1164,7 @@ export class RoomClient implements RoomConnection {
     this.pingSentAt = this.now();
 
     try {
-      socket.send(encodeMessage(buildPing(roomId, seq)));
+      socket.send(encodeMessage(buildPing(roomId, seq, { clientTime: this.pingSentAt })));
     } catch {
       // 忽略发送失败
     }

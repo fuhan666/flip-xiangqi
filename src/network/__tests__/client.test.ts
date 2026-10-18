@@ -785,6 +785,106 @@ describe('RoomClient', () => {
 
       client.disconnect();
     });
+
+    it('handles game.clock updates, calculates NTP clock offset, and supports sendLobbyReturn', async () => {
+      let serverSocket: NodeWebSocket | null = null;
+      const startParameters = buildStartParameters({
+        roomId: 'room-1',
+        host: { memberId: 'host-1', name: '房主' },
+        guest: { memberId: 'guest-1', name: '客人' },
+        settings: { sidePreference: 'host-red', timeControlId: 'standard', locked: true, settingsVersion: 1 },
+        hostSide: 'red',
+      });
+      const match = createMatch({ matchId: 'm-1', seed: 42, startParameters });
+      const snap0 = snapshotMatch(match, 1000);
+
+      const server = await startServer((socket) => {
+        serverSocket = socket;
+        socket.on('message', (data) => {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === 'hello') {
+            socket.send(
+              buildServerMessage({
+                type: 'welcome',
+                roomId: 'room-1',
+                payload: {
+                  roomId: 'room-1',
+                  memberId: 'host-1',
+                  role: 'host',
+                  name: '房主',
+                  members,
+                  lobby: createLobbyState(),
+                  game: snap0,
+                },
+              }),
+            );
+          }
+          if (msg.type === 'ping') {
+            socket.send(
+              buildServerMessage({
+                type: 'pong',
+                roomId: 'room-1',
+                payload: {
+                  seq: msg.payload.seq,
+                  clientSendTime: msg.payload.clientTime,
+                  serverReceiveTime: 1050,
+                  serverSendTime: 1052,
+                },
+              }),
+            );
+          }
+        });
+      });
+
+      let simulatedTime = 1000;
+      const client = new RoomClient({
+        webSocketFactory: (url) => new NodeWebSocket(url) as unknown as WebSocketLike,
+        clock: { now: () => simulatedTime },
+        heartbeatIntervalMs: 20,
+        heartbeatTimeoutMs: 100,
+      });
+
+      client.connect({ host: '127.0.0.1', port: server.port }, { role: 'host', name: '房主', token: 'token-1' });
+      await waitUntil(() => client.getState().game !== null);
+
+      // 验证 welcome 中携带的 clock
+      expect(client.getState().game?.clock?.turn).toBe('red');
+
+      // 推进模拟时间并等待 pong 计算 NTP offset
+      simulatedTime = 1010;
+      await waitUntil(() => client.getState().game?.clockOffsetMs !== 0);
+      expect(typeof client.getState().game?.clockOffsetMs).toBe('number');
+
+      // 收到 game.clock 广播
+      serverSocket!.send(
+        buildServerMessage({
+          type: 'game.clock',
+          roomId: 'room-1',
+          payload: {
+            matchId: 'm-1',
+            sampleSeq: 1,
+            revision: 5,
+            clock: {
+              ...snap0.clock!,
+              red: { ...snap0.clock!.red, baseTimeRemainingMs: 1195_000 },
+            },
+          },
+        }),
+      );
+      await waitUntil(() => client.getState().game?.clock?.red.baseTimeRemainingMs === 1195_000);
+      expect(client.getState().game?.revision).toBe(5);
+
+      // 发送 lobby.return (rematch)
+      const receivedMessages: any[] = [];
+      serverSocket!.on('message', (d) => receivedMessages.push(JSON.parse(d.toString())));
+      client.sendLobbyReturn('rematch');
+      await waitUntil(() => receivedMessages.some((m) => m.type === 'lobby.return'));
+      const returnMsg = receivedMessages.find((m) => m.type === 'lobby.return');
+      expect(returnMsg.payload.intent).toBe('rematch');
+      expect(returnMsg.payload.matchId).toBe('m-1');
+
+      client.disconnect();
+    });
   });
 });
 
