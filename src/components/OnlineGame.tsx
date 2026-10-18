@@ -8,6 +8,8 @@ import { Board } from './Board.js';
 import { CapturedPieces } from './CapturedPieces.js';
 import { GameResultDialog } from './GameResultDialog.js';
 import { MoveHistory, actionSummary, campLabel } from './MoveHistory.js';
+import { NegotiationDialog } from './NegotiationDialog.js';
+import { NegotiationToast } from './NegotiationToast.js';
 import { PlayerClock } from './PlayerClock.js';
 import { StatusPanel } from './StatusPanel.js';
 import { ConnectionStatus } from './rooms/ConnectionStatus.js';
@@ -69,6 +71,15 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
   const [shuffling, setShuffling] = useState(true);
   const [showCheckToast, setShowCheckToast] = useState(false);
   const [, setGraceTick] = useState(0);
+  const [showResignConfirm, setShowResignConfirm] = useState(false);
+  const [currentTime, setCurrentTime] = useState(() => Date.now());
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setCurrentTime(Date.now());
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, []);
 
   // 首次开局短暂展示 ≤0.5 秒「洗牌中…」
   useEffect(() => {
@@ -200,6 +211,11 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
       return;
     }
 
+    if (Boolean(game.pendingNegotiation)) {
+      setInteractionMessage('协商进行中，棋盘操作已锁定');
+      return;
+    }
+
     const piece = getPieceAt(displayState, position);
 
     // 1. 点击暗子 -> 翻牌
@@ -266,6 +282,45 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
         setSelectedPosition(null);
         setInteractionMessage(null);
       }
+    }
+  };
+
+  const myMemberId = connection.memberId ?? '';
+  const drawCooldownUntil = game.drawCooldownUntil?.[myMemberId] ?? 0;
+  const isDrawCooldown = drawCooldownUntil > currentTime;
+  const drawCooldownRemainingSec = isDrawCooldown ? Math.ceil((drawCooldownUntil - currentTime) / 1000) : 0;
+
+  const isMatchEnded = Boolean(displayState.winner || game.settlement);
+  const isNegotiating = Boolean(game.pendingNegotiation);
+  const isConnected = connection.status === 'connected';
+
+  const canUndo = isConnected && !isMatchEnded && !isNegotiating && game.stepNumber > 0;
+  const canDraw = isConnected && !isMatchEnded && !isNegotiating && !isDrawCooldown;
+  const canResign = isConnected && !isMatchEnded;
+
+  const handleUndo = () => {
+    const res = client.sendGameNegotiate('undo');
+    if (!res.ok && res.reason) {
+      setInteractionMessage(res.reason);
+    }
+  };
+
+  const handleDraw = () => {
+    const res = client.sendGameNegotiate('draw');
+    if (!res.ok && res.reason) {
+      setInteractionMessage(res.reason);
+    }
+  };
+
+  const handleResign = () => {
+    setShowResignConfirm(true);
+  };
+
+  const handleConfirmResign = () => {
+    setShowResignConfirm(false);
+    const res = client.sendGameResign();
+    if (!res.ok && res.reason) {
+      setInteractionMessage(res.reason);
     }
   };
 
@@ -367,6 +422,7 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
           <Board
             captureGhost={feedback.captureGhost}
             checkPulse={feedback.checkPulse}
+            disabled={isNegotiating || isMatchEnded}
             flip={feedback.flip}
             gameState={displayState}
             hideHeader={true}
@@ -421,6 +477,36 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
               ) : null}
             </div>
 
+            <div className="online-negotiation-actions">
+              <button
+                className="online-action-btn online-btn-undo"
+                data-testid="btn-undo"
+                disabled={!canUndo}
+                onClick={handleUndo}
+                type="button"
+              >
+                悔棋
+              </button>
+              <button
+                className="online-action-btn online-btn-draw"
+                data-testid="btn-draw"
+                disabled={!canDraw}
+                onClick={handleDraw}
+                type="button"
+              >
+                {isDrawCooldown ? `求和 (${drawCooldownRemainingSec}s)` : '求和'}
+              </button>
+              <button
+                className="online-action-btn online-btn-resign"
+                data-testid="btn-resign"
+                disabled={!canResign}
+                onClick={handleResign}
+                type="button"
+              >
+                认输
+              </button>
+            </div>
+
             <button
               className="panel-action-secondary online-exit-button"
               data-testid={viewerRole === 'host' ? 'close-room' : 'leave-room'}
@@ -451,6 +537,53 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
           <CapturedPieces gameState={displayState} />
         </aside>
       </div>
+
+      {showResignConfirm ? (
+        <div
+          aria-labelledby="resign-confirm-title"
+          aria-modal="true"
+          className="resign-confirm-overlay"
+          data-testid="resign-confirm-dialog"
+          role="dialog"
+        >
+          <div className="resign-confirm-panel">
+            <h3 className="resign-confirm-title" id="resign-confirm-title">
+              确认认输？
+            </h3>
+            <p className="resign-confirm-prompt">
+              认输后对方将立即获胜，本局将以失败定格。是否确认认输？
+            </p>
+            <div className="resign-confirm-actions">
+              <button
+                className="resign-btn resign-btn-danger"
+                data-testid="confirm-resign-btn"
+                onClick={handleConfirmResign}
+                type="button"
+              >
+                确认认输
+              </button>
+              <button
+                className="resign-btn resign-btn-cancel"
+                data-testid="cancel-resign-btn"
+                onClick={() => setShowResignConfirm(false)}
+                type="button"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {game.pendingNegotiation ? (
+        <NegotiationDialog
+          isTarget={game.pendingNegotiation.responderMemberId === connection.memberId}
+          onReply={(agree) => client.sendGameNegotiateReply(agree)}
+          pendingNegotiation={game.pendingNegotiation}
+        />
+      ) : null}
+
+      <NegotiationToast event={game.negotiationEvent} />
 
       {settlement ? (
         <GameResultDialog

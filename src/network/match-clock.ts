@@ -16,11 +16,12 @@ export type EndgameReason =
   | 'match-timeout'
   | 'step-timeout'
   | 'disconnect-timeout'
-  | 'resignation';
+  | 'resignation'
+  | 'draw-agreement';
 
 export interface MatchSettlement {
-  winner: Camp;
-  loser: Camp;
+  winner: Camp | null;
+  loser: Camp | null;
   reason: EndgameReason;
   redDurationSeconds: number;
   blackDurationSeconds: number;
@@ -74,11 +75,13 @@ export class MatchClock {
 
   private turn: Camp = 'red';
   private paused = false;
+  private isNegotiationPaused = false;
   private lastTickTime: number;
   private sampleSeq = 0;
 
   private red: PlayerClockState;
   private black: PlayerClockState;
+  private checkpoints: Array<{ turn: Camp; red: PlayerClockState; black: PlayerClockState }> = [];
 
   private hostGraceDeadlineMs: number | null = null;
   private guestGraceDeadlineMs: number | null = null;
@@ -120,7 +123,7 @@ export class MatchClock {
   }
 
   public get isPaused(): boolean {
-    return this.paused;
+    return this.paused || this.isNegotiationPaused;
   }
 
   public getSettlement(): MatchSettlement | null {
@@ -138,28 +141,64 @@ export class MatchClock {
     };
   }
 
+  public pauseNegotiation(now: number = this.nowFn()): void {
+    this.advance(now);
+    this.isNegotiationPaused = true;
+    this.lastTickTime = now;
+    this.sampleSeq++;
+  }
+
+  public resumeNegotiation(now: number = this.nowFn()): void {
+    this.isNegotiationPaused = false;
+    this.lastTickTime = now;
+    this.sampleSeq++;
+  }
+
+  public saveCheckpoint(): void {
+    this.checkpoints.push({
+      turn: this.turn,
+      red: clonePlayerClockState(this.red),
+      black: clonePlayerClockState(this.black),
+    });
+  }
+
+  public undoLastAction(now: number = this.nowFn()): boolean {
+    if (this.checkpoints.length === 0) {
+      return false;
+    }
+    const cp = this.checkpoints.pop()!;
+    this.turn = cp.turn;
+    this.red = clonePlayerClockState(cp.red);
+    this.black = clonePlayerClockState(cp.black);
+    this.lastTickTime = now;
+    this.sampleSeq++;
+    return true;
+  }
+
   public advance(now: number = this.nowFn()): { timeoutResult: MatchSettlement | null; changed: boolean } {
     if (this.settlement) {
       return { timeoutResult: this.settlement, changed: false };
     }
 
-    if (this.paused) {
-      const hostExpired = this.hostGraceDeadlineMs !== null && now >= this.hostGraceDeadlineMs;
-      const guestExpired = this.guestGraceDeadlineMs !== null && now >= this.guestGraceDeadlineMs;
+    if (this.isPaused) {
+      if (this.paused) {
+        const hostExpired = this.hostGraceDeadlineMs !== null && now >= this.hostGraceDeadlineMs;
+        const guestExpired = this.guestGraceDeadlineMs !== null && now >= this.guestGraceDeadlineMs;
 
-      if (hostExpired && guestExpired) {
-        if (this.hostGraceDeadlineMs! < this.guestGraceDeadlineMs!) {
+        if (hostExpired && guestExpired) {
+          if (this.hostGraceDeadlineMs! < this.guestGraceDeadlineMs!) {
+            return { timeoutResult: this.finalizeByRoleTimeout('host', now), changed: true };
+          } else if (this.guestGraceDeadlineMs! < this.hostGraceDeadlineMs!) {
+            return { timeoutResult: this.finalizeByRoleTimeout('guest', now), changed: true };
+          } else {
+            const loserRole = this.firstDroppedRole ?? 'host';
+            return { timeoutResult: this.finalizeByRoleTimeout(loserRole, now), changed: true };
+          }
+        } else if (hostExpired) {
           return { timeoutResult: this.finalizeByRoleTimeout('host', now), changed: true };
-        } else if (this.guestGraceDeadlineMs! < this.hostGraceDeadlineMs!) {
+        } else if (guestExpired) {
           return { timeoutResult: this.finalizeByRoleTimeout('guest', now), changed: true };
-        } else {
-          const loserRole = this.firstDroppedRole ?? 'host';
-          return { timeoutResult: this.finalizeByRoleTimeout(loserRole, now), changed: true };
         }
-      } else if (hostExpired) {
-        return { timeoutResult: this.finalizeByRoleTimeout('host', now), changed: true };
-      } else if (guestExpired) {
-        return { timeoutResult: this.finalizeByRoleTimeout('guest', now), changed: true };
       }
 
       this.lastTickTime = now;
@@ -208,8 +247,8 @@ export class MatchClock {
       return { ok: false, reason: '对局已超时结束' };
     }
 
-    if (this.paused) {
-      return { ok: false, reason: '对局处于断线冻结状态，暂无法操作' };
+    if (this.isPaused) {
+      return { ok: false, reason: '对局处于暂停冻结状态，暂无法操作' };
     }
 
     // 切换行动方并重置新回合步时
@@ -306,12 +345,38 @@ export class MatchClock {
     return this.settlement;
   }
 
+  public finalizeDraw(reason: EndgameReason = 'draw-agreement', now: number = this.nowFn()): MatchSettlement {
+    if (this.settlement) {
+      return this.settlement;
+    }
+
+    const redDurationSeconds = Math.max(0, Math.round(this.red.accumulatedDurationMs / 1000));
+    const blackDurationSeconds = Math.max(0, Math.round(this.black.accumulatedDurationMs / 1000));
+
+    this.settlement = {
+      winner: null,
+      loser: null,
+      reason,
+      redDurationSeconds,
+      blackDurationSeconds,
+      endedAt: now,
+    };
+
+    this.paused = true;
+    this.sampleSeq++;
+
+    return this.settlement;
+  }
+
   public getNextDeadlineTime(now: number = this.nowFn()): number | null {
     if (this.settlement) {
       return null;
     }
 
-    if (this.paused) {
+    if (this.isPaused) {
+      if (!this.paused) {
+        return null;
+      }
       const deadlines: number[] = [];
       if (this.hostGraceDeadlineMs !== null) {
         deadlines.push(this.hostGraceDeadlineMs);
@@ -348,7 +413,7 @@ export class MatchClock {
   public getSnapshot(now: number = this.nowFn()): MatchClockSnapshot {
     return {
       turn: this.turn,
-      paused: this.paused,
+      paused: this.isPaused,
       red: clonePlayerClockState(this.red),
       black: clonePlayerClockState(this.black),
       serverTime: now,
@@ -371,6 +436,7 @@ const VALID_ENDGAME_REASONS = new Set<string>([
   'step-timeout',
   'disconnect-timeout',
   'resignation',
+  'draw-agreement',
 ]);
 
 export function isEndgameReason(value: unknown): value is EndgameReason {
@@ -477,11 +543,17 @@ export function parseMatchSettlement(value: unknown): MatchSettlement | null {
     return null;
   }
   const { winner, loser, reason, redDurationSeconds, blackDurationSeconds, endedAt } = value;
-  if ((winner !== 'red' && winner !== 'black') || (loser !== 'red' && loser !== 'black')) {
-    return null;
-  }
   if (!isEndgameReason(reason)) {
     return null;
+  }
+  if (reason === 'draw-agreement') {
+    if (winner !== null || loser !== null) {
+      return null;
+    }
+  } else {
+    if ((winner !== 'red' && winner !== 'black') || (loser !== 'red' && loser !== 'black') || winner === loser) {
+      return null;
+    }
   }
   if (
     typeof redDurationSeconds !== 'number' ||

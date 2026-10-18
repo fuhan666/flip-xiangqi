@@ -10,7 +10,11 @@ export interface GameResultDialogProps {
   onReturnLobby: () => void;
 }
 
-export function formatEndgameReason(reason: string): string {
+export function formatEndgameReason(
+  reason: string,
+  viewerSide?: Camp | null,
+  winner?: Camp | null,
+): string {
   switch (reason) {
     case 'checkmate':
       return '绝杀：对方已被将死';
@@ -22,8 +26,13 @@ export function formatEndgameReason(reason: string): string {
       return '单步用时耗尽超时判负';
     case 'disconnect-timeout':
       return '掉线超过 90 秒超时判负';
+    case 'draw-agreement':
+      return '双方握手言和，协商平局';
     case 'resignation':
-      return '对方认输';
+      if (viewerSide && winner) {
+        return viewerSide === winner ? '对方认输' : '己方认输';
+      }
+      return '一方认输';
     default:
       return '对局结束';
   }
@@ -71,13 +80,16 @@ export function GameResultDialog({
       data-testid="game-result-modal"
       role="dialog"
     >
-      <div className={`game-result-dialog ${isWinner ? 'dialog-victory' : 'dialog-defeat'}`} ref={dialogRef}>
+      <div
+        className={`game-result-dialog ${isDraw ? 'dialog-draw' : isWinner ? 'dialog-victory' : 'dialog-defeat'}`}
+        ref={dialogRef}
+      >
         <div className="celebration-container">
           <div
-            className={`celebration-piece camp-${settlement.winner} ${isWinner ? 'piece-celebrate' : ''}`}
+            className={`celebration-piece camp-${settlement.winner ?? 'draw'} ${isWinner ? 'piece-celebrate' : ''}`}
             data-testid="celebration-piece"
           >
-            <span>{settlement.winner === 'red' ? '帅' : '将'}</span>
+            <span>{isDraw ? '和' : settlement.winner === 'red' ? '帅' : '将'}</span>
           </div>
         </div>
 
@@ -86,7 +98,7 @@ export function GameResultDialog({
         </h2>
 
         <div className="game-result-reason" data-testid="result-reason">
-          {formatEndgameReason(settlement.reason)}
+          {formatEndgameReason(settlement.reason, viewerSide, settlement.winner)}
         </div>
 
         <div className="game-result-stats" data-testid="result-stats">

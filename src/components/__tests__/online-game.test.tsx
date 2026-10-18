@@ -44,6 +44,9 @@ describe('OnlineGame component', () => {
       lastRejectedReason: null,
       statusNotice: null,
       lastAcceptedAction: null,
+      pendingNegotiation: null,
+      drawCooldownUntil: {},
+      negotiationEvent: null,
       ...overrides,
     };
   }
@@ -364,6 +367,9 @@ describe('OnlineGame component', () => {
         lastRejectedReason: null,
         statusNotice: null,
         lastAcceptedAction: null,
+        pendingNegotiation: null,
+        drawCooldownUntil: {},
+        negotiationEvent: null,
       },
     };
 
@@ -429,6 +435,9 @@ describe('OnlineGame component', () => {
         lastRejectedReason: null,
         statusNotice: null,
         lastAcceptedAction: null,
+        pendingNegotiation: null,
+        drawCooldownUntil: {},
+        negotiationEvent: null,
       },
     };
 
