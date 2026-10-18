@@ -22,7 +22,6 @@ export function ConnectionStatus({ status, rtt }: ConnectionStatusProps) {
       aria-live="polite"
       className="connection-status"
       data-testid="connection-status"
-      role="status"
     >
       <span
         aria-hidden="true"

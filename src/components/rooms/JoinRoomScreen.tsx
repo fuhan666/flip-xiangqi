@@ -108,59 +108,59 @@ export function JoinRoomScreen({ createClient, storage, initialAddress, guestPag
   const connecting = connection.status === 'connecting';
 
   return (
-    <main className="app-shell room-shell">
+    <main className={`app-shell room-shell${connection.game ? ' room-shell-ingame' : ''}`}>
       {connection.status === 'reconnecting' ? (
         <ConnectionBanner onReconnect={() => clientRef.current?.reconnect()} />
       ) : null}
       {connection.justReconnected ? <Toast message="已重新连接 ✓" /> : null}
 
-      <header className="room-header room-header-row">
-        <div>
-          <h1>加入房间</h1>
-          <p>{guestPage ? '你正在打开房主分享的地址，确认后即可加入。' : '输入房主分享的地址，加入同一局域网的对局房间。'}</p>
-        </div>
-        {inLobby ? (
-          <ConnectionStatus rtt={connection.rtt} status={connection.status} />
-        ) : null}
-      </header>
-
-      {inLobby ? (
-        connection.game && clientRef.current ? (
-          <OnlineGame
-            client={clientRef.current}
-            connection={connection}
-            onExit={() => setConfirmLeave(true)}
-          />
-        ) : (
-          <>
-            <RoomLobby
-              connectionHint={
-                <p className="room-hint" data-testid="join-connection-state">
-                  {connection.status === 'reconnecting' ? '正在重连…' : `已连接 · 房间号 ${connection.roomId}`}
-                </p>
-              }
-              lastRejection={connection.lastRejection}
-              lobby={connection.lobby}
-              members={connection.members}
-              onLockChange={(locked) => clientRef.current?.sendLobbyLock(locked)}
-              onReadyToggle={(ready) => clientRef.current?.sendLobbyReady(ready)}
-              onSettingsChange={(sidePreference, timeControlId) =>
-                clientRef.current?.sendLobbySettings(sidePreference, timeControlId)
-              }
-              onStart={() => clientRef.current?.sendLobbyStart()}
-              pendingCommand={connection.pendingCommand}
-              reconnecting={connection.reconnecting}
-              selfId={connection.memberId}
-              viewerRole={connection.role ?? 'guest'}
-            />
-            <div className="panel-actions">
-              <button className="panel-action-secondary" data-testid="leave-room" onClick={() => setConfirmLeave(true)} type="button">
-                离开房间
-              </button>
-            </div>
-          </>
-        )
+      {inLobby && connection.game && clientRef.current ? (
+        <OnlineGame
+          client={clientRef.current}
+          connection={connection}
+          onExit={() => setConfirmLeave(true)}
+        />
       ) : (
+        <>
+          <header className="room-header room-header-row">
+            <div>
+              <h1>加入房间</h1>
+              <p>{guestPage ? '你正在打开房主分享的地址，确认后即可加入。' : '输入房主分享的地址，加入同一局域网的对局房间。'}</p>
+            </div>
+            {inLobby ? (
+              <ConnectionStatus rtt={connection.rtt} status={connection.status} />
+            ) : null}
+          </header>
+
+          {inLobby ? (
+            <>
+              <RoomLobby
+                connectionHint={
+                  <p className="room-hint" data-testid="join-connection-state">
+                    {connection.status === 'reconnecting' ? '正在重连…' : `已连接 · 房间号 ${connection.roomId}`}
+                  </p>
+                }
+                lastRejection={connection.lastRejection}
+                lobby={connection.lobby}
+                members={connection.members}
+                onLockChange={(locked) => clientRef.current?.sendLobbyLock(locked)}
+                onReadyToggle={(ready) => clientRef.current?.sendLobbyReady(ready)}
+                onSettingsChange={(sidePreference, timeControlId) =>
+                  clientRef.current?.sendLobbySettings(sidePreference, timeControlId)
+                }
+                onStart={() => clientRef.current?.sendLobbyStart()}
+                pendingCommand={connection.pendingCommand}
+                reconnecting={connection.reconnecting}
+                selfId={connection.memberId}
+                viewerRole={connection.role ?? 'guest'}
+              />
+              <div className="panel-actions">
+                <button className="panel-action-secondary" data-testid="leave-room" onClick={() => setConfirmLeave(true)} type="button">
+                  离开房间
+                </button>
+              </div>
+            </>
+          ) : (
         <>
           <section className="room-panel">
             <h2>房间地址</h2>
@@ -235,6 +235,8 @@ export function JoinRoomScreen({ createClient, storage, initialAddress, guestPag
           </section>
         </>
       )}
+    </>
+  )}
 
       <ConfirmDialog
         confirmLabel="离开房间"

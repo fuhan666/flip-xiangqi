@@ -153,15 +153,7 @@ export function CreateRoomScreen({ api, createClient, preferredPort, onExit }: C
   const primaryText = room ? (primaryAddress ? primaryAddress.address : '127.0.0.1') + `:${room.port}` : '';
 
   return (
-    <main className="app-shell room-shell">
-      <header className="room-header room-header-row">
-        <div>
-          <h1>等待对手加入</h1>
-          <p>请让对手与你连接同一 Wi-Fi/局域网，再输入上面的地址加入。</p>
-        </div>
-        <ConnectionStatus rtt={connection.rtt} status={connection.status} />
-      </header>
-
+    <main className={`app-shell room-shell${connection.game ? ' room-shell-ingame' : ''}`}>
       {connection.game && sessionRef.current ? (
         <OnlineGame
           client={sessionRef.current.client}
@@ -170,6 +162,14 @@ export function CreateRoomScreen({ api, createClient, preferredPort, onExit }: C
         />
       ) : (
         <>
+          <header className="room-header room-header-row">
+            <div>
+              <h1>等待对手加入</h1>
+              <p>请让对手与你连接同一 Wi-Fi/局域网，再输入上面的地址加入。</p>
+            </div>
+            <ConnectionStatus rtt={connection.rtt} status={connection.status} />
+          </header>
+
           <section className="room-panel">
             <h2>分享这个地址</h2>
             {creating || !room ? (

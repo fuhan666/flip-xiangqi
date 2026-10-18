@@ -1,3 +1,5 @@
+import type { Perspective } from './board-perspective';
+
 const VIEW_BOX_WIDTH = 900;
 const VIEW_BOX_HEIGHT = 1000;
 const GRID_ORIGIN = 50;
@@ -71,7 +73,11 @@ function cornerMark(x: number, y: number): string[] {
 
 const MARK_PATHS = [...CANNON_MARKS, ...PAWN_MARKS].flatMap(([x, y]) => cornerMark(x, y)).join(' ');
 
-export function BoardArtwork() {
+export interface BoardArtworkProps {
+  perspective?: Perspective;
+}
+
+export function BoardArtwork({ perspective = 'red' }: BoardArtworkProps) {
   return (
     <svg
       aria-hidden="true"
@@ -129,13 +135,14 @@ export function BoardArtwork() {
       <path className="board-artwork-marks" d={MARK_PATHS} />
 
       <g className="board-artwork-river">
-        <text dominantBaseline="middle" textAnchor="middle" x="225" y={502}>
+        <text dominantBaseline="middle" textAnchor="middle" x={perspective === 'black' ? 675 : 225} y={502}>
           楚河
         </text>
-        <text dominantBaseline="middle" textAnchor="middle" x="675" y={502}>
+        <text dominantBaseline="middle" textAnchor="middle" x={perspective === 'black' ? 225 : 675} y={502}>
           汉界
         </text>
       </g>
     </svg>
   );
 }
+

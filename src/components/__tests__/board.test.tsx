@@ -267,4 +267,151 @@ describe('Board', () => {
     expect(flippedCell.querySelector('.piece-face-hidden')).toBeNull();
     expect(flippedCell.querySelector('.piece-face-revealed')).not.toBeNull();
   });
+
+  it('renders black perspective with own side (Black) at bottom and dispatches logical coordinates on click', async () => {
+    const user = userEvent.setup();
+    const onCellClick = vi.fn();
+    const gameState = createEmptyGameState({
+      pieces: [
+        piece({ id: 'black-king', camp: 'black', type: 'king', position: { x: 4, y: 0 } }),
+        piece({ id: 'red-king', camp: 'red', type: 'king', position: { x: 4, y: 9 } }),
+      ],
+    });
+
+    const { container } = render(
+      <Board
+        gameState={gameState}
+        onCellClick={onCellClick}
+        perspective="black"
+        selectedPosition={null}
+      />,
+    );
+
+    const buttons = container.querySelectorAll('.board > button.cell');
+    expect(buttons).toHaveLength(90);
+
+    // 屏幕第 1 个格子（视觉顶部左上角 dy=0, dx=0）在黑方视角对应逻辑 (8, 9)
+    expect(buttons[0]).toHaveAttribute('data-testid', 'cell-8-9');
+    await user.click(buttons[0]);
+    expect(onCellClick).toHaveBeenCalledWith({ x: 8, y: 9 });
+
+    // 视觉底排中心（dy=9, dx=4）在黑方视角对应逻辑黑将 (4, 0)
+    // 视觉索引 = 9 * 9 + 4 = 85
+    expect(buttons[85]).toHaveAttribute('data-testid', 'cell-4-0');
+    expect(buttons[85]).toHaveTextContent('将');
+    await user.click(buttons[85]);
+    expect(onCellClick).toHaveBeenCalledWith({ x: 4, y: 0 });
+
+    // 视觉顶排中心（dy=0, dx=4）对应逻辑红帅 (4, 9)
+    // 视觉索引 = 0 * 9 + 4 = 4
+    expect(buttons[4]).toHaveAttribute('data-testid', 'cell-4-9');
+    expect(buttons[4]).toHaveTextContent('帅');
+  });
+
+  it('swaps river text coordinates between red and black perspectives', () => {
+    const gameState = createEmptyGameState({
+      pieces: [
+        piece({ id: 'red-king', camp: 'red', type: 'king', position: { x: 4, y: 9 } }),
+        piece({ id: 'black-king', camp: 'black', type: 'king', position: { x: 4, y: 0 } }),
+      ],
+    });
+
+    // 红方视角：楚河在左 (x=225)，汉界在右 (x=675)
+    const { container: redContainer, unmount: unmountRed } = render(
+      <Board gameState={gameState} onCellClick={vi.fn()} perspective="red" selectedPosition={null} />,
+    );
+    const redRiverTexts = redContainer.querySelectorAll('.board-artwork-river text');
+    expect(redRiverTexts[0]).toHaveTextContent('楚河');
+    expect(redRiverTexts[0]).toHaveAttribute('x', '225');
+    expect(redRiverTexts[1]).toHaveTextContent('汉界');
+    expect(redRiverTexts[1]).toHaveAttribute('x', '675');
+    unmountRed();
+
+    // 黑方视角：汉界在左 (x=225)，楚河在右 (x=675)
+    const { container: blackContainer } = render(
+      <Board gameState={gameState} onCellClick={vi.fn()} perspective="black" selectedPosition={null} />,
+    );
+    const blackRiverTexts = blackContainer.querySelectorAll('.board-artwork-river text');
+    expect(blackRiverTexts[0]).toHaveTextContent('楚河');
+    expect(blackRiverTexts[0]).toHaveAttribute('x', '675');
+    expect(blackRiverTexts[1]).toHaveTextContent('汉界');
+    expect(blackRiverTexts[1]).toHaveAttribute('x', '225');
+  });
+
+  it('projects last move rings, trace lines, and capture ghost coordinates in black perspective', () => {
+    // 逻辑走子：从 (0, 6) 到 (0, 0)
+    // 黑方视角映射后：起点 (8, 3)，终点 (8, 9)
+    // SVG cx = 50 + 100 * x, cy = 50 + 100 * y:
+    // 起点: cx=850, cy=350
+    // 终点: cx=850, cy=950
+    const gameStateWithMove = applyAction(
+      createEmptyGameState({
+        pieces: [
+          piece({ id: 'red-king', camp: 'red', type: 'king', position: { x: 4, y: 9 } }),
+          piece({ id: 'black-king', camp: 'black', type: 'king', position: { x: 4, y: 0 } }),
+          piece({ id: 'center-blocker', camp: 'red', type: 'pawn', position: { x: 4, y: 5 } }),
+          piece({ id: 'red-rook', camp: 'red', type: 'rook', position: { x: 0, y: 6 } }),
+        ],
+      }),
+      { type: 'move', from: { x: 0, y: 6 }, to: { x: 0, y: 0 } },
+    );
+
+    const { container } = render(
+      <Board
+        captureGhost={{
+          camp: 'black',
+          eventKey: 'ghost-1',
+          pieceType: 'rook',
+          position: { x: 0, y: 0 },
+        }}
+        gameState={gameStateWithMove}
+        onCellClick={vi.fn()}
+        perspective="black"
+        selectedPosition={null}
+        trace={{ eventKey: 'trace-1', from: { x: 0, y: 6 }, to: { x: 0, y: 0 } }}
+      />,
+    );
+
+    const ringFrom = container.querySelector('.board-last-move-from');
+    expect(ringFrom).toHaveAttribute('cx', '850');
+    expect(ringFrom).toHaveAttribute('cy', '350');
+
+    const ringTo = container.querySelector('.board-last-move-to');
+    expect(ringTo).toHaveAttribute('cx', '850');
+    expect(ringTo).toHaveAttribute('cy', '950');
+
+    const traceLine = container.querySelector('.board-trace-line');
+    expect(traceLine).toHaveAttribute('x1', '850');
+    expect(traceLine).toHaveAttribute('y1', '350');
+    expect(traceLine).toHaveAttribute('x2', '850');
+    expect(traceLine).toHaveAttribute('y2', '950');
+
+    // captureGhost 在逻辑 (0, 0)，黑方显示坐标 (8, 9)
+    // left = ((50 + 100 * 8) / 900) * 100% = 850 / 900 * 100% ≈ 94.444%
+    // top = ((50 + 100 * 9) / 1000) * 100% = 95%
+    const ghost = screen.getByTestId('capture-ghost');
+    expect(ghost.style.left).toBe(`${(850 / 900) * 100}%`);
+    expect(ghost.style.top).toBe('95%');
+  });
+
+  it('respects hideHeader prop and still renders check banner when in check', () => {
+    const checkedState = createEmptyGameState({
+      checkedCamp: 'black',
+      pieces: [
+        piece({ id: 'red-king', camp: 'red', type: 'king', position: { x: 4, y: 9 } }),
+        piece({ id: 'black-king', camp: 'black', type: 'king', position: { x: 4, y: 0 } }),
+      ],
+    });
+
+    const { container, rerender } = render(
+      <Board gameState={checkedState} hideHeader={true} onCellClick={vi.fn()} selectedPosition={null} />,
+    );
+
+    expect(container.querySelector('.board-shell-header')).toBeNull();
+    expect(screen.getByText('将军警示：请立即应将')).toBeInTheDocument();
+
+    rerender(<Board gameState={checkedState} hideHeader={false} onCellClick={vi.fn()} selectedPosition={null} />);
+    expect(container.querySelector('.board-shell-header')).not.toBeNull();
+  });
 });
+
