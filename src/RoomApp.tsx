@@ -8,7 +8,7 @@ import { MenuScreen } from './components/rooms/MenuScreen';
 import { SettingsScreen } from './components/rooms/SettingsScreen';
 import './rooms.css';
 
-export const APP_VERSION = 'v0.7.0-dev';
+export const APP_VERSION = 'v0.7.0';
 const ROOM_PORT_KEY = 'flip-xiangqi.room-port';
 
 type Screen = 'menu' | 'create' | 'join' | 'settings';
