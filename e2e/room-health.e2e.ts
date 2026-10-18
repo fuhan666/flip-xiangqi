@@ -57,6 +57,30 @@ async function openGuest(context: BrowserContext, port: number): Promise<Page> {
         super(...(args as [string, ...any[]]));
         (window as any).__roomWs = this;
         (window as any).__lastWs = this;
+
+        let userOnMessage: any = null;
+        super.onmessage = (event: MessageEvent) => {
+          const delay = (window as any).__injectedLatencyMs || 0;
+          if (delay > 0) {
+            setTimeout(() => userOnMessage?.call(this, event), delay);
+          } else {
+            userOnMessage?.call(this, event);
+          }
+        };
+        Object.defineProperty(this, 'onmessage', {
+          get: () => userOnMessage,
+          set: (fn) => {
+            userOnMessage = fn;
+          },
+        });
+
+        const origSend = this.send.bind(this);
+        this.send = (data: any) => {
+          if ((window as any).__muteOutgoing) {
+            return;
+          }
+          return origSend(data);
+        };
       }
     };
   });
@@ -114,9 +138,11 @@ test.describe('heartbeat, latency monitoring and disconnection recovery', () => 
 
     await expect(hostPage.getByTestId('member-guest')).toContainText('在线');
 
-    // 突发静默断线（直接关闭客人端页面与网络会话）
+    // 突发静默断线（客人端保持打开但静默丢弃出站心跳包）
     const dropStart = Date.now();
-    await guestContext.close();
+    await guestPage.evaluate(() => {
+      (window as any).__muteOutgoing = true;
+    });
 
     // 房主端必须在 5000ms 内检测到心跳失联并呈现「已掉线」
     await expect(hostPage.getByTestId('member-guest')).toContainText('已掉线', { timeout: 5000 });
@@ -126,6 +152,43 @@ test.describe('heartbeat, latency monitoring and disconnection recovery', () => 
     await screenshot(hostPage, '03-host-detected-silent-drop');
     await closeRoomFromHost(hostPage);
     await hostContext.close();
+    await guestContext.close();
+  });
+
+  test('dynamically updates status lamp based on controlled latency (green -> yellow -> red -> recovery)', async ({ browser }) => {
+    const hostContext = await browser.newContext();
+    const hostPage = await hostContext.newPage();
+    const room = await createRoom(hostPage);
+
+    const guestContext = await browser.newContext();
+    const guestPage = await openGuest(guestContext, room.port);
+    await joinRoom(guestPage, `127.0.0.1:${room.port}`);
+
+    // 初始状态良好 (<= 80ms)
+    await expect(guestPage.getByTestId('connection-lamp')).toHaveClass(/connection-lamp-green/, { timeout: 10_000 });
+
+    // 注入较高延迟 120ms (80ms - 200ms -> 黄色指示灯)
+    await guestPage.evaluate(() => {
+      (window as any).__injectedLatencyMs = 120;
+    });
+    await expect(guestPage.getByTestId('connection-lamp')).toHaveClass(/connection-lamp-yellow/, { timeout: 10_000 });
+    await expect(guestPage.getByTestId('connection-rtt')).toContainText(/ms/);
+
+    // 注入高延迟 250ms (>= 200ms -> 红色指示灯)
+    await guestPage.evaluate(() => {
+      (window as any).__injectedLatencyMs = 250;
+    });
+    await expect(guestPage.getByTestId('connection-lamp')).toHaveClass(/connection-lamp-red/, { timeout: 10_000 });
+
+    // 恢复低延迟 0ms (<= 80ms -> 恢复绿色指示灯)
+    await guestPage.evaluate(() => {
+      (window as any).__injectedLatencyMs = 0;
+    });
+    await expect(guestPage.getByTestId('connection-lamp')).toHaveClass(/connection-lamp-green/, { timeout: 10_000 });
+
+    await closeRoomFromHost(hostPage);
+    await hostContext.close();
+    await guestContext.close();
   });
 
   test('handles disconnection with top banner, backoff, manual reconnect and toast', async ({ browser }) => {

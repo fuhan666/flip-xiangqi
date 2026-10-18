@@ -1,6 +1,6 @@
 # Flip Xiangqi MVP Implementation Plan
 
-> **For Hermes:** Follow `subagent-driven-development`, `test-driven-development`, and `requesting-code-review` while executing this plan. Complete phases in order and keep Multica issues updated.
+> **For Hermes:** Follow `subagent-driven-development`, `test-driven-development`, and `requesting-code-review` while executing this plan. Complete phases in order.
 
 **Goal:** Deliver a playable local two-player Flip Xiangqi MVP that covers PHASE1 through PHASE5 from the roadmap.
 
@@ -150,7 +150,7 @@
 2. Run all tests.
 3. Run an independent review.
 4. Commit final polish.
-5. Push and update Multica issues/comments.
+5. Push and finalize implementation.
 
 ## Validation
 

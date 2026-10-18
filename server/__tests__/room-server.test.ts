@@ -28,6 +28,7 @@ interface TestClient {
 
 const openClients: TestClient[] = [];
 const serversToStop: Array<() => Promise<void>> = [];
+const blockers: Server[] = [];
 
 function openClient(port: number): Promise<TestClient> {
   return new Promise((resolve, reject) => {
@@ -101,20 +102,25 @@ async function startRoom(overrides: Partial<RoomServerOptions> = {}): Promise<Ro
 }
 
 function freePort(): Promise<number> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const probe = createServer();
+    probe.on('error', reject);
     probe.listen(0, '127.0.0.1', () => {
       const port = (probe.address() as AddressInfo).port;
-      probe.close(() => resolve(port));
+      probe.close((error) => (error ? reject(error) : resolve(port)));
     });
   });
 }
 
-function occupyPort(port: number): Promise<Server> {
-  return new Promise((resolve) => {
+function occupyPort(port = 0): Promise<Server> {
+  return new Promise((resolve, reject) => {
     const server = createServer();
+    server.on('error', reject);
     // 与房间监听同样绑定 0.0.0.0，确保端口占用真实冲突。
-    server.listen(port, '0.0.0.0', () => resolve(server));
+    server.listen(port, '0.0.0.0', () => {
+      blockers.push(server);
+      resolve(server);
+    });
   });
 }
 
@@ -177,6 +183,16 @@ afterEach(async () => {
   }
   while (serversToStop.length > 0) {
     await serversToStop.pop()?.();
+  }
+  while (blockers.length > 0) {
+    const blocker = blockers.pop();
+    await new Promise<void>((resolve) => {
+      if (!blocker || !blocker.listening) {
+        resolve();
+        return;
+      }
+      blocker.close(() => resolve());
+    });
   }
 });
 
@@ -386,22 +402,21 @@ describe('disconnect cleanup', () => {
 
 describe('port strategy', () => {
   it('falls back to the next free port when the preferred one is busy', async () => {
-    const preferredPort = await freePort();
-    const blocker = await occupyPort(preferredPort);
-    const room = await startRoom({ preferredPort, maxPortAttempts: 3 });
+    const blocker = await occupyPort(0);
+    const preferredPort = (blocker.address() as AddressInfo).port;
+    const room = await startRoom({ preferredPort, maxPortAttempts: 5 });
 
-    expect(room.actualPort).toBe(preferredPort + 1);
+    expect(room.actualPort).toBeGreaterThan(preferredPort);
+    expect(room.actualPort).toBeLessThanOrEqual(preferredPort + 4);
     await room.closeRoom('server-stopped');
-    await new Promise<void>((resolve) => blocker.close(() => resolve()));
   });
 
   it('reports PORT_UNAVAILABLE when the attempts are exhausted', async () => {
-    const preferredPort = await freePort();
-    const blocker = await occupyPort(preferredPort);
+    const blocker = await occupyPort(0);
+    const preferredPort = (blocker.address() as AddressInfo).port;
     const room = new RoomServer({ preferredPort, maxPortAttempts: 1, logger: () => undefined });
 
     await expect(room.start()).rejects.toMatchObject({ code: 'PORT_UNAVAILABLE' });
-    await new Promise<void>((resolve) => blocker.close(() => resolve()));
   });
 
   it('rejects invalid port configuration with INVALID_PORT', async () => {

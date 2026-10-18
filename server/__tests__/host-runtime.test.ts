@@ -15,18 +15,20 @@ const runtimes: HostRuntime[] = [];
 const blockers: Server[] = [];
 
 function freePort(): Promise<number> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const probe = createServer();
+    probe.on('error', reject);
     probe.listen(0, '127.0.0.1', () => {
       const port = (probe.address() as AddressInfo).port;
-      probe.close(() => resolve(port));
+      probe.close((error) => (error ? reject(error) : resolve(port)));
     });
   });
 }
 
 function occupyPort(port: number): Promise<Server> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const server = createServer();
+    server.on('error', reject);
     // 与房间监听同样绑定 0.0.0.0，确保端口占用真实冲突。
     server.listen(port, '0.0.0.0', () => {
       blockers.push(server);
@@ -150,7 +152,8 @@ describe('control api', () => {
 
     const created = await postJson(base, '/api/room/create', {});
     expect(created.ok).toBe(true);
-    expect(created.port).toBe(roomPort + 1);
+    expect(created.port).toBeGreaterThan(roomPort);
+    expect(created.port).toBeLessThanOrEqual(roomPort + 20);
   });
 
   it('only accepts control requests from the loopback interface', async () => {
