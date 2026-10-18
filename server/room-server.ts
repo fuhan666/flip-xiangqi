@@ -23,6 +23,16 @@ import {
   DEFAULT_HEARTBEAT_TIMEOUT_MS,
 } from '../src/network/heartbeat.js';
 import {
+  createMatch,
+  snapshotMatch,
+  applyMatchAction,
+  type MatchAction,
+  type MatchSnapshot,
+  type MatchState,
+} from '../src/network/match.js';
+import { createEmptyGameState } from '../src/game/index.js';
+import type { GameStateSnapshot } from '../src/game/index.js';
+import {
   buildServerMessage,
   closeCodeForError,
   parseClientMessage,
@@ -59,6 +69,8 @@ export interface RoomServerOptions {
   logger?: Logger;
   /** 随机分先的一次性裁决（true = 房主执红），默认用密码学随机数，测试可注入。 */
   drawHostRed?: () => boolean;
+  /** 随机洗牌种子（32 位无符号整数），默认用密码学随机数，测试可注入。 */
+  drawSeed?: () => number;
 }
 
 interface RoomMember {
@@ -92,6 +104,10 @@ function defaultDrawHostRed(): boolean {
   return randomBytes(1)[0] % 2 === 0;
 }
 
+function defaultDrawSeed(): number {
+  return randomBytes(4).readUInt32BE(0);
+}
+
 function generateToken(): string {
   return randomBytes(16).toString('hex');
 }
@@ -114,15 +130,18 @@ export class RoomServer {
   private readonly options: Required<Pick<RoomServerOptions, 'maxPortAttempts' | 'handshakeTimeoutMs' | 'heartbeatIntervalMs' | 'heartbeatTimeoutMs'>> & RoomServerOptions;
   private readonly logger: Logger;
   private readonly drawHostRed: () => boolean;
+  private readonly drawSeed: () => number;
   private readonly server: Server;
   private readonly wss: WebSocketServer;
   private readonly tcpSockets = new Set<Socket>();
   private readonly openSockets = new Set<WebSocket>();
   private readonly watchdogs = new Map<WebSocket, SocketWatchdog>();
   private guestResumeToken: string | null = null;
+  private hostReconnectTimer: NodeJS.Timeout | null = null;
   private host: RoomMember | null = null;
   private guest: RoomMember | null = null;
   private lobby: LobbyState;
+  private match: MatchState | null = null;
   private closed = false;
   private port = 0;
 
@@ -136,6 +155,7 @@ export class RoomServer {
     };
     this.logger = options.logger ?? defaultLogger;
     this.drawHostRed = options.drawHostRed ?? defaultDrawHostRed;
+    this.drawSeed = options.drawSeed ?? defaultDrawSeed;
     this.roomId = generateId();
     this.hostToken = generateToken();
     this.lobby = createLobbyState();
@@ -195,6 +215,19 @@ export class RoomServer {
   /** 当前权威大厅快照（独立副本，测试与内部状态隔离）。 */
   getLobby(): LobbyState {
     return snapshotLobbyState(this.lobby);
+  }
+
+  /** 当前权威对局快照（无对局时为 null）。 */
+  getMatch(): MatchSnapshot | null {
+    return this.match ? snapshotMatch(this.match) : null;
+  }
+
+  isHostConnected(): boolean {
+    return Boolean(this.host?.connected);
+  }
+
+  getLobbyPhase(): LobbyState['phase'] {
+    return this.lobby.phase;
   }
 
   async start(): Promise<number> {
@@ -271,7 +304,12 @@ export class RoomServer {
     }
 
     this.clearAllWatchdogs();
+    if (this.hostReconnectTimer) {
+      clearTimeout(this.hostReconnectTimer);
+      this.hostReconnectTimer = null;
+    }
     this.guestResumeToken = null;
+    this.match = null;
 
     await this.stopListener();
     this.logger('room.closed', { room: this.roomId, reason });
@@ -445,6 +483,7 @@ export class RoomServer {
               members: this.getMembers(),
               lobby: this.getLobby(),
               ...(member.role === 'guest' && this.guestResumeToken ? { resumeToken: this.guestResumeToken } : {}),
+              ...(this.match ? { game: snapshotMatch(this.match) } : {}),
             },
           }),
         );
@@ -510,6 +549,16 @@ export class RoomServer {
         return;
       }
 
+      if (message.type === 'game.action') {
+        this.handleGameAction(socket, connectionId, joinedMember, message);
+        return;
+      }
+
+      if (message.type === 'game.sync') {
+        this.handleGameSync(socket, connectionId, joinedMember, message);
+        return;
+      }
+
       this.reject(socket, connectionId, 'INVALID_MESSAGE', 'unexpected-type');
     });
 
@@ -549,6 +598,26 @@ export class RoomServer {
       if (!payload.token || payload.token !== this.hostToken) {
         this.reject(socket, 'host', 'UNAUTHORIZED', 'bad-host-token');
         return null;
+      }
+      if (this.host && this.lobby.phase === 'started') {
+        if (this.hostReconnectTimer) {
+          clearTimeout(this.hostReconnectTimer);
+          this.hostReconnectTimer = null;
+        }
+        const member = this.host;
+        const oldSocket = member.socket;
+        if (oldSocket && oldSocket !== socket) {
+          this.clearSocketWatchdog(oldSocket);
+          try {
+            oldSocket.terminate();
+          } catch {
+            // ignore
+          }
+        }
+        member.socket = socket;
+        member.connected = true;
+        member.leaveReason = null;
+        return member;
       }
       if (this.host?.connected) {
         this.reject(socket, 'host', 'UNAUTHORIZED', 'host-slot-taken');
@@ -684,8 +753,21 @@ export class RoomServer {
         phase: result.state.phase,
         settingsVersion: result.state.settings.settingsVersion,
       });
+      if (result.state.phase === 'started' && !this.match) {
+        const seed = this.drawSeed();
+        const matchId = generateId();
+        this.match = createMatch({
+          matchId,
+          seed,
+          startParameters: result.state.startParameters!,
+        });
+        this.logger('game.started', { room: this.roomId, matchId, seed });
+      }
       // 发起者同样收到权威状态：既确认操作成功，也清除在途请求。
       this.broadcastLobby();
+      if (this.match) {
+        this.broadcastGameState();
+      }
     }
   }
 
@@ -735,6 +817,33 @@ export class RoomServer {
 
   private handleMemberDrop(member: RoomMember): void {
     if (member.role === 'host') {
+      if (this.lobby.phase === 'started') {
+        if (member.socket) {
+          this.clearSocketWatchdog(member.socket);
+        }
+        member.connected = false;
+        member.socket = null;
+        member.leaveReason = 'dropped';
+        this.logger('ws.host_dropped', { room: this.roomId, member: member.id });
+        this.applyLobby({ type: 'member-left', role: 'host' });
+        this.broadcastMembers();
+
+        if (!this.guest?.connected) {
+          void this.closeRoom('host-disconnected');
+          return;
+        }
+
+        if (this.hostReconnectTimer) {
+          clearTimeout(this.hostReconnectTimer);
+        }
+        this.hostReconnectTimer = setTimeout(() => {
+          if (!this.host?.connected) {
+            this.logger('ws.host_reconnect_timeout', { room: this.roomId });
+            void this.closeRoom('host-disconnected');
+          }
+        }, 15_000);
+        return;
+      }
       this.logger('ws.host_dropped', { room: this.roomId, member: member.id });
       void this.closeRoom('host-disconnected');
       return;
@@ -749,6 +858,10 @@ export class RoomServer {
     this.logger('ws.guest_dropped', { room: this.roomId, member: member.id });
     this.applyLobby({ type: 'member-left', role: 'guest' });
     this.broadcastMembers();
+
+    if (!this.host?.connected) {
+      void this.closeRoom('host-disconnected');
+    }
   }
 
   private depart(member: RoomMember, reason: 'leave'): void {
@@ -794,6 +907,207 @@ export class RoomServer {
           // 忽略单个连接的发送失败。
         }
       }
+    }
+  }
+
+  private handleGameAction(
+    socket: WebSocket,
+    connectionId: string,
+    member: RoomMember,
+    message: Extract<ClientMessage, { type: 'game.action' }>,
+  ): void {
+    if (message.roomId !== this.roomId) {
+      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
+      return;
+    }
+
+    if (!this.match || this.lobby.phase !== 'started') {
+      this.sendGameRejection(
+        socket,
+        message.payload.matchId,
+        0,
+        '对局尚未开始',
+        this.match ? snapshotMatch(this.match).gameState : createEmptyGameState(),
+        message.requestId,
+      );
+      return;
+    }
+
+    // 双方在线检查：避免恢复窗口中的竞争
+    if (!this.host?.connected || !this.guest?.connected) {
+      this.sendGameRejection(
+        socket,
+        this.match.matchId,
+        this.match.stepNumber,
+        '对手已离线，暂无法操作',
+        snapshotMatch(this.match).gameState,
+        message.requestId,
+      );
+      return;
+    }
+
+    if (message.payload.matchId !== this.match.matchId) {
+      this.sendGameRejection(
+        socket,
+        this.match.matchId,
+        this.match.stepNumber,
+        '对局标识不匹配',
+        snapshotMatch(this.match).gameState,
+        message.requestId,
+      );
+      return;
+    }
+
+    if (message.payload.stepNumber !== this.match.stepNumber) {
+      this.sendGameRejection(
+        socket,
+        this.match.matchId,
+        this.match.stepNumber,
+        '操作步数已过期，请以最新棋盘为准',
+        snapshotMatch(this.match).gameState,
+        message.requestId,
+      );
+      return;
+    }
+
+    const currentTurn = this.match.gameState.currentTurn;
+    const expectedMemberId =
+      currentTurn === 'red' ? this.match.startParameters.redMemberId : this.match.startParameters.blackMemberId;
+
+    if (member.id !== expectedMemberId) {
+      this.sendGameRejection(
+        socket,
+        this.match.matchId,
+        this.match.stepNumber,
+        '非己方回合，请等待对方行动',
+        snapshotMatch(this.match).gameState,
+        message.requestId,
+      );
+      return;
+    }
+
+    const result = applyMatchAction(this.match, member.id, message.payload.action);
+    if (!result.ok) {
+      this.logger('game.action_rejected', {
+        room: this.roomId,
+        member: member.id,
+        reason: result.reason,
+      });
+      this.sendGameRejection(
+        socket,
+        this.match.matchId,
+        this.match.stepNumber,
+        result.reason,
+        snapshotMatch(this.match).gameState,
+        message.requestId,
+      );
+      return;
+    }
+
+    this.match = result.match;
+    this.logger('game.action_applied', {
+      room: this.roomId,
+      matchId: this.match.matchId,
+      stepNumber: this.match.stepNumber,
+      member: member.id,
+    });
+
+    this.broadcastGameState({
+      requestId: message.requestId,
+      actorMemberId: member.id,
+      action: message.payload.action,
+    });
+  }
+
+  private handleGameSync(
+    socket: WebSocket,
+    _connectionId: string,
+    _member: RoomMember,
+    message: Extract<ClientMessage, { type: 'game.sync' }>,
+  ): void {
+    if (!this.match) {
+      return;
+    }
+    const snap = snapshotMatch(this.match);
+    try {
+      socket.send(
+        buildServerMessage({
+          type: 'game.state',
+          roomId: this.roomId,
+          ...(message.requestId ? { requestId: message.requestId } : {}),
+          payload: {
+            matchId: snap.matchId,
+            seed: snap.seed,
+            stepNumber: snap.stepNumber,
+            state: snap.gameState,
+            startParameters: snap.startParameters,
+          },
+        }),
+      );
+    } catch {
+      // 忽略单个发送失败
+    }
+  }
+
+  private broadcastGameState(options?: {
+    requestId?: string;
+    actorMemberId?: string;
+    action?: MatchAction;
+  }): void {
+    if (!this.match) {
+      return;
+    }
+    const snap = snapshotMatch(this.match);
+    const text = buildServerMessage({
+      type: 'game.state',
+      roomId: this.roomId,
+      ...(options?.requestId ? { requestId: options.requestId } : {}),
+      payload: {
+        matchId: snap.matchId,
+        seed: snap.seed,
+        stepNumber: snap.stepNumber,
+        state: snap.gameState,
+        startParameters: snap.startParameters,
+        ...(options?.actorMemberId ? { actorMemberId: options.actorMemberId } : {}),
+        ...(options?.action ? { action: options.action } : {}),
+      },
+    });
+
+    for (const socket of this.openSockets) {
+      if (socket.readyState === 1) {
+        try {
+          socket.send(text);
+        } catch {
+          // 忽略发送失败
+        }
+      }
+    }
+  }
+
+  private sendGameRejection(
+    socket: WebSocket,
+    matchId: string,
+    stepNumber: number,
+    reason: string,
+    state: GameStateSnapshot,
+    requestId?: string,
+  ): void {
+    try {
+      socket.send(
+        buildServerMessage({
+          type: 'game.rejected',
+          roomId: this.roomId,
+          ...(requestId ? { requestId } : {}),
+          payload: {
+            matchId,
+            stepNumber,
+            reason,
+            state,
+          },
+        }),
+      );
+    } catch {
+      // socket 已关闭
     }
   }
 

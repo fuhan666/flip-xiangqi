@@ -7,6 +7,7 @@ import { copyText } from './clipboard';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ConnectionStatus } from './ConnectionStatus';
 import { RoomLobby } from './RoomLobby';
+import { OnlineGame } from '../OnlineGame';
 
 interface CreateRoomScreenProps {
   api: RoomControlApi;
@@ -161,108 +162,118 @@ export function CreateRoomScreen({ api, createClient, preferredPort, onExit }: C
         <ConnectionStatus rtt={connection.rtt} status={connection.status} />
       </header>
 
-      <section className="room-panel">
-        <h2>分享这个地址</h2>
-        {creating || !room ? (
-          <p className="room-hint" data-testid="create-progress">
-            正在启动建房服务…
-          </p>
-        ) : (
-          <>
-            <div className="address-card">
-              <code className="address-text" data-testid="room-address-main">
-                {primaryText}
-              </code>
-              <button
-                className="panel-action-primary address-copy"
-                data-testid="copy-address"
-                onClick={() => void handleCopy('main', primaryText)}
-                type="button"
-              >
-                {copiedKey === 'main' ? '已复制 ✓' : '复制'}
-              </button>
-            </div>
-
-            {room.loopbackOnly ? (
-              <p className="room-warning" data-testid="room-loopback-note">
-                未检测到局域网地址 —— 对手将无法从其他设备加入，仅供本机测试 —— 请检查网络连接后重新建房。
+      {connection.game && sessionRef.current ? (
+        <OnlineGame
+          client={sessionRef.current.client}
+          connection={connection}
+          onExit={() => setConfirmClose(true)}
+        />
+      ) : (
+        <>
+          <section className="room-panel">
+            <h2>分享这个地址</h2>
+            {creating || !room ? (
+              <p className="room-hint" data-testid="create-progress">
+                正在启动建房服务…
               </p>
-            ) : null}
+            ) : (
+              <>
+                <div className="address-card">
+                  <code className="address-text" data-testid="room-address-main">
+                    {primaryText}
+                  </code>
+                  <button
+                    className="panel-action-primary address-copy"
+                    data-testid="copy-address"
+                    onClick={() => void handleCopy('main', primaryText)}
+                    type="button"
+                  >
+                    {copiedKey === 'main' ? '已复制 ✓' : '复制'}
+                  </button>
+                </div>
 
-            {room.addresses.length > 1 ? (
-              <div className="address-candidates">
-                <button
-                  className="panel-action-secondary"
-                  data-testid="toggle-candidates"
-                  onClick={() => setShowCandidates((current) => !current)}
-                  type="button"
-                >
-                  {showCandidates ? '收起候选地址' : `切换候选地址（共 ${room.addresses.length} 个）`}
-                </button>
-                {showCandidates ? (
-                  <ul className="candidate-list" data-testid="candidate-list">
-                    {room.addresses.map((candidate) => {
-                      const text = `${candidate.address}:${room.port}`;
-                      return (
-                        <li className="candidate-item" key={text}>
-                          <code>{text}</code>
-                          <span className="candidate-meta">{candidate.interfaceName}</span>
-                          <button
-                            className="panel-action-secondary"
-                            data-testid={`copy-candidate-${candidate.interfaceName}`}
-                            onClick={() => void handleCopy(text, text)}
-                            type="button"
-                          >
-                            {copiedKey === text ? '已复制 ✓' : '复制'}
-                          </button>
-                        </li>
-                      );
-                    })}
-                  </ul>
+                {room.loopbackOnly ? (
+                  <p className="room-warning" data-testid="room-loopback-note">
+                    未检测到局域网地址 —— 对手将无法从其他设备加入，仅供本机测试 —— 请检查网络连接后重新建房。
+                  </p>
                 ) : null}
-              </div>
-            ) : null}
 
-            {room.port !== preferredPort ? (
-              <p className="room-hint" data-testid="room-port-fallback">
-                端口 {preferredPort} 已被占用，已自动改用 {room.port}。
+                {room.addresses.length > 1 ? (
+                  <div className="address-candidates">
+                    <button
+                      className="panel-action-secondary"
+                      data-testid="toggle-candidates"
+                      onClick={() => setShowCandidates((current) => !current)}
+                      type="button"
+                    >
+                      {showCandidates ? '收起候选地址' : `切换候选地址（共 ${room.addresses.length} 个）`}
+                    </button>
+                    {showCandidates ? (
+                      <ul className="candidate-list" data-testid="candidate-list">
+                        {room.addresses.map((candidate) => {
+                          const text = `${candidate.address}:${room.port}`;
+                          return (
+                            <li className="candidate-item" key={text}>
+                              <code>{text}</code>
+                              <span className="candidate-meta">{candidate.interfaceName}</span>
+                              <button
+                                className="panel-action-secondary"
+                                data-testid={`copy-candidate-${candidate.interfaceName}`}
+                                onClick={() => void handleCopy(text, text)}
+                                type="button"
+                              >
+                                {copiedKey === text ? '已复制 ✓' : '复制'}
+                              </button>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {room.port !== preferredPort ? (
+                  <p className="room-hint" data-testid="room-port-fallback">
+                    端口 {preferredPort} 已被占用，已自动改用 {room.port}。
+                  </p>
+                ) : null}
+
+                <p className="room-hint">实际端口：{room.port} · 房间号：{room.roomId}</p>
+                {copyFailed ? (
+                  <p className="room-error" data-testid="copy-error">
+                    {copyFailed}
+                  </p>
+                ) : null}
+              </>
+            )}
+          </section>
+
+          <RoomLobby
+            connectionHint={
+              <p className="room-hint" data-testid="host-connection-state">
+                {describeHostConnection(connection)}
               </p>
-            ) : null}
+            }
+            lastRejection={connection.lastRejection}
+            lobby={connection.lobby}
+            members={hostFallbackMembers(connection)}
+            onLockChange={(locked) => sessionRef.current?.client.sendLobbyLock(locked)}
+            onReadyToggle={(ready) => sessionRef.current?.client.sendLobbyReady(ready)}
+            onSettingsChange={(sidePreference, timeControlId) => sessionRef.current?.client.sendLobbySettings(sidePreference, timeControlId)}
+            onStart={() => sessionRef.current?.client.sendLobbyStart()}
+            pendingCommand={connection.pendingCommand}
+            reconnecting={connection.reconnecting}
+            selfId={connection.memberId}
+            viewerRole={connection.role ?? 'host'}
+          />
 
-            <p className="room-hint">实际端口：{room.port} · 房间号：{room.roomId}</p>
-            {copyFailed ? (
-              <p className="room-error" data-testid="copy-error">
-                {copyFailed}
-              </p>
-            ) : null}
-          </>
-        )}
-      </section>
-
-      <RoomLobby
-        connectionHint={
-          <p className="room-hint" data-testid="host-connection-state">
-            {describeHostConnection(connection)}
-          </p>
-        }
-        lastRejection={connection.lastRejection}
-        lobby={connection.lobby}
-        members={hostFallbackMembers(connection)}
-        onLockChange={(locked) => sessionRef.current?.client.sendLobbyLock(locked)}
-        onReadyToggle={(ready) => sessionRef.current?.client.sendLobbyReady(ready)}
-        onSettingsChange={(sidePreference, timeControlId) => sessionRef.current?.client.sendLobbySettings(sidePreference, timeControlId)}
-        onStart={() => sessionRef.current?.client.sendLobbyStart()}
-        pendingCommand={connection.pendingCommand}
-        reconnecting={connection.reconnecting}
-        selfId={connection.memberId}
-        viewerRole={connection.role ?? 'host'}
-      />
-
-      <div className="panel-actions">
-        <button className="panel-action-secondary" data-testid="close-room" onClick={() => setConfirmClose(true)} type="button">
-          关闭房间
-        </button>
-      </div>
+          <div className="panel-actions">
+            <button className="panel-action-secondary" data-testid="close-room" onClick={() => setConfirmClose(true)} type="button">
+              关闭房间
+            </button>
+          </div>
+        </>
+      )}
 
       <ConfirmDialog
         confirmLabel="关闭房间"

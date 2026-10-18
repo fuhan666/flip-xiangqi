@@ -1,6 +1,6 @@
-import { BOARD_HEIGHT, BOARD_WIDTH } from './constants';
-import { cloneState, findKing, getPieceAt, otherCamp } from './state';
-import type { Camp, GameState, MoveValidationResult, Piece, Position } from './types';
+import { BOARD_HEIGHT, BOARD_WIDTH } from './constants.js';
+import { cloneState, findKing, getPieceAt, otherCamp } from './state.js';
+import type { Camp, GameState, MoveValidationResult, Piece, Position } from './types.js';
 
 function isInsideBoard(position: Position): boolean {
   return position.x >= 0 && position.x < BOARD_WIDTH && position.y >= 0 && position.y < BOARD_HEIGHT;

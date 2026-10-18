@@ -13,6 +13,6 @@
     "outDir": "dist-server",
     "rootDir": "."
   },
-  "include": ["server/**/*.ts", "src/network/protocol.ts", "src/network/lobby.ts"],
+  "include": ["server/**/*.ts", "src/network/**/*.ts", "src/game/**/*.ts"],
   "exclude": ["**/__tests__/**"]
 }

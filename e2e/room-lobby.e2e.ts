@@ -116,12 +116,12 @@ test.describe('room lobby settings, ready gate and start snapshot', () => {
     await screenshot(hostPage, '03-host-started');
     await screenshot(guestPage, '04-guest-started');
 
-    // 冻结后不可再改：设置禁用，就绪/开始入口消失。
-    await expect(hostPage.getByTestId('setting-side-host-black')).toBeDisabled();
-    await expect(hostPage.getByTestId('setting-time-blitz')).toBeDisabled();
+    // 开局后进入棋盘：就绪/开始入口消失，双方棋盘可见并呈现步数。
     await expect(hostPage.getByTestId('lobby-ready-toggle')).toHaveCount(0);
     await expect(hostPage.getByTestId('lobby-start')).toHaveCount(0);
     await expect(hostPage.getByTestId('settings-lock')).toHaveCount(0);
+    await expect(hostPage.getByTestId('online-game')).toBeVisible({ timeout: 10_000 });
+    await expect(guestPage.getByTestId('online-game')).toBeVisible({ timeout: 10_000 });
 
     expect(hostErrors).toEqual([]);
     expect(guestErrors).toEqual([]);

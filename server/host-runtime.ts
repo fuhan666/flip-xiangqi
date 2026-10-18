@@ -156,8 +156,13 @@ export class HostRuntime {
   /** 建房：已有活动房间时返回同一房间（重复点击不产生第二个监听器）。 */
   async createRoom(preferredPort?: number): Promise<ApiResponse> {
     if (this.room && !this.room.server.isClosed) {
-      this.logger('room.create_duplicate', { room: this.room.roomId, port: this.room.port });
-      return { ok: true, ...this.buildRoomInfo(this.room), hostToken: this.room.hostToken };
+      if (this.room.server.getLobbyPhase() === 'started' && !this.room.server.isHostConnected()) {
+        await this.room.server.closeRoom('host-closed');
+        this.room = null;
+      } else {
+        this.logger('room.create_duplicate', { room: this.room.roomId, port: this.room.port });
+        return { ok: true, ...this.buildRoomInfo(this.room), hostToken: this.room.hostToken };
+      }
     }
 
     const port = preferredPort ?? this.options.roomPort;

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { createLobbyState, applyLobbyCommand, type LobbyState } from '../lobby';
 import {
+  buildClientGameAction,
+  buildClientGameSync,
   buildClientHello,
   buildClientLeave,
   buildClientLobbyReady,
@@ -317,6 +319,92 @@ describe('heartbeat and session resumption envelopes', () => {
     expect(parsedWelcome.ok).toBe(true);
     if (parsedWelcome.ok && parsedWelcome.message.type === 'welcome') {
       expect(parsedWelcome.message.payload.resumeToken).toBe('token-xyz');
+    }
+  });
+
+  it('encodes and parses game.action, game.state, game.rejected, and game.sync', () => {
+    // game.action
+    const clientAction = buildClientGameAction('room-1', {
+      requestId: 'req-1',
+      matchId: 'match-1',
+      stepNumber: 0,
+      action: { type: 'flip', position: { x: 4, y: 2 } },
+    });
+    const parsedAction = parseClientMessage(encodeMessage(clientAction));
+    expect(parsedAction.ok).toBe(true);
+    if (parsedAction.ok && parsedAction.message.type === 'game.action') {
+      expect(parsedAction.message.requestId).toBe('req-1');
+      expect(parsedAction.message.payload.matchId).toBe('match-1');
+      expect(parsedAction.message.payload.stepNumber).toBe(0);
+      expect(parsedAction.message.payload.action).toEqual({ type: 'flip', position: { x: 4, y: 2 } });
+    }
+
+    // game.sync
+    const clientSync = buildClientGameSync('room-1', 'match-1', 'req-sync');
+    const parsedSync = parseClientMessage(encodeMessage(clientSync));
+    expect(parsedSync.ok).toBe(true);
+    if (parsedSync.ok && parsedSync.message.type === 'game.sync') {
+      expect(parsedSync.message.requestId).toBe('req-sync');
+      expect(parsedSync.message.payload.matchId).toBe('match-1');
+    }
+
+    // game.state
+    const serverState = buildServerMessage({
+      type: 'game.state',
+      roomId: 'room-1',
+      requestId: 'req-1',
+      payload: {
+        matchId: 'match-1',
+        seed: 12345,
+        stepNumber: 1,
+        state: {
+          currentTurn: 'black',
+          winner: null,
+          checkedCamp: null,
+          lastError: null,
+          statusMessage: '黑方行动',
+          pieces: [],
+          actionHistory: [],
+          recentAction: null,
+        },
+        actorMemberId: 'host-1',
+        action: { type: 'flip', position: { x: 4, y: 2 } },
+      },
+    });
+    const parsedState = parseServerMessage(serverState);
+    expect(parsedState.ok).toBe(true);
+    if (parsedState.ok && parsedState.message.type === 'game.state') {
+      expect(parsedState.message.payload.matchId).toBe('match-1');
+      expect(parsedState.message.payload.stepNumber).toBe(1);
+      expect(parsedState.message.payload.actorMemberId).toBe('host-1');
+    }
+
+    // game.rejected
+    const serverRejected = buildServerMessage({
+      type: 'game.rejected',
+      roomId: 'room-1',
+      requestId: 'req-1',
+      payload: {
+        matchId: 'match-1',
+        stepNumber: 0,
+        reason: '非己方回合',
+        state: {
+          currentTurn: 'red',
+          winner: null,
+          checkedCamp: null,
+          lastError: null,
+          statusMessage: '红方行动',
+          pieces: [],
+          actionHistory: [],
+          recentAction: null,
+        },
+      },
+    });
+    const parsedRejected = parseServerMessage(serverRejected);
+    expect(parsedRejected.ok).toBe(true);
+    if (parsedRejected.ok && parsedRejected.message.type === 'game.rejected') {
+      expect(parsedRejected.message.payload.reason).toBe('非己方回合');
+      expect(parsedRejected.message.payload.stepNumber).toBe(0);
     }
   });
 });

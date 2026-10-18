@@ -1,6 +1,6 @@
-import { cloneState, getPieceAt, otherCamp, positionsEqual, restoreState, snapshotState } from './state';
-import { createInitialGameState } from './setup';
-import { hasAnyLegalAction, isInCheck, validateMove, violatesFacingKings } from './move-rules';
+import { cloneState, getPieceAt, otherCamp, positionsEqual, restoreState, snapshotState } from './state.js';
+import { createInitialGameState } from './setup.js';
+import { hasAnyLegalAction, isInCheck, validateMove, violatesFacingKings } from './move-rules.js';
 import type {
   Camp,
   GameAction,
@@ -11,7 +11,7 @@ import type {
   GameState,
   HistoryPieceSnapshot,
   Piece,
-} from './types';
+} from './types.js';
 
 interface TurnResolution {
   state: GameState;

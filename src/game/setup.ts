@@ -1,6 +1,6 @@
-import { HIDDEN_OPENING_FORBIDDEN_POSITIONS_BY_TYPE, HIDDEN_OPENING_POSITIONS } from './constants';
-import { createBasePieces, createEmptyGameState } from './state';
-import type { GameState, Piece, PieceType, Position } from './types';
+import { HIDDEN_OPENING_FORBIDDEN_POSITIONS_BY_TYPE, HIDDEN_OPENING_POSITIONS } from './constants.js';
+import { createBasePieces, createEmptyGameState } from './state.js';
+import type { GameState, Piece, PieceType, Position } from './types.js';
 
 function shuffle<T>(items: T[], rng: () => number): T[] {
   const next = [...items];
@@ -20,7 +20,7 @@ const HIDDEN_PIECE_PLACEMENT_PRIORITY: PieceType[] = ['rook', 'cannon', 'pawn', 
 const HIDDEN_OPENING_FORBIDDEN_POSITION_KEYS_BY_TYPE = Object.fromEntries(
   Object.entries(HIDDEN_OPENING_FORBIDDEN_POSITIONS_BY_TYPE).map(([type, positions]) => [
     type,
-    new Set(positions.map(positionKey)),
+    new Set((positions ?? []).map(positionKey)),
   ]),
 ) as Partial<Record<PieceType, Set<string>>>;
 
