@@ -3,7 +3,10 @@ import {
   applyMatchAction,
   createMatch,
   createSeededRng,
+  parseGameStateSnapshot,
   parseMatchAction,
+  parseMatchSnapshot,
+  parsePiece,
   snapshotMatch,
 } from '../match.js';
 import { buildStartParameters } from '../lobby.js';
@@ -116,5 +119,83 @@ describe('match engine and deterministic RNG', () => {
     expect(parseMatchAction({ type: 'flip', position: { x: 0, y: 10 } })).toBeNull();
     expect(parseMatchAction({ type: 'move', from: { x: -1, y: 0 }, to: { x: 0, y: 0 } })).toBeNull();
     expect(parseMatchAction({ type: 'unknown' })).toBeNull();
+  });
+
+  it('validates pieces, coordinates, and snapshot boundaries', () => {
+    const validPiece = {
+      id: 'p1',
+      camp: 'red',
+      type: 'pawn',
+      position: { x: 0, y: 6 },
+      revealed: false,
+      captured: false,
+    };
+
+    // Captured piece with non-null position is rejected
+    const invalidCaptured = {
+      ...validPiece,
+      captured: true,
+      position: { x: 0, y: 6 },
+    };
+
+    // Overlapping uncaptured pieces on same coordinate rejected
+    const overlapping = [
+      validPiece,
+      { ...validPiece, id: 'p2' },
+    ];
+
+    const validHistoryEntry = {
+      turnNumber: 1,
+      actor: 'red',
+      action: { type: 'flip', position: { x: 0, y: 6 } },
+      consequences: [],
+      nextTurn: 'black',
+      checkedCamp: null,
+      winner: null,
+      statusMessage: '红方翻开',
+    };
+
+    const validSnapshot = {
+      pieces: [validPiece],
+      currentTurn: 'red',
+      winner: null,
+      checkedCamp: null,
+      lastError: null,
+      statusMessage: '进行中',
+      actionHistory: [validHistoryEntry],
+    };
+
+    // Malformed seed / stepNumber in match snapshot
+    const startParameters = buildStartParameters({
+      roomId: 'room1',
+      host: { memberId: 'host-1', name: '房主' },
+      guest: { memberId: 'guest-1', name: '客人' },
+      settings: { sidePreference: 'host-red', timeControlId: 'standard', locked: true, settingsVersion: 1 },
+      hostSide: 'red',
+    });
+
+    const matchSnap = {
+      matchId: 'm1',
+      seed: 42,
+      stepNumber: 0,
+      startParameters,
+      gameState: validSnapshot,
+    };
+
+    expect(parsePiece(validPiece)).toEqual(validPiece);
+    expect(parsePiece(invalidCaptured)).toBeNull();
+    expect(parsePiece({ ...validPiece, type: 'invalid-type' })).toBeNull();
+    expect(parsePiece({ ...validPiece, position: { x: 10, y: 0 } })).toBeNull();
+
+    expect(parseGameStateSnapshot(validSnapshot)).not.toBeNull();
+    expect(parseGameStateSnapshot({ ...validSnapshot, pieces: overlapping })).toBeNull();
+    expect(parseGameStateSnapshot({ ...validSnapshot, currentTurn: 'invalid' })).toBeNull();
+
+    expect(parseMatchSnapshot(matchSnap)).not.toBeNull();
+    expect(parseMatchSnapshot({ ...matchSnap, seed: -1 })).toBeNull();
+    expect(parseMatchSnapshot({ ...matchSnap, seed: 0x100000000 })).toBeNull();
+    expect(parseMatchSnapshot({ ...matchSnap, stepNumber: -1 })).toBeNull();
+    expect(parseMatchSnapshot({ ...matchSnap, stepNumber: 1.5 })).toBeNull();
+    expect(parseMatchSnapshot({ ...matchSnap, stepNumber: Number.MAX_SAFE_INTEGER + 1 })).toBeNull();
   });
 });

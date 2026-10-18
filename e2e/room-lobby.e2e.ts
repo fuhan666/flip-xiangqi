@@ -123,6 +123,9 @@ test.describe('room lobby settings, ready gate and start snapshot', () => {
     await expect(hostPage.getByTestId('online-game')).toBeVisible({ timeout: 10_000 });
     await expect(guestPage.getByTestId('online-game')).toBeVisible({ timeout: 10_000 });
 
+    await hostPage.getByTestId('close-room').click();
+    await hostPage.getByTestId('confirm-yes').click();
+
     expect(hostErrors).toEqual([]);
     expect(guestErrors).toEqual([]);
     await hostContext.close();
@@ -275,6 +278,9 @@ test.describe('room lobby settings, ready gate and start snapshot', () => {
       expect(startedOverflow.scrollWidth).toBeLessThanOrEqual(startedOverflow.innerWidth + 1);
       await screenshot(hostPage, `07-host-started-${viewport.name}`);
       await screenshot(guestPage, `08-guest-started-${viewport.name}`);
+
+      await hostPage.getByTestId('close-room').click();
+      await hostPage.getByTestId('confirm-yes').click();
 
       await hostContext.close();
       await guestContext.close();

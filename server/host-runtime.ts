@@ -29,6 +29,7 @@ export interface HostRuntimeOptions {
   heartbeatIntervalMs?: number;
   heartbeatTimeoutMs?: number;
   logger?: Logger;
+  drawSeed?: () => number;
 }
 
 export interface RoomInfoPayload {
@@ -156,13 +157,8 @@ export class HostRuntime {
   /** 建房：已有活动房间时返回同一房间（重复点击不产生第二个监听器）。 */
   async createRoom(preferredPort?: number): Promise<ApiResponse> {
     if (this.room && !this.room.server.isClosed) {
-      if (this.room.server.getLobbyPhase() === 'started' && !this.room.server.isHostConnected()) {
-        await this.room.server.closeRoom('host-closed');
-        this.room = null;
-      } else {
-        this.logger('room.create_duplicate', { room: this.room.roomId, port: this.room.port });
-        return { ok: true, ...this.buildRoomInfo(this.room), hostToken: this.room.hostToken };
-      }
+      this.logger('room.create_duplicate', { room: this.room.roomId, port: this.room.port });
+      return { ok: true, ...this.buildRoomInfo(this.room), hostToken: this.room.hostToken };
     }
 
     const port = preferredPort ?? this.options.roomPort;
@@ -176,6 +172,7 @@ export class HostRuntime {
       handshakeTimeoutMs: this.options.handshakeTimeoutMs,
       heartbeatIntervalMs: this.options.heartbeatIntervalMs,
       heartbeatTimeoutMs: this.options.heartbeatTimeoutMs,
+      drawSeed: this.options.drawSeed,
       logger: this.logger,
       requestListener: (request, response) => {
         void this.handleRoomPageRequest(request, response);

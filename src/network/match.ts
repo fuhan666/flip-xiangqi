@@ -5,7 +5,7 @@
  * - 可传输的对局快照（去除 undoStack）。
  */
 import { applyAction, createInitialGameState, snapshotState } from '../game/index.js';
-import type { GameAction, GameHistoryEntry, GameState, GameStateSnapshot, Position } from '../game/index.js';
+import type { GameAction, GameHistoryEntry, GameState, GameStateSnapshot, Piece, PieceType, Position } from '../game/index.js';
 import { parseStartParameters, type StartParameters } from './lobby.js';
 
 export function createSeededRng(seed: number): () => number {
@@ -87,6 +87,53 @@ export function parseMatchAction(value: unknown): MatchAction | null {
   return null;
 }
 
+const VALID_PIECE_TYPES = new Set(['king', 'advisor', 'elephant', 'horse', 'rook', 'cannon', 'pawn']);
+
+export function parsePiece(value: unknown): Piece | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  if (
+    typeof raw.id !== 'string' ||
+    raw.id.length === 0 ||
+    (raw.camp !== 'red' && raw.camp !== 'black') ||
+    typeof raw.type !== 'string' ||
+    !VALID_PIECE_TYPES.has(raw.type) ||
+    typeof raw.revealed !== 'boolean' ||
+    typeof raw.captured !== 'boolean'
+  ) {
+    return null;
+  }
+
+  if (raw.captured) {
+    if (raw.position !== null) {
+      return null;
+    }
+    return {
+      id: raw.id,
+      camp: raw.camp,
+      type: raw.type as PieceType,
+      position: null,
+      revealed: raw.revealed,
+      captured: true,
+    };
+  }
+
+  const pos = parsePosition(raw.position);
+  if (!pos) {
+    return null;
+  }
+  return {
+    id: raw.id,
+    camp: raw.camp,
+    type: raw.type as PieceType,
+    position: pos,
+    revealed: raw.revealed,
+    captured: false,
+  };
+}
+
 export function parseGameStateSnapshot(value: unknown): GameStateSnapshot | null {
   if (!value || typeof value !== 'object') {
     return null;
@@ -97,13 +144,76 @@ export function parseGameStateSnapshot(value: unknown): GameStateSnapshot | null
     (raw.currentTurn !== 'red' && raw.currentTurn !== 'black') ||
     (raw.winner !== null && raw.winner !== 'red' && raw.winner !== 'black') ||
     (raw.checkedCamp !== null && raw.checkedCamp !== 'red' && raw.checkedCamp !== 'black') ||
+    (raw.lastError !== null && typeof raw.lastError !== 'string') ||
     typeof raw.statusMessage !== 'string' ||
     !Array.isArray(raw.actionHistory)
   ) {
     return null;
   }
 
-  return value as GameStateSnapshot;
+  const pieces: Piece[] = [];
+  const occupiedCoords = new Set<string>();
+  for (const item of raw.pieces) {
+    const piece = parsePiece(item);
+    if (!piece) {
+      return null;
+    }
+    if (!piece.captured && piece.position) {
+      const coordKey = `${piece.position.x},${piece.position.y}`;
+      if (occupiedCoords.has(coordKey)) {
+        return null;
+      }
+      occupiedCoords.add(coordKey);
+    }
+    pieces.push(piece);
+  }
+
+  const actionHistory: GameHistoryEntry[] = [];
+  for (const item of raw.actionHistory) {
+    if (!item || typeof item !== 'object') {
+      return null;
+    }
+    const entry = item as Record<string, unknown>;
+    if (
+      typeof entry.turnNumber !== 'number' ||
+      !Number.isInteger(entry.turnNumber) ||
+      entry.turnNumber < 1 ||
+      (entry.actor !== 'red' && entry.actor !== 'black') ||
+      !entry.action ||
+      typeof entry.action !== 'object' ||
+      !Array.isArray(entry.consequences) ||
+      (entry.nextTurn !== null && entry.nextTurn !== 'red' && entry.nextTurn !== 'black') ||
+      (entry.checkedCamp !== null && entry.checkedCamp !== 'red' && entry.checkedCamp !== 'black') ||
+      (entry.winner !== null && entry.winner !== 'red' && entry.winner !== 'black') ||
+      typeof entry.statusMessage !== 'string'
+    ) {
+      return null;
+    }
+    const action = entry.action as Record<string, unknown>;
+    if (action.type === 'flip') {
+      if (!parsePosition(action.position)) {
+        return null;
+      }
+    } else if (action.type === 'move') {
+      if (!parsePosition(action.from) || !parsePosition(action.to)) {
+        return null;
+      }
+    } else {
+      return null;
+    }
+    actionHistory.push(item as GameHistoryEntry);
+  }
+
+  return {
+    pieces,
+    currentTurn: raw.currentTurn,
+    winner: raw.winner,
+    checkedCamp: raw.checkedCamp,
+    lastError: raw.lastError ?? null,
+    statusMessage: raw.statusMessage,
+    actionHistory,
+    recentAction: (raw.recentAction as GameHistoryEntry | null) ?? null,
+  };
 }
 
 export function parseMatchSnapshot(value: unknown): MatchSnapshot | null {
@@ -116,8 +226,10 @@ export function parseMatchSnapshot(value: unknown): MatchSnapshot | null {
     raw.matchId.length === 0 ||
     typeof raw.seed !== 'number' ||
     !Number.isInteger(raw.seed) ||
+    raw.seed < 0 ||
+    raw.seed > 0xffffffff ||
     typeof raw.stepNumber !== 'number' ||
-    !Number.isInteger(raw.stepNumber) ||
+    !Number.isSafeInteger(raw.stepNumber) ||
     raw.stepNumber < 0
   ) {
     return null;

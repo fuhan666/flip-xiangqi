@@ -53,6 +53,7 @@ export type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'reconnecti
 export type LobbyRequestKind = 'settings' | 'lock' | 'ready' | 'start';
 
 export interface AcceptedGameAction {
+  eventId: string;
   stepNumber: number;
   actorMemberId: string;
   action: MatchAction;
@@ -212,6 +213,7 @@ export class RoomClient implements RoomConnection {
   private reconnectStartTime: number | null = null;
   private reconnectAttempt = 0;
   private reconnecting = false;
+  private pendingSyncRequestId: string | null = null;
 
   constructor(options: RoomClientOptions = {}) {
     this.webSocketFactory = options.webSocketFactory ?? defaultWebSocketFactory;
@@ -464,6 +466,7 @@ export class RoomClient implements RoomConnection {
           action,
         },
         lastAcceptedAction: {
+          eventId: `${game.matchId}:${stepNumber}:${requestId}`,
           stepNumber,
           actorMemberId: this.state.memberId!,
           action,
@@ -487,8 +490,10 @@ export class RoomClient implements RoomConnection {
     if (!roomId) {
       return;
     }
+    const requestId = generateRequestId();
+    this.pendingSyncRequestId = requestId;
     try {
-      socket.send(encodeMessage(buildClientGameSync(roomId, this.state.game?.matchId, generateRequestId())));
+      socket.send(encodeMessage(buildClientGameSync(roomId, this.state.game?.matchId, requestId)));
     } catch {
       // 忽略发送失败
     }
@@ -645,20 +650,67 @@ export class RoomClient implements RoomConnection {
         return;
       }
 
-      const isMyAction = incoming.actorMemberId && incoming.actorMemberId === this.state.memberId;
-      const lastAcceptedAction: AcceptedGameAction | null =
-        incoming.actorMemberId && incoming.action
-          ? {
-              stepNumber: incoming.stepNumber - 1,
-              actorMemberId: incoming.actorMemberId,
-              action: incoming.action,
-              source: isMyAction ? 'local' : 'remote',
-            }
-          : null;
+      const isExplicitSync = Boolean(message.requestId && message.requestId === this.pendingSyncRequestId);
+      if (isExplicitSync) {
+        this.pendingSyncRequestId = null;
+      }
+
+      // 同一步的重复广播：更新已确认快照，但不得清除当前在途推测或回退乐观呈现
+      if (currentGame && currentGame.matchId === incoming.matchId && incoming.stepNumber === currentGame.stepNumber) {
+        if (currentGame.pendingAction !== null) {
+          this.setState({
+            ...this.state,
+            game: {
+              ...currentGame,
+              confirmedState: incoming.state,
+            },
+          });
+          return;
+        }
+      }
+
+      const isJumpStep = Boolean(currentGame && incoming.stepNumber > currentGame.stepNumber + 1);
+      const isHydration = isExplicitSync || isJumpStep;
 
       let pendingAction = currentGame?.pendingAction ?? null;
-      if (pendingAction && incoming.stepNumber >= pendingAction.stepNumber) {
+      let lastAcceptedAction: AcceptedGameAction | null = null;
+
+      if (isHydration) {
         pendingAction = null;
+        lastAcceptedAction = null;
+      } else {
+        const isMyAction = Boolean(incoming.actorMemberId && incoming.actorMemberId === this.state.memberId);
+        const isMatchingPending = Boolean(
+          pendingAction &&
+          message.requestId &&
+          message.requestId === pendingAction.requestId,
+        );
+
+        if (isMyAction && (isMatchingPending || !pendingAction)) {
+          pendingAction = null;
+          lastAcceptedAction = incoming.actorMemberId && incoming.action
+            ? {
+                eventId: `${incoming.matchId}:${incoming.stepNumber - 1}:${message.requestId ?? 'confirmed'}`,
+                stepNumber: incoming.stepNumber - 1,
+                actorMemberId: incoming.actorMemberId,
+                action: incoming.action,
+                source: 'local',
+              }
+            : null;
+        } else {
+          if (pendingAction && incoming.stepNumber > pendingAction.stepNumber) {
+            pendingAction = null;
+          }
+          lastAcceptedAction = incoming.actorMemberId && incoming.action
+            ? {
+                eventId: `${incoming.matchId}:${incoming.stepNumber - 1}:${incoming.actorMemberId}:${message.requestId ?? 'remote'}`,
+                stepNumber: incoming.stepNumber - 1,
+                actorMemberId: incoming.actorMemberId,
+                action: incoming.action,
+                source: 'remote',
+              }
+            : null;
+        }
       }
 
       this.setState({
@@ -687,14 +739,30 @@ export class RoomClient implements RoomConnection {
         return;
       }
 
+      // 如果带 requestId 且不匹配当前 pendingAction，属于旧请求的延迟拒绝，忽略
+      if (
+        message.requestId &&
+        currentGame.pendingAction &&
+        currentGame.pendingAction.requestId !== message.requestId
+      ) {
+        return;
+      }
+
       if (incoming.stepNumber < currentGame.stepNumber) {
-        if (currentGame.pendingAction && currentGame.pendingAction.stepNumber === incoming.stepNumber) {
+        if (
+          currentGame.pendingAction &&
+          currentGame.pendingAction.stepNumber === incoming.stepNumber &&
+          (!message.requestId || currentGame.pendingAction.requestId === message.requestId)
+        ) {
           this.setState({
             ...this.state,
             game: {
               ...currentGame,
+              displayState: currentGame.confirmedState,
               pendingAction: null,
               lastRejectedReason: incoming.reason,
+              statusNotice: '你的操作未被采纳，请重新操作',
+              lastAcceptedAction: null,
             },
           });
         }
@@ -833,7 +901,14 @@ export class RoomClient implements RoomConnection {
         rtt: null,
         pendingCommand: null,
         lastRejection: null,
-        game: this.state.game ? { ...this.state.game, pendingAction: null } : null,
+        game: this.state.game
+          ? {
+              ...this.state.game,
+              displayState: this.state.game.confirmedState,
+              pendingAction: null,
+              lastAcceptedAction: null,
+            }
+          : null,
       });
       this.scheduleReconnect();
       return;
@@ -846,6 +921,14 @@ export class RoomClient implements RoomConnection {
       reconnecting: false,
       rtt: null,
       message: '与房间的连接已断开 —— 网络波动或房主端关闭了连接 —— 请返回重新加入',
+      game: this.state.game
+        ? {
+            ...this.state.game,
+            displayState: this.state.game.confirmedState,
+            pendingAction: null,
+            lastAcceptedAction: null,
+          }
+        : null,
     });
   }
 

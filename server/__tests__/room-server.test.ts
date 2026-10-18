@@ -144,6 +144,7 @@ interface ConnectedPair {
   guest: TestClient;
   hostId: string;
   guestId: string;
+  guestResumeToken?: string;
 }
 
 async function connectedPair(overrides: Partial<RoomServerOptions> = {}): Promise<ConnectedPair> {
@@ -160,6 +161,7 @@ async function connectedPair(overrides: Partial<RoomServerOptions> = {}): Promis
     guest,
     hostId: hostWelcome.payload.memberId,
     guestId: guestWelcome.payload.memberId,
+    guestResumeToken: guestWelcome.payload.resumeToken,
   };
 }
 
@@ -919,5 +921,111 @@ describe('heartbeat and reconnection', () => {
       (m) => m.payload.members.some((member: { role: string; connected: boolean }) => member.role === 'host' && member.connected),
     );
     expect(memberRestored.payload.members.find((m: { role: string }) => m.role === 'host').connected).toBe(true);
+  });
+
+  it('preserves room and match state when both drop, and allows recovery past 15 seconds', async () => {
+    const pair = await connectedPair();
+    enableAutoPong(pair.host, pair.room.roomId);
+    enableAutoPong(pair.guest, pair.room.roomId);
+    await readyBoth(pair, 1);
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    const startMsg = await pair.host.waitForType('game.state');
+    const matchId = startMsg.payload.matchId;
+
+    // 双方均断开
+    pair.host.socket.terminate();
+    pair.guest.socket.terminate();
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(pair.room.isClosed).toBe(false);
+
+    // 房主重连恢复
+    const newHost = await openClient(pair.room.actualPort);
+    await hello(newHost, { role: 'host', name: '房主', token: pair.room.hostToken });
+    const hostWelcome = await newHost.waitForType('welcome');
+    expect(hostWelcome.payload.game?.matchId).toBe(matchId);
+
+    // 客人凭借 resumeToken 重连恢复
+    const newGuest = await openClient(pair.room.actualPort);
+    await hello(newGuest, { role: 'guest', name: '客人', resumeToken: pair.guestResumeToken });
+    const guestWelcome = await newGuest.waitForType('welcome');
+    expect(guestWelcome.payload.game?.matchId).toBe(matchId);
+    expect(pair.room.isClosed).toBe(false);
+  });
+
+  it('enforces requestId idempotency and validates socket ownership on dispatch', async () => {
+    const pair = await connectedPair();
+    enableAutoPong(pair.host, pair.room.roomId);
+    enableAutoPong(pair.guest, pair.room.roomId);
+    pair.host.send(
+      encodeMessage(buildClientLobbySettings(pair.room.roomId, { sidePreference: 'host-red', timeControlId: 'standard' })),
+    );
+    await pair.host.waitForType('lobby.state', (m) => m.payload.lobby.settings.sidePreference === 'host-red');
+    await readyBoth(pair, 2);
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    const startMsg = await pair.host.waitForType('game.state');
+    const matchId = startMsg.payload.matchId;
+
+    const pieces = startMsg.payload.state.pieces as Array<{ id: string; revealed: boolean; position: { x: number; y: number } | null }>;
+    const hiddenPiece = pieces.find((p) => !p.revealed && p.position !== null)!;
+
+    // 发送动作带 requestId: 'req-idem-1'
+    pair.host.send(
+      encodeMessage(
+        buildClientGameAction(pair.room.roomId, {
+          requestId: 'req-idem-1',
+          matchId,
+          stepNumber: 0,
+          action: { type: 'flip', position: hiddenPiece.position! },
+        }),
+      ),
+    );
+
+    const step1 = await pair.host.waitForType('game.state', (m) => m.payload.stepNumber === 1);
+    expect(step1.requestId).toBe('req-idem-1');
+
+    // 重复发送完全相同的 requestId -> 幂等命中，返回相同步数 1，不产生第 2 步
+    pair.host.send(
+      encodeMessage(
+        buildClientGameAction(pair.room.roomId, {
+          requestId: 'req-idem-1',
+          matchId,
+          stepNumber: 0,
+          action: { type: 'flip', position: hiddenPiece.position! },
+        }),
+      ),
+    );
+
+    const idemResponse = await pair.host.waitForType('game.state', (m) => m.requestId === 'req-idem-1');
+    expect(idemResponse.payload.stepNumber).toBe(1);
+
+    // 测试旧 socket 替换：房主重连获得新 socket
+    const newHost = await openClient(pair.room.actualPort);
+    await hello(newHost, { role: 'host', name: '房主', token: pair.room.hostToken });
+    await newHost.waitForType('welcome');
+
+    // 旧 socket 收到 superseded 通知
+    const supersededRejection = await pair.host.waitForType('error');
+    expect(supersededRejection.payload.code).toBe('UNAUTHORIZED');
+    expect(supersededRejection.payload.message).toContain('socket-superseded');
+  });
+
+  it('validates roomId and matchId in handleGameSync', async () => {
+    const pair = await connectedPair();
+    enableAutoPong(pair.host, pair.room.roomId);
+    enableAutoPong(pair.guest, pair.room.roomId);
+    await readyBoth(pair, 1);
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    await pair.host.waitForType('game.state');
+
+    // 1. 错误的 matchId (返回 game.rejected，不破坏连接)
+    pair.host.send(JSON.stringify({ version: 3, type: 'game.sync', roomId: pair.room.roomId, requestId: 'sync-bad-match', payload: { matchId: 'non-existent-match' } }));
+    const rej = await pair.host.waitForType('game.rejected', (m) => m.requestId === 'sync-bad-match');
+    expect(rej.payload.reason).toContain('对局标识不匹配');
+
+    // 2. 错误的 roomId (协议层错误，返回 error 并关闭)
+    pair.host.send(JSON.stringify({ version: 3, type: 'game.sync', roomId: 'wrong-room', payload: {} }));
+    const err = await pair.host.waitForType('error');
+    expect(err.payload.message).toContain('room-id-mismatch');
   });
 });

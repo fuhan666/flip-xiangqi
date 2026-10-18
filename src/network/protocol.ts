@@ -510,14 +510,18 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     if (typeof payload.matchId !== 'string' || payload.matchId.length === 0) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-match-id' };
     }
-    if (typeof payload.seed !== 'number' || !Number.isInteger(payload.seed)) {
+    if (
+      typeof payload.seed !== 'number' ||
+      !Number.isInteger(payload.seed) ||
+      payload.seed < 0 ||
+      payload.seed > 0xffffffff
+    ) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-seed' };
     }
     if (
       typeof payload.stepNumber !== 'number' ||
-      !Number.isInteger(payload.stepNumber) ||
-      payload.stepNumber < 0 ||
-      payload.stepNumber > Number.MAX_SAFE_INTEGER
+      !Number.isSafeInteger(payload.stepNumber) ||
+      payload.stepNumber < 0
     ) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-step-number' };
     }

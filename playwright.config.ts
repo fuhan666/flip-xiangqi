@@ -19,5 +19,9 @@ export default defineConfig({
     timeout: 60_000,
     stdout: 'pipe',
     stderr: 'pipe',
+    env: {
+      ...process.env,
+      TEST_ROOM_SEED: '42',
+    },
   },
 });

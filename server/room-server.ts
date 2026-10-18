@@ -105,6 +105,12 @@ function defaultDrawHostRed(): boolean {
 }
 
 function defaultDrawSeed(): number {
+  if (process.env.TEST_ROOM_SEED) {
+    const parsed = Number(process.env.TEST_ROOM_SEED);
+    if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 0xffffffff) {
+      return parsed >>> 0;
+    }
+  }
   return randomBytes(4).readUInt32BE(0);
 }
 
@@ -137,7 +143,7 @@ export class RoomServer {
   private readonly openSockets = new Set<WebSocket>();
   private readonly watchdogs = new Map<WebSocket, SocketWatchdog>();
   private guestResumeToken: string | null = null;
-  private hostReconnectTimer: NodeJS.Timeout | null = null;
+  private readonly processedActions = new Map<string, { stepNumber: number; match: MatchState }>();
   private host: RoomMember | null = null;
   private guest: RoomMember | null = null;
   private lobby: LobbyState;
@@ -304,10 +310,7 @@ export class RoomServer {
     }
 
     this.clearAllWatchdogs();
-    if (this.hostReconnectTimer) {
-      clearTimeout(this.hostReconnectTimer);
-      this.hostReconnectTimer = null;
-    }
+    this.processedActions.clear();
     this.guestResumeToken = null;
     this.match = null;
 
@@ -498,6 +501,12 @@ export class RoomServer {
         return;
       }
 
+      const activeMember = joinedMember.role === 'host' ? this.host : this.guest;
+      if (!activeMember || activeMember.socket !== socket) {
+        this.reject(socket, connectionId, 'UNAUTHORIZED', 'socket-superseded');
+        return;
+      }
+
       if (message.type === 'ping') {
         if (message.roomId !== this.roomId) {
           this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
@@ -600,16 +609,13 @@ export class RoomServer {
         return null;
       }
       if (this.host && this.lobby.phase === 'started') {
-        if (this.hostReconnectTimer) {
-          clearTimeout(this.hostReconnectTimer);
-          this.hostReconnectTimer = null;
-        }
         const member = this.host;
         const oldSocket = member.socket;
         if (oldSocket && oldSocket !== socket) {
           this.clearSocketWatchdog(oldSocket);
           try {
-            oldSocket.terminate();
+            this.sendError(oldSocket, 'UNAUTHORIZED', 'socket-superseded');
+            oldSocket.close(closeCodeForError('UNAUTHORIZED'), 'socket-superseded');
           } catch {
             // ignore
           }
@@ -645,7 +651,8 @@ export class RoomServer {
       if (oldSocket && oldSocket !== socket) {
         this.clearSocketWatchdog(oldSocket);
         try {
-          oldSocket.terminate();
+          this.sendError(oldSocket, 'UNAUTHORIZED', 'socket-superseded');
+          oldSocket.close(closeCodeForError('UNAUTHORIZED'), 'socket-superseded');
         } catch {
           // 忽略关闭失败
         }
@@ -827,21 +834,6 @@ export class RoomServer {
         this.logger('ws.host_dropped', { room: this.roomId, member: member.id });
         this.applyLobby({ type: 'member-left', role: 'host' });
         this.broadcastMembers();
-
-        if (!this.guest?.connected) {
-          void this.closeRoom('host-disconnected');
-          return;
-        }
-
-        if (this.hostReconnectTimer) {
-          clearTimeout(this.hostReconnectTimer);
-        }
-        this.hostReconnectTimer = setTimeout(() => {
-          if (!this.host?.connected) {
-            this.logger('ws.host_reconnect_timeout', { room: this.roomId });
-            void this.closeRoom('host-disconnected');
-          }
-        }, 15_000);
         return;
       }
       this.logger('ws.host_dropped', { room: this.roomId, member: member.id });
@@ -858,10 +850,6 @@ export class RoomServer {
     this.logger('ws.guest_dropped', { room: this.roomId, member: member.id });
     this.applyLobby({ type: 'member-left', role: 'guest' });
     this.broadcastMembers();
-
-    if (!this.host?.connected) {
-      void this.closeRoom('host-disconnected');
-    }
   }
 
   private depart(member: RoomMember, reason: 'leave'): void {
@@ -946,6 +934,35 @@ export class RoomServer {
       return;
     }
 
+    if (message.requestId && this.processedActions.has(message.requestId)) {
+      const cached = this.processedActions.get(message.requestId)!;
+      this.logger('game.action_duplicate', {
+        room: this.roomId,
+        requestId: message.requestId,
+        stepNumber: cached.stepNumber,
+      });
+      const snap = snapshotMatch(cached.match);
+      try {
+        socket.send(
+          buildServerMessage({
+            type: 'game.state',
+            roomId: this.roomId,
+            requestId: message.requestId,
+            payload: {
+              matchId: snap.matchId,
+              seed: snap.seed,
+              stepNumber: snap.stepNumber,
+              state: snap.gameState,
+              startParameters: snap.startParameters,
+            },
+          }),
+        );
+      } catch {
+        // 忽略发送失败
+      }
+      return;
+    }
+
     if (message.payload.matchId !== this.match.matchId) {
       this.sendGameRejection(
         socket,
@@ -1005,6 +1022,19 @@ export class RoomServer {
     }
 
     this.match = result.match;
+    if (message.requestId) {
+      this.processedActions.set(message.requestId, {
+        stepNumber: this.match.stepNumber,
+        match: this.match,
+      });
+      if (this.processedActions.size > 200) {
+        const oldestKey = this.processedActions.keys().next().value;
+        if (oldestKey) {
+          this.processedActions.delete(oldestKey);
+        }
+      }
+    }
+
     this.logger('game.action_applied', {
       room: this.roomId,
       matchId: this.match.matchId,
@@ -1021,11 +1051,34 @@ export class RoomServer {
 
   private handleGameSync(
     socket: WebSocket,
-    _connectionId: string,
+    connectionId: string,
     _member: RoomMember,
     message: Extract<ClientMessage, { type: 'game.sync' }>,
   ): void {
-    if (!this.match) {
+    if (message.roomId !== this.roomId) {
+      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
+      return;
+    }
+    if (!this.match || this.lobby.phase !== 'started') {
+      this.sendGameRejection(
+        socket,
+        message.payload.matchId ?? '',
+        0,
+        '对局尚未开始',
+        createEmptyGameState(),
+        message.requestId,
+      );
+      return;
+    }
+    if (message.payload.matchId && message.payload.matchId !== this.match.matchId) {
+      this.sendGameRejection(
+        socket,
+        message.payload.matchId,
+        this.match.stepNumber,
+        '对局标识不匹配',
+        snapshotMatch(this.match).gameState,
+        message.requestId,
+      );
       return;
     }
     const snap = snapshotMatch(this.match);

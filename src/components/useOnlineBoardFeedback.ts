@@ -76,7 +76,7 @@ export function useOnlineBoardFeedback(
   const [event, setEvent] = useState<OnlineFeedbackEvent>(IDLE_EVENT);
   const [reducedMotion, setReducedMotion] = useState<boolean>(readPrefersReducedMotion);
   const sequenceRef = useRef(0);
-  const lastAnimatedStepRef = useRef<number | null>(null);
+  const lastAnimatedEventIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
@@ -98,18 +98,20 @@ export function useOnlineBoardFeedback(
   }, [reducedMotion]);
 
   useEffect(() => {
-    // 1. 无动作（开局初始化/全量恢复/拒绝回滚）-> 重置事件，不补播
+    // 1. 无动作（开局初始化/全量恢复/拒绝回滚）-> 重置事件，清理动画，允许重试重新播放
     if (!lastAcceptedAction) {
       setEvent(IDLE_EVENT);
+      lastAnimatedEventIdRef.current = null;
       return;
     }
 
-    // 2. 该步已经播放过动画（本地乐观先播，服务端确认不重播）
-    if (lastAnimatedStepRef.current === lastAcceptedAction.stepNumber) {
+    // 2. 该事件已经播放过动画（本地乐观先播，服务端确认带相同 eventId 不重播）
+    const eventId = lastAcceptedAction.eventId ?? `${lastAcceptedAction.stepNumber}:${lastAcceptedAction.source}`;
+    if (lastAnimatedEventIdRef.current === eventId) {
       return;
     }
 
-    lastAnimatedStepRef.current = lastAcceptedAction.stepNumber;
+    lastAnimatedEventIdRef.current = eventId;
 
     if (readPrefersReducedMotion()) {
       setEvent(IDLE_EVENT);
