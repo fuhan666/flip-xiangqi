@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { WebSocket } from 'ws';
 import { RoomServerError, RoomServer, startRoomServer, type RoomServerOptions } from '../room-server';
 import {
+  buildClientGameAction,
   buildClientHello,
   buildClientLeave,
   buildClientLobbyLock,
@@ -778,5 +779,145 @@ describe('heartbeat and reconnection', () => {
     const reconnectedWelcome = await reconnectedGuest.waitForType('welcome');
     expect(reconnectedWelcome.payload.memberId).toBe(pair.guestId);
     expect(reconnectedWelcome.payload.lobby.phase).toBe('started');
+  });
+
+  it('broadcasts seed and initial game state upon lobby.start', async () => {
+    const pair = await connectedPair();
+    enableAutoPong(pair.host, pair.room.roomId);
+    enableAutoPong(pair.guest, pair.room.roomId);
+    await readyBoth(pair, 1);
+
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+
+    const hostGameState = await pair.host.waitForType('game.state');
+    const guestGameState = await pair.guest.waitForType('game.state');
+
+    expect(hostGameState.payload.matchId).toBeDefined();
+    expect(hostGameState.payload.matchId).toBe(guestGameState.payload.matchId);
+    expect(hostGameState.payload.seed).toBe(guestGameState.payload.seed);
+    expect(hostGameState.payload.stepNumber).toBe(0);
+    expect(hostGameState.payload.state.currentTurn).toBe('red');
+    expect(hostGameState.payload.state.pieces).toEqual(guestGameState.payload.state.pieces);
+  });
+
+  it('arbitrates game.action, advances stepNumber, rejects wrong turn and stale steps', async () => {
+    const pair = await connectedPair();
+    enableAutoPong(pair.host, pair.room.roomId);
+    enableAutoPong(pair.guest, pair.room.roomId);
+    // 房主选 host-red
+    pair.host.send(
+      encodeMessage(buildClientLobbySettings(pair.room.roomId, { sidePreference: 'host-red', timeControlId: 'standard' })),
+    );
+    await pair.host.waitForType('lobby.state', (m) => m.payload.lobby.settings.sidePreference === 'host-red');
+
+    await readyBoth(pair, 2);
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+
+    const startMsg = await pair.host.waitForType('game.state');
+    const matchId = startMsg.payload.matchId;
+    const pieces = startMsg.payload.state.pieces as Array<{ id: string; revealed: boolean; position: { x: number; y: number } | null }>;
+    const hiddenPiece = pieces.find((p) => !p.revealed && p.position !== null)!;
+
+    // 1. 黑方（客人）在红方回合出步 -> 拒绝
+    pair.guest.send(
+      encodeMessage(
+        buildClientGameAction(pair.room.roomId, {
+          requestId: 'req-bad-turn',
+          matchId,
+          stepNumber: 0,
+          action: { type: 'flip', position: hiddenPiece.position! },
+        }),
+      ),
+    );
+
+    const rejection = await pair.guest.waitForType('game.rejected', (m) => m.requestId === 'req-bad-turn');
+    expect(rejection.payload.reason).toContain('非己方回合');
+    expect(rejection.payload.stepNumber).toBe(0);
+
+    // 2. 红方（房主）出步 -> 接受并广播
+    pair.host.send(
+      encodeMessage(
+        buildClientGameAction(pair.room.roomId, {
+          requestId: 'req-host-flip',
+          matchId,
+          stepNumber: 0,
+          action: { type: 'flip', position: hiddenPiece.position! },
+        }),
+      ),
+    );
+
+    const step1Host = await pair.host.waitForType('game.state', (m) => m.payload.stepNumber === 1);
+    const step1Guest = await pair.guest.waitForType('game.state', (m) => m.payload.stepNumber === 1);
+    expect(step1Host.payload.action).toEqual({ type: 'flip', position: hiddenPiece.position! });
+    expect(step1Guest.payload.actorMemberId).toBe(pair.hostId);
+    expect(step1Host.payload.state.currentTurn).toBe('black');
+
+    // 3. 再次发送已过期的第 0 步 -> 拒绝
+    pair.guest.send(
+      encodeMessage(
+        buildClientGameAction(pair.room.roomId, {
+          requestId: 'req-stale-step',
+          matchId,
+          stepNumber: 0,
+          action: { type: 'flip', position: hiddenPiece.position! },
+        }),
+      ),
+    );
+
+    const staleRejection = await pair.guest.waitForType('game.rejected', (m) => m.requestId === 'req-stale-step');
+    expect(staleRejection.payload.reason).toContain('已过期');
+    expect(staleRejection.payload.stepNumber).toBe(1);
+  });
+
+  it('retains match state and allows host reconnecting with hostToken during started phase', async () => {
+    const pair = await connectedPair();
+    enableAutoPong(pair.host, pair.room.roomId);
+    enableAutoPong(pair.guest, pair.room.roomId);
+    await readyBoth(pair, 1);
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    const startMsg = await pair.host.waitForType('game.state');
+    const matchId = startMsg.payload.matchId;
+
+    // 房主 socket 掉线
+    pair.host.socket.terminate();
+
+    // 客人收到房主掉线通知，房间不关闭
+    const memberDrop = await pair.guest.waitForType(
+      'members',
+      (m) => m.payload.members.some((member: { role: string; connected: boolean }) => member.role === 'host' && !member.connected),
+    );
+    expect(memberDrop.payload.members.find((m: { role: string }) => m.role === 'host').connected).toBe(false);
+
+    // 客人此时若尝试操作，服务端拒绝因对手离线
+    const pieces = startMsg.payload.state.pieces as Array<{ id: string; revealed: boolean; position: { x: number; y: number } | null }>;
+    const hiddenPiece = pieces.find((p) => !p.revealed && p.position !== null)!;
+    pair.guest.send(
+      encodeMessage(
+        buildClientGameAction(pair.room.roomId, {
+          requestId: 'req-offline',
+          matchId,
+          stepNumber: 0,
+          action: { type: 'flip', position: hiddenPiece.position! },
+        }),
+      ),
+    );
+    const offlineRejection = await pair.guest.waitForType('game.rejected');
+    expect(offlineRejection.payload.reason).toContain('对手已离线');
+
+    // 房主凭借 hostToken 重连
+    const reconnectedHost = await openClient(pair.room.actualPort);
+    await hello(reconnectedHost, { role: 'host', name: '房主', token: pair.room.hostToken });
+    const welcome = await reconnectedHost.waitForType('welcome');
+    expect(welcome.payload.memberId).toBe(pair.hostId);
+    expect(welcome.payload.game).toBeDefined();
+    expect(welcome.payload.game.matchId).toBe(matchId);
+    expect(welcome.payload.game.stepNumber).toBe(0);
+
+    // 客人看到房主重新恢复连接
+    const memberRestored = await pair.guest.waitForType(
+      'members',
+      (m) => m.payload.members.some((member: { role: string; connected: boolean }) => member.role === 'host' && member.connected),
+    );
+    expect(memberRestored.payload.members.find((m: { role: string }) => m.role === 'host').connected).toBe(true);
   });
 });

@@ -1,4 +1,4 @@
-import { BLACK_KING_POSITION, NON_KING_PIECES, RED_KING_POSITION } from './constants';
+import { BLACK_KING_POSITION, NON_KING_PIECES, RED_KING_POSITION } from './constants.js';
 import type {
   Camp,
   GameHistoryAction,
@@ -9,7 +9,7 @@ import type {
   HistoryPieceSnapshot,
   Piece,
   Position,
-} from './types';
+} from './types.js';
 
 function clonePosition(position: Position | null): Position | null {
   return position ? { ...position } : null;

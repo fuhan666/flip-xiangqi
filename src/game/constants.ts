@@ -1,4 +1,4 @@
-import type { Camp, PieceType, Position } from './types';
+import type { Camp, PieceType, Position } from './types.js';
 
 export const BOARD_WIDTH = 9;
 export const BOARD_HEIGHT = 10;

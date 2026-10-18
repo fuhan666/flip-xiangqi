@@ -4,7 +4,7 @@
  * 文案遵循「发生了什么 + 为什么 + 现在怎么办」三段式，
  * 不向用户暴露裸错误码。
  */
-import type { ErrorCode, LobbyRejectCode, RoomClosedReason } from './protocol';
+import type { ErrorCode, LobbyRejectCode, RoomClosedReason } from './protocol.js';
 
 const ERROR_COPY: Record<ErrorCode, string> = {
   INVALID_ADDRESS: '地址无法识别 —— 需要「IP:端口」格式，例如 192.168.1.5:8080 —— 请检查是否漏掉端口或有多余字符',

@@ -786,3 +786,59 @@
     animation: none;
   }
 }
+
+.online-game-container {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  width: 100%;
+}
+
+.online-summary-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.shuffling-banner {
+  padding: 10px 16px;
+  background: rgba(244, 219, 167, 0.16);
+  border: 1px solid rgba(244, 219, 167, 0.4);
+  border-radius: 8px;
+  color: #f4dba7;
+  font-weight: bold;
+  text-align: center;
+  letter-spacing: 0.1em;
+}
+
+.online-rejection-notice {
+  margin: 0;
+  padding: 10px 14px;
+}
+
+.online-meta-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding-top: 6px;
+  border-top: 1px solid rgba(215, 178, 119, 0.2);
+}
+
+.turn-indicator {
+  font-size: 18px;
+  font-weight: bold;
+  color: #f4dba7;
+}
+
+.step-counter {
+  font-size: 15px;
+  color: #d7b277;
+}
+
+.online-busy-hint {
+  font-size: 14px;
+  color: #e5a742;
+  font-style: italic;
+}

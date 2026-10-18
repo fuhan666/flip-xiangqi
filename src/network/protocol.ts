@@ -8,17 +8,28 @@ import {
   isSidePreference,
   isTimeControlId,
   parseLobbyState,
+  parseStartParameters,
   type LobbyRejectCode,
   type LobbyState,
   type SidePreference,
+  type StartParameters,
   type TimeControlId,
 } from './lobby.js';
+import {
+  parseGameStateSnapshot,
+  parseMatchAction,
+  parseMatchSnapshot,
+  type MatchAction,
+  type MatchSnapshot,
+} from './match.js';
+import type { GameStateSnapshot } from '../game/index.js';
 
 // 线格式使用的领域类型从协议入口统一再导出，调用方无需两个导入源。
-export type { LobbyRejectCode, LobbyState, SidePreference, TimeControlId } from './lobby.js';
+export type { LobbyRejectCode, LobbyState, SidePreference, StartParameters, TimeControlId } from './lobby.js';
+export type { MatchAction, MatchSnapshot } from './match.js';
 
-/** v2：welcome 携带完整大厅快照，并新增 lobby.* 消息族。 */
-export const PROTOCOL_VERSION = 2;
+/** v3：增加 game.action、game.state、game.rejected、game.sync 权威对局协议。 */
+export const PROTOCOL_VERSION = 3;
 
 /** WebSocket 握手路径（房间服务同时在该路径上提供客人页面）。 */
 export const WS_PATH = '/ws';
@@ -109,7 +120,18 @@ export type ClientMessage =
   | (Envelope & { type: 'lobby.settings'; roomId: string; payload: { sidePreference: SidePreference; timeControlId: TimeControlId } })
   | (Envelope & { type: 'lobby.lock'; roomId: string; payload: { locked: boolean } })
   | (Envelope & { type: 'lobby.ready'; roomId: string; payload: { ready: boolean; settingsVersion: number } })
-  | (Envelope & { type: 'lobby.start'; roomId: string; payload: Record<string, never> });
+  | (Envelope & { type: 'lobby.start'; roomId: string; payload: Record<string, never> })
+  | (Envelope & {
+      type: 'game.action';
+      requestId: string;
+      roomId: string;
+      payload: { matchId: string; stepNumber: number; action: MatchAction };
+    })
+  | (Envelope & {
+      type: 'game.sync';
+      roomId: string;
+      payload: { matchId?: string };
+    });
 
 export interface LobbyRejection {
   code: LobbyRejectCode;
@@ -128,6 +150,7 @@ export type ServerMessage =
         members: MemberSnapshot[];
         lobby: LobbyState;
         resumeToken?: string;
+        game?: MatchSnapshot;
       };
     })
   | (Envelope & { type: 'members'; roomId: string; payload: { members: MemberSnapshot[] } })
@@ -135,6 +158,29 @@ export type ServerMessage =
   | (Envelope & { type: 'pong'; roomId: string; payload: { seq: number } })
   | (Envelope & { type: 'lobby.state'; roomId: string; payload: { lobby: LobbyState } })
   | (Envelope & { type: 'lobby.rejected'; roomId: string; payload: LobbyRejection })
+  | (Envelope & {
+      type: 'game.state';
+      roomId: string;
+      payload: {
+        matchId: string;
+        seed: number;
+        stepNumber: number;
+        state: GameStateSnapshot;
+        actorMemberId?: string;
+        action?: MatchAction;
+        startParameters?: StartParameters;
+      };
+    })
+  | (Envelope & {
+      type: 'game.rejected';
+      roomId: string;
+      payload: {
+        matchId: string;
+        stepNumber: number;
+        reason: string;
+        state: GameStateSnapshot;
+      };
+    })
   | (Envelope & { type: 'room.closed'; roomId: string; payload: { reason: RoomClosedReason } })
   | (Envelope & { type: 'error'; roomId: string | null; payload: { code: ServerErrorCode; message: string } });
 
@@ -304,6 +350,62 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
     return { ok: true, message: { ...message, type: 'lobby.start', roomId: message.roomId, payload: {} } };
   }
 
+  if (message.type === 'game.action') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-action-room-id' };
+    }
+    if (typeof message.requestId !== 'string' || message.requestId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-action-request-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof payload.matchId !== 'string' || payload.matchId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-action-match-id' };
+    }
+    if (
+      typeof payload.stepNumber !== 'number' ||
+      !Number.isInteger(payload.stepNumber) ||
+      payload.stepNumber < 0 ||
+      payload.stepNumber > Number.MAX_SAFE_INTEGER
+    ) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-action-step-number' };
+    }
+    const action = parseMatchAction(payload.action);
+    if (!action) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-action-action' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.action',
+        requestId: message.requestId,
+        roomId: message.roomId,
+        payload: {
+          matchId: payload.matchId,
+          stepNumber: payload.stepNumber,
+          action,
+        },
+      },
+    };
+  }
+
+  if (message.type === 'game.sync') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-sync-room-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    const matchId = typeof payload.matchId === 'string' && payload.matchId.length > 0 ? payload.matchId : undefined;
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.sync',
+        roomId: message.roomId,
+        payload: { ...(matchId ? { matchId } : {}) },
+      },
+    };
+  }
+
   return { ok: false, code: 'INVALID_MESSAGE', detail: `unknown-type=${message.type}` };
 }
 
@@ -329,6 +431,10 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     if (!members || !lobby) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'welcome-members' };
     }
+    const game = payload.game !== undefined ? parseMatchSnapshot(payload.game) : undefined;
+    if (payload.game !== undefined && !game) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'welcome-game' };
+    }
     return {
       ok: true,
       message: {
@@ -343,6 +449,7 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
           members,
           lobby,
           ...(typeof payload.resumeToken === 'string' ? { resumeToken: payload.resumeToken } : {}),
+          ...(game ? { game } : {}),
         },
       },
     };
@@ -393,6 +500,92 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'members-payload' };
     }
     return { ok: true, message: { ...message, type: 'members', roomId: message.roomId, payload: { members } } };
+  }
+
+  if (message.type === 'game.state') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-room-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof payload.matchId !== 'string' || payload.matchId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-match-id' };
+    }
+    if (typeof payload.seed !== 'number' || !Number.isInteger(payload.seed)) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-seed' };
+    }
+    if (
+      typeof payload.stepNumber !== 'number' ||
+      !Number.isInteger(payload.stepNumber) ||
+      payload.stepNumber < 0 ||
+      payload.stepNumber > Number.MAX_SAFE_INTEGER
+    ) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-step-number' };
+    }
+    const state = parseGameStateSnapshot(payload.state);
+    if (!state) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-state' };
+    }
+    const actorMemberId = typeof payload.actorMemberId === 'string' ? payload.actorMemberId : undefined;
+    const action = payload.action ? parseMatchAction(payload.action) ?? undefined : undefined;
+    const startParameters = payload.startParameters
+      ? parseStartParameters(payload.startParameters) ?? undefined
+      : undefined;
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.state',
+        roomId: message.roomId,
+        payload: {
+          matchId: payload.matchId,
+          seed: payload.seed,
+          stepNumber: payload.stepNumber,
+          state,
+          ...(actorMemberId ? { actorMemberId } : {}),
+          ...(action ? { action } : {}),
+          ...(startParameters ? { startParameters } : {}),
+        },
+      },
+    };
+  }
+
+  if (message.type === 'game.rejected') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-rejected-room-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof payload.matchId !== 'string' || payload.matchId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-rejected-match-id' };
+    }
+    if (
+      typeof payload.stepNumber !== 'number' ||
+      !Number.isInteger(payload.stepNumber) ||
+      payload.stepNumber < 0 ||
+      payload.stepNumber > Number.MAX_SAFE_INTEGER
+    ) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-rejected-step-number' };
+    }
+    if (typeof payload.reason !== 'string') {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-rejected-reason' };
+    }
+    const state = parseGameStateSnapshot(payload.state);
+    if (!state) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-rejected-state' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.rejected',
+        roomId: message.roomId,
+        payload: {
+          matchId: payload.matchId,
+          stepNumber: payload.stepNumber,
+          reason: payload.reason,
+          state,
+        },
+      },
+    };
   }
 
   if (message.type === 'room.closed') {
@@ -528,6 +721,37 @@ export function buildClientLobbyReady(roomId: string, ready: boolean, settingsVe
 
 export function buildClientLobbyStart(roomId: string): ClientMessage {
   return { version: PROTOCOL_VERSION, type: 'lobby.start', roomId, payload: {} };
+}
+
+export function buildClientGameAction(
+  roomId: string,
+  input: { requestId: string; matchId: string; stepNumber: number; action: MatchAction },
+): ClientMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.action',
+    requestId: input.requestId,
+    roomId,
+    payload: {
+      matchId: input.matchId,
+      stepNumber: input.stepNumber,
+      action: input.action,
+    },
+  };
+}
+
+export function buildClientGameSync(
+  roomId: string,
+  matchId?: string,
+  requestId?: string,
+): ClientMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.sync',
+    roomId,
+    ...(requestId ? { requestId } : {}),
+    payload: { ...(matchId ? { matchId } : {}) },
+  };
 }
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;

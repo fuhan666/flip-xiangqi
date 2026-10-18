@@ -5,7 +5,7 @@ import { JoinRoomScreen } from '../rooms/JoinRoomScreen';
 import type { RoomControlApi, RoomCreateResult } from '../../network/control-api';
 import type { ConnectionState, JoinOptions, RoomConnection } from '../../network/client';
 import type { ParsedAddress } from '../../network/address';
-import type { MemberSnapshot, SidePreference, TimeControlId } from '../../network/protocol';
+import type { MemberSnapshot, MatchAction, SidePreference, TimeControlId } from '../../network/protocol';
 import type { StorageLike } from '../../network/recent-rooms';
 import { IDLE_CONNECTION_STATE } from '../rooms/connection-state';
 import { applyLobbyCommand, createLobbyState, type LobbyState } from '../../network/lobby';
@@ -111,6 +111,12 @@ class FakeConnection implements RoomConnection {
     this.lobbyCalls.push({ type: 'start' });
     this.setState({ ...this.state, pendingCommand: 'start', lastRejection: null });
   }
+
+  sendGameAction(_action: MatchAction): { ok: boolean; reason?: string } {
+    return { ok: true };
+  }
+
+  requestGameSync(): void {}
 
   emit(state: Partial<ConnectionState>): void {
     this.setState({ ...this.state, ...state });

@@ -7,16 +7,18 @@
  * - 临时掉线自动重连（指数退避，上限与总预算）与手动立即重连；
  * - 取消或再次连接时，旧 socket 与计时器的回调一律忽略（代际计数）。
  */
-import { formatAddress, toWebSocketUrl, type ParsedAddress } from './address';
-import { describeErrorCode, describeLobbyReject, describeRoomClosed } from './errors';
+import { formatAddress, toWebSocketUrl, type ParsedAddress } from './address.js';
+import { describeErrorCode, describeLobbyReject, describeRoomClosed } from './errors.js';
 import {
   computeBackoffDelay,
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_HEARTBEAT_TIMEOUT_MS,
   DEFAULT_RECONNECT_BUDGET_MS,
   DEFAULT_RECONNECT_DELAYS,
-} from './heartbeat';
+} from './heartbeat.js';
 import {
+  buildClientGameAction,
+  buildClientGameSync,
   buildClientHello,
   buildClientLeave,
   buildClientLobbyLock,
@@ -33,19 +35,47 @@ import {
   type ClientMessage,
   type ErrorCode,
   type LobbyRejection,
+  type MatchAction,
   type MemberSnapshot,
   type Role,
   type RoomClosedReason,
   type ServerErrorCode,
   type SidePreference,
+  type StartParameters,
   type TimeControlId,
-} from './protocol';
-import type { LobbyState } from './lobby';
+} from './protocol.js';
+import type { LobbyState } from './lobby.js';
+import { applyAction, restoreState, snapshotState, type GameStateSnapshot } from '../game/index.js';
 
 export type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'error';
 
 /** 大厅请求类别：同一时刻只保留一个在途请求，用于防连点。 */
 export type LobbyRequestKind = 'settings' | 'lock' | 'ready' | 'start';
+
+export interface AcceptedGameAction {
+  stepNumber: number;
+  actorMemberId: string;
+  action: MatchAction;
+  source: 'local' | 'remote';
+}
+
+export interface GameClientState {
+  matchId: string;
+  seed: number;
+  stepNumber: number;
+  startParameters: StartParameters;
+  confirmedState: GameStateSnapshot;
+  displayState: GameStateSnapshot;
+  pendingAction: {
+    requestId: string;
+    stepNumber: number;
+    action: MatchAction;
+  } | null;
+  lastError: string | null;
+  lastRejectedReason: string | null;
+  statusNotice: string | null;
+  lastAcceptedAction: AcceptedGameAction | null;
+}
 
 export interface ConnectionState {
   status: ConnectionStatus;
@@ -64,6 +94,8 @@ export interface ConnectionState {
   lastRejection: LobbyRejection | null;
   /** 在途大厅请求；收到权威状态或拒绝后清空。 */
   pendingCommand: LobbyRequestKind | null;
+  /** 当前权威对局状态（未开局前为 null）。 */
+  game: GameClientState | null;
   /** 当前往返延迟（毫秒）；未测得或断线时为 null。 */
   rtt: number | null;
   /** 是否处于断线重连中。 */
@@ -107,6 +139,10 @@ export interface RoomConnection {
   sendLobbyReady(ready: boolean): void;
   /** 房主请求开始对局（服务端执行门禁并一次性冻结开局参数）。 */
   sendLobbyStart(): void;
+  /** 发送对局动作（翻牌/移动/吃子），本地先乐观执行。 */
+  sendGameAction(action: MatchAction): { ok: boolean; reason?: string };
+  /** 显式请求权威对局同步。 */
+  requestGameSync(): void;
 }
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 8_000;
@@ -124,6 +160,7 @@ const IDLE_STATE: ConnectionState = {
   lobby: null,
   lastRejection: null,
   pendingCommand: null,
+  game: null,
   rtt: null,
   reconnecting: false,
   justReconnected: false,
@@ -131,6 +168,10 @@ const IDLE_STATE: ConnectionState = {
 
 function defaultWebSocketFactory(url: string): WebSocketLike {
   return new WebSocket(url) as unknown as WebSocketLike;
+}
+
+function generateRequestId(): string {
+  return Math.random().toString(36).slice(2, 10);
 }
 
 export interface RoomClientOptions {
@@ -345,6 +386,114 @@ export class RoomClient implements RoomConnection {
     this.sendLobbyRequest('start', buildClientLobbyStart(roomId));
   }
 
+  sendGameAction(action: MatchAction): { ok: boolean; reason?: string } {
+    const socket = this.socket;
+    if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
+      return { ok: false, reason: '连接未就绪' };
+    }
+
+    const game = this.state.game;
+    if (!game) {
+      return { ok: false, reason: '对局未开始' };
+    }
+
+    if (game.displayState.winner !== null) {
+      return { ok: false, reason: '对局已经结束，请重新开局' };
+    }
+
+    if (game.pendingAction !== null) {
+      return { ok: false, reason: '上一操作处理中，请稍候' };
+    }
+
+    const mySide =
+      this.state.memberId === game.startParameters.redMemberId
+        ? 'red'
+        : this.state.memberId === game.startParameters.blackMemberId
+          ? 'black'
+          : null;
+
+    if (!mySide) {
+      return { ok: false, reason: '非对局成员' };
+    }
+
+    if (game.displayState.currentTurn !== mySide) {
+      return { ok: false, reason: '当前非己方回合' };
+    }
+
+    const stateObj = restoreState(game.displayState, []);
+    const nextGameState = applyAction(stateObj, action);
+    if (nextGameState.lastError) {
+      this.setState({
+        ...this.state,
+        game: {
+          ...game,
+          lastError: nextGameState.lastError,
+          statusNotice: nextGameState.lastError,
+        },
+      });
+      return { ok: false, reason: nextGameState.lastError };
+    }
+
+    const nextStateSnapshot = snapshotState(nextGameState);
+    const requestId = generateRequestId();
+    const stepNumber = game.stepNumber;
+
+    try {
+      socket.send(
+        encodeMessage(
+          buildClientGameAction(this.state.roomId!, {
+            requestId,
+            matchId: game.matchId,
+            stepNumber,
+            action,
+          }),
+        ),
+      );
+    } catch {
+      return { ok: false, reason: '网络发送失败' };
+    }
+
+    this.setState({
+      ...this.state,
+      game: {
+        ...game,
+        displayState: nextStateSnapshot,
+        pendingAction: {
+          requestId,
+          stepNumber,
+          action,
+        },
+        lastAcceptedAction: {
+          stepNumber,
+          actorMemberId: this.state.memberId!,
+          action,
+          source: 'local',
+        },
+        lastError: null,
+        lastRejectedReason: null,
+        statusNotice: null,
+      },
+    });
+
+    return { ok: true };
+  }
+
+  requestGameSync(): void {
+    const socket = this.socket;
+    if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
+      return;
+    }
+    const roomId = this.state.roomId;
+    if (!roomId) {
+      return;
+    }
+    try {
+      socket.send(encodeMessage(buildClientGameSync(roomId, this.state.game?.matchId, generateRequestId())));
+    } catch {
+      // 忽略发送失败
+    }
+  }
+
   /** 发送大厅请求：记录在途类别供界面防连点；发送失败按本地错误提示，不动连接。 */
   private sendLobbyRequest(kind: LobbyRequestKind, message: ClientMessage): void {
     const socket = this.socket;
@@ -389,6 +538,26 @@ export class RoomClient implements RoomConnection {
         this.savedResumeToken = message.payload.resumeToken;
       }
 
+      const incomingGame = message.payload.game;
+      let gameClientState: GameClientState | null = this.state.game;
+      if (incomingGame) {
+        gameClientState = {
+          matchId: incomingGame.matchId,
+          seed: incomingGame.seed,
+          stepNumber: incomingGame.stepNumber,
+          startParameters: incomingGame.startParameters,
+          confirmedState: incomingGame.gameState,
+          displayState: incomingGame.gameState,
+          pendingAction: null,
+          lastError: null,
+          lastRejectedReason: null,
+          statusNotice: null,
+          lastAcceptedAction: null,
+        };
+      } else if (message.payload.lobby.phase === 'lobby') {
+        gameClientState = null;
+      }
+
       this.setState({
         status: 'connected',
         errorCode: null,
@@ -401,6 +570,7 @@ export class RoomClient implements RoomConnection {
         lobby: message.payload.lobby,
         lastRejection: null,
         pendingCommand: null,
+        game: gameClientState,
         rtt: this.state.rtt,
         reconnecting: false,
         justReconnected: wasReconnecting,
@@ -458,6 +628,92 @@ export class RoomClient implements RoomConnection {
         ...this.state,
         lastRejection: { code, message: describeLobbyReject(code) },
         pendingCommand: null,
+      });
+      return;
+    }
+
+    if (message.type === 'game.state') {
+      const incoming = message.payload;
+      const currentGame = this.state.game;
+
+      if (currentGame && currentGame.matchId === incoming.matchId && incoming.stepNumber < currentGame.stepNumber) {
+        return;
+      }
+
+      const startParameters = incoming.startParameters ?? currentGame?.startParameters;
+      if (!startParameters) {
+        return;
+      }
+
+      const isMyAction = incoming.actorMemberId && incoming.actorMemberId === this.state.memberId;
+      const lastAcceptedAction: AcceptedGameAction | null =
+        incoming.actorMemberId && incoming.action
+          ? {
+              stepNumber: incoming.stepNumber - 1,
+              actorMemberId: incoming.actorMemberId,
+              action: incoming.action,
+              source: isMyAction ? 'local' : 'remote',
+            }
+          : null;
+
+      let pendingAction = currentGame?.pendingAction ?? null;
+      if (pendingAction && incoming.stepNumber >= pendingAction.stepNumber) {
+        pendingAction = null;
+      }
+
+      this.setState({
+        ...this.state,
+        game: {
+          matchId: incoming.matchId,
+          seed: incoming.seed,
+          stepNumber: incoming.stepNumber,
+          startParameters,
+          confirmedState: incoming.state,
+          displayState: incoming.state,
+          pendingAction,
+          lastError: null,
+          lastRejectedReason: null,
+          statusNotice: null,
+          lastAcceptedAction,
+        },
+      });
+      return;
+    }
+
+    if (message.type === 'game.rejected') {
+      const incoming = message.payload;
+      const currentGame = this.state.game;
+      if (!currentGame || currentGame.matchId !== incoming.matchId) {
+        return;
+      }
+
+      if (incoming.stepNumber < currentGame.stepNumber) {
+        if (currentGame.pendingAction && currentGame.pendingAction.stepNumber === incoming.stepNumber) {
+          this.setState({
+            ...this.state,
+            game: {
+              ...currentGame,
+              pendingAction: null,
+              lastRejectedReason: incoming.reason,
+            },
+          });
+        }
+        return;
+      }
+
+      this.setState({
+        ...this.state,
+        game: {
+          ...currentGame,
+          stepNumber: incoming.stepNumber,
+          confirmedState: incoming.state,
+          displayState: incoming.state,
+          pendingAction: null,
+          lastError: incoming.reason,
+          lastRejectedReason: incoming.reason,
+          statusNotice: '你的操作未被采纳，请重新操作',
+          lastAcceptedAction: null,
+        },
       });
       return;
     }
@@ -558,13 +814,13 @@ export class RoomClient implements RoomConnection {
     this.stopHeartbeat();
     this.teardownSocket();
 
-    // 仅已入房客人且有恢复凭据支持自动重连
-    if (
-      this.savedJoinOptions?.role === 'guest' &&
-      this.savedRoomId &&
-      this.savedResumeToken &&
-      this.savedAddress
-    ) {
+    // 仅已入房成员且有恢复凭据支持自动重连（客人用 resumeToken，房主用 host token）
+    const isGuest = this.savedJoinOptions?.role === 'guest';
+    const isHost = this.savedJoinOptions?.role === 'host';
+    const canReconnectGuest = isGuest && this.savedRoomId && this.savedResumeToken && this.savedAddress;
+    const canReconnectHost = isHost && this.savedRoomId && this.savedJoinOptions?.token && this.savedAddress;
+
+    if (canReconnectGuest || canReconnectHost) {
       this.reconnecting = true;
       if (this.reconnectStartTime === null) {
         this.reconnectStartTime = this.now();
@@ -577,6 +833,7 @@ export class RoomClient implements RoomConnection {
         rtt: null,
         pendingCommand: null,
         lastRejection: null,
+        game: this.state.game ? { ...this.state.game, pendingAction: null } : null,
       });
       this.scheduleReconnect();
       return;
@@ -627,12 +884,16 @@ export class RoomClient implements RoomConnection {
   }
 
   private attemptReconnect(): void {
+    const isGuest = this.savedJoinOptions?.role === 'guest';
+    const isHost = this.savedJoinOptions?.role === 'host';
+    const hasCredentials = (isGuest && this.savedResumeToken) || (isHost && this.savedJoinOptions?.token);
+
     if (
       !this.reconnecting ||
       !this.savedAddress ||
       !this.savedJoinOptions ||
       !this.savedRoomId ||
-      !this.savedResumeToken
+      !hasCredentials
     ) {
       return;
     }
@@ -668,16 +929,20 @@ export class RoomClient implements RoomConnection {
         return;
       }
       try {
-        socket.send(
-          encodeMessage(
-            buildClientHello({
+        const helloMsg = isHost
+          ? buildClientHello({
+              role: 'host',
+              name: this.savedJoinOptions!.name,
+              roomId: this.savedRoomId,
+              token: this.savedJoinOptions!.token,
+            })
+          : buildClientHello({
               role: 'guest',
               name: this.savedJoinOptions!.name,
               roomId: this.savedRoomId,
               resumeToken: this.savedResumeToken!,
-            }),
-          ),
-        );
+            });
+        socket.send(encodeMessage(helloMsg));
       } catch {
         this.teardownSocket();
         this.scheduleReconnect();
