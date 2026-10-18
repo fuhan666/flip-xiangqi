@@ -18,6 +18,9 @@ import {
 } from './heartbeat.js';
 import {
   buildClientGameAction,
+  buildClientGameNegotiate,
+  buildClientGameNegotiateReply,
+  buildClientGameResign,
   buildClientGameSync,
   buildClientHello,
   buildClientLeave,
@@ -40,6 +43,8 @@ import {
   type MatchClockSnapshot,
   type MatchSettlement,
   type MemberSnapshot,
+  type NegotiationEvent,
+  type PendingNegotiation,
   type Role,
   type RoomClosedReason,
   type ServerErrorCode,
@@ -83,6 +88,9 @@ export interface GameClientState {
   lastRejectedReason: string | null;
   statusNotice: string | null;
   lastAcceptedAction: AcceptedGameAction | null;
+  pendingNegotiation: PendingNegotiation | null;
+  drawCooldownUntil: Record<string, number>;
+  negotiationEvent: NegotiationEvent | null;
 }
 
 export interface ConnectionState {
@@ -151,6 +159,12 @@ export interface RoomConnection {
   sendLobbyReturn(intent: 'return-lobby' | 'rematch'): void;
   /** 发送对局动作（翻牌/移动/吃子），本地先乐观执行。 */
   sendGameAction(action: MatchAction): { ok: boolean; reason?: string };
+  /** 发起协商（悔棋 undo 或求和 draw）。 */
+  sendGameNegotiate(kind: 'undo' | 'draw'): { ok: boolean; reason?: string };
+  /** 回应协商请求（agree: boolean）。 */
+  sendGameNegotiateReply(agree: boolean): { ok: boolean; reason?: string };
+  /** 主动认输。 */
+  sendGameResign(): { ok: boolean; reason?: string };
   /** 显式请求权威对局同步。 */
   requestGameSync(): void;
 }
@@ -430,6 +444,10 @@ export class RoomClient implements RoomConnection {
       return { ok: false, reason: '对局已经结束，请重新开局' };
     }
 
+    if (game.pendingNegotiation !== null) {
+      return { ok: false, reason: '协商进行中，操作已锁定' };
+    }
+
     if (game.pendingAction !== null) {
       return { ok: false, reason: '上一操作处理中，请稍候' };
     }
@@ -474,6 +492,7 @@ export class RoomClient implements RoomConnection {
             requestId,
             matchId: game.matchId,
             stepNumber,
+            revision: game.revision,
             action,
           }),
         ),
@@ -505,6 +524,117 @@ export class RoomClient implements RoomConnection {
       },
     });
 
+    return { ok: true };
+  }
+
+  sendGameNegotiate(kind: 'undo' | 'draw'): { ok: boolean; reason?: string } {
+    const socket = this.socket;
+    if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
+      return { ok: false, reason: '连接未就绪' };
+    }
+    const game = this.state.game;
+    if (!game) {
+      return { ok: false, reason: '对局未开始' };
+    }
+    if (game.settlement !== null || game.displayState.winner !== null) {
+      return { ok: false, reason: '对局已结束' };
+    }
+    if (game.pendingNegotiation !== null) {
+      return { ok: false, reason: '已有协商正在进行中' };
+    }
+    const myMemberId = this.state.memberId;
+    if (!myMemberId) {
+      return { ok: false, reason: '未获取玩家信息' };
+    }
+    if (kind === 'undo') {
+      if (game.stepNumber === 0) {
+        return { ok: false, reason: '当前尚无可悔棋步数' };
+      }
+    } else if (kind === 'draw') {
+      const cooldownUntil = game.drawCooldownUntil[myMemberId] ?? 0;
+      const now = this.now();
+      if (cooldownUntil > now) {
+        const remainingSeconds = Math.ceil((cooldownUntil - now) / 1000);
+        return { ok: false, reason: `求和冷却中，请等待 ${remainingSeconds} 秒` };
+      }
+    }
+
+    const requestId = generateRequestId();
+    try {
+      socket.send(
+        encodeMessage(
+          buildClientGameNegotiate(this.state.roomId!, {
+            requestId,
+            matchId: game.matchId,
+            revision: game.revision,
+            kind,
+          }),
+        ),
+      );
+    } catch {
+      return { ok: false, reason: '网络发送失败' };
+    }
+    return { ok: true };
+  }
+
+  sendGameNegotiateReply(agree: boolean): { ok: boolean; reason?: string } {
+    const socket = this.socket;
+    if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
+      return { ok: false, reason: '连接未就绪' };
+    }
+    const game = this.state.game;
+    if (!game || !game.pendingNegotiation) {
+      return { ok: false, reason: '当前无待回应的协商' };
+    }
+    if (game.pendingNegotiation.responderMemberId !== this.state.memberId) {
+      return { ok: false, reason: '非协商目标玩家' };
+    }
+
+    const requestId = generateRequestId();
+    try {
+      socket.send(
+        encodeMessage(
+          buildClientGameNegotiateReply(this.state.roomId!, {
+            requestId,
+            matchId: game.matchId,
+            negotiationId: game.pendingNegotiation.negotiationId,
+            accept: agree,
+          }),
+        ),
+      );
+    } catch {
+      return { ok: false, reason: '网络发送失败' };
+    }
+    return { ok: true };
+  }
+
+  sendGameResign(): { ok: boolean; reason?: string } {
+    const socket = this.socket;
+    if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
+      return { ok: false, reason: '连接未就绪' };
+    }
+    const game = this.state.game;
+    if (!game) {
+      return { ok: false, reason: '对局未开始' };
+    }
+    if (game.settlement !== null || game.displayState.winner !== null) {
+      return { ok: false, reason: '对局已结束' };
+    }
+
+    const requestId = generateRequestId();
+    try {
+      socket.send(
+        encodeMessage(
+          buildClientGameResign(this.state.roomId!, {
+            requestId,
+            matchId: game.matchId,
+            revision: game.revision,
+          }),
+        ),
+      );
+    } catch {
+      return { ok: false, reason: '网络发送失败' };
+    }
     return { ok: true };
   }
 
@@ -589,6 +719,9 @@ export class RoomClient implements RoomConnection {
           lastRejectedReason: null,
           statusNotice: null,
           lastAcceptedAction: null,
+          pendingNegotiation: incomingGame.pendingNegotiation ?? null,
+          drawCooldownUntil: incomingGame.drawCooldownUntil ?? {},
+          negotiationEvent: incomingGame.negotiationEvent ?? null,
         };
       } else if (message.payload.lobby.phase === 'lobby') {
         gameClientState = null;
@@ -710,9 +843,15 @@ export class RoomClient implements RoomConnection {
     if (message.type === 'game.state') {
       const incoming = message.payload;
       const currentGame = this.state.game;
+      const incomingRevision = incoming.revision ?? incoming.stepNumber * 10;
 
-      if (currentGame && currentGame.matchId === incoming.matchId && incoming.stepNumber < currentGame.stepNumber) {
-        return;
+      if (currentGame && currentGame.matchId === incoming.matchId) {
+        if (incomingRevision < currentGame.revision) {
+          return;
+        }
+        if (incomingRevision === currentGame.revision && incoming.stepNumber < currentGame.stepNumber) {
+          return;
+        }
       }
 
       const startParameters = incoming.startParameters ?? currentGame?.startParameters;
@@ -725,8 +864,13 @@ export class RoomClient implements RoomConnection {
         this.pendingSyncRequestId = null;
       }
 
-      // 同一步的重复广播：更新已确认快照，但不得清除当前在途推测或回退乐观呈现
-      if (currentGame && currentGame.matchId === incoming.matchId && incoming.stepNumber === currentGame.stepNumber) {
+      // 同一步且相同 revision 的重复广播：更新已确认快照，但不得清除当前在途推测或回退乐观呈现
+      if (
+        currentGame &&
+        currentGame.matchId === incoming.matchId &&
+        incoming.stepNumber === currentGame.stepNumber &&
+        incomingRevision === currentGame.revision
+      ) {
         if (currentGame.pendingAction !== null) {
           this.setState({
             ...this.state,
@@ -734,16 +878,20 @@ export class RoomClient implements RoomConnection {
               ...currentGame,
               confirmedState: incoming.state,
               clock: incoming.clock ?? currentGame.clock,
-              settlement: incoming.settlement ?? currentGame.settlement,
-              revision: incoming.revision ?? currentGame.revision,
+              settlement: incoming.settlement !== undefined ? incoming.settlement : currentGame.settlement,
+              revision: incomingRevision,
+              pendingNegotiation: incoming.pendingNegotiation !== undefined ? incoming.pendingNegotiation : currentGame.pendingNegotiation,
+              drawCooldownUntil: incoming.drawCooldownUntil ?? currentGame.drawCooldownUntil,
+              negotiationEvent: incoming.negotiationEvent !== undefined ? incoming.negotiationEvent : currentGame.negotiationEvent,
             },
           });
           return;
         }
       }
 
+      const isUndoRollback = Boolean(currentGame && incoming.stepNumber < currentGame.stepNumber);
       const isJumpStep = Boolean(currentGame && incoming.stepNumber > currentGame.stepNumber + 1);
-      const isHydration = isExplicitSync || isJumpStep;
+      const isHydration = isExplicitSync || isJumpStep || isUndoRollback;
 
       let pendingAction = currentGame?.pendingAction ?? null;
       let lastAcceptedAction: AcceptedGameAction | null = null;
@@ -792,18 +940,21 @@ export class RoomClient implements RoomConnection {
           matchId: incoming.matchId,
           seed: incoming.seed,
           stepNumber: incoming.stepNumber,
-          revision: incoming.revision ?? incoming.stepNumber * 10,
+          revision: incomingRevision,
           startParameters,
           confirmedState: incoming.state,
           displayState: incoming.state,
           clock: incoming.clock ?? currentGame?.clock ?? null,
-          settlement: incoming.settlement ?? null,
+          settlement: incoming.settlement !== undefined ? incoming.settlement : (currentGame?.settlement ?? null),
           clockOffsetMs: this.clockOffsetMs,
           pendingAction,
           lastError: null,
           lastRejectedReason: null,
           statusNotice: null,
           lastAcceptedAction,
+          pendingNegotiation: incoming.pendingNegotiation !== undefined ? incoming.pendingNegotiation : (currentGame?.pendingNegotiation ?? null),
+          drawCooldownUntil: incoming.drawCooldownUntil ?? currentGame?.drawCooldownUntil ?? {},
+          negotiationEvent: incoming.negotiationEvent !== undefined ? incoming.negotiationEvent : (currentGame?.negotiationEvent ?? null),
         },
       });
       return;

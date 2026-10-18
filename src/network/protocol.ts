@@ -31,8 +31,17 @@ import type { GameStateSnapshot } from '../game/index.js';
 // 线格式使用的领域类型从协议入口统一再导出，调用方无需两个导入源。
 export type { LobbyRejectCode, LobbyState, SidePreference, StartParameters, TimeControlId } from './lobby.js';
 export type { EndgameReason, MatchAction, MatchClockSnapshot, MatchSettlement, MatchSnapshot } from './match.js';
+export type { NegotiationEvent, NegotiationEventType, NegotiationType, PendingNegotiation } from './negotiation.js';
 
-/** v4：增加局时/步时时钟锚点、90 秒断线宽限期、权威终局结算与回厅/再局协议。 */
+import {
+  parseDrawCooldownUntil,
+  parseNegotiationEvent,
+  parsePendingNegotiation,
+  type NegotiationEvent,
+  type PendingNegotiation,
+} from './negotiation.js';
+
+/** v4：增加局时/步时时钟锚点、90 秒断线宽限期、权威终局结算与回厅/再局协议，支持双方协商。 */
 export const PROTOCOL_VERSION = 4;
 
 /** WebSocket 握手路径（房间服务同时在该路径上提供客人页面）。 */
@@ -134,7 +143,25 @@ export type ClientMessage =
       type: 'game.action';
       requestId: string;
       roomId: string;
-      payload: { matchId: string; stepNumber: number; action: MatchAction };
+      payload: { matchId: string; stepNumber: number; revision: number; action: MatchAction };
+    })
+  | (Envelope & {
+      type: 'game.negotiate';
+      requestId: string;
+      roomId: string;
+      payload: { matchId: string; revision: number; kind: 'undo' | 'draw' };
+    })
+  | (Envelope & {
+      type: 'game.negotiate.reply';
+      requestId: string;
+      roomId: string;
+      payload: { matchId: string; negotiationId: string; accept: boolean };
+    })
+  | (Envelope & {
+      type: 'game.resign';
+      requestId: string;
+      roomId: string;
+      payload: { matchId: string; revision: number };
     })
   | (Envelope & {
       type: 'game.sync';
@@ -191,6 +218,9 @@ export type ServerMessage =
         startParameters?: StartParameters;
         clock?: MatchClockSnapshot;
         settlement?: MatchSettlement | null;
+        pendingNegotiation?: PendingNegotiation | null;
+        drawCooldownUntil?: Record<string, number>;
+        negotiationEvent?: NegotiationEvent | null;
       };
     })
   | (Envelope & {
@@ -433,6 +463,13 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
     ) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-action-step-number' };
     }
+    if (
+      typeof payload.revision !== 'number' ||
+      !Number.isSafeInteger(payload.revision) ||
+      payload.revision < 0
+    ) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-action-revision' };
+    }
     const action = parseMatchAction(payload.action);
     if (!action) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-action-action' };
@@ -447,7 +484,111 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
         payload: {
           matchId: payload.matchId,
           stepNumber: payload.stepNumber,
+          revision: payload.revision,
           action,
+        },
+      },
+    };
+  }
+
+  if (message.type === 'game.negotiate') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-negotiate-room-id' };
+    }
+    if (typeof message.requestId !== 'string' || message.requestId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-negotiate-request-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof payload.matchId !== 'string' || payload.matchId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-negotiate-match-id' };
+    }
+    if (
+      typeof payload.revision !== 'number' ||
+      !Number.isSafeInteger(payload.revision) ||
+      payload.revision < 0
+    ) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-negotiate-revision' };
+    }
+    if (payload.kind !== 'undo' && payload.kind !== 'draw') {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-negotiate-kind' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.negotiate',
+        requestId: message.requestId,
+        roomId: message.roomId,
+        payload: {
+          matchId: payload.matchId,
+          revision: payload.revision,
+          kind: payload.kind,
+        },
+      },
+    };
+  }
+
+  if (message.type === 'game.negotiate.reply') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-negotiate-reply-room-id' };
+    }
+    if (typeof message.requestId !== 'string' || message.requestId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-negotiate-reply-request-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof payload.matchId !== 'string' || payload.matchId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-negotiate-reply-match-id' };
+    }
+    if (typeof payload.negotiationId !== 'string' || payload.negotiationId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-negotiate-reply-negotiation-id' };
+    }
+    if (typeof payload.accept !== 'boolean') {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-negotiate-reply-accept' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.negotiate.reply',
+        requestId: message.requestId,
+        roomId: message.roomId,
+        payload: {
+          matchId: payload.matchId,
+          negotiationId: payload.negotiationId,
+          accept: payload.accept,
+        },
+      },
+    };
+  }
+
+  if (message.type === 'game.resign') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-resign-room-id' };
+    }
+    if (typeof message.requestId !== 'string' || message.requestId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-resign-request-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof payload.matchId !== 'string' || payload.matchId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-resign-match-id' };
+    }
+    if (
+      typeof payload.revision !== 'number' ||
+      !Number.isSafeInteger(payload.revision) ||
+      payload.revision < 0
+    ) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-resign-revision' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.resign',
+        requestId: message.requestId,
+        roomId: message.roomId,
+        payload: {
+          matchId: payload.matchId,
+          revision: payload.revision,
         },
       },
     };
@@ -663,6 +804,21 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
           ? null
           : parseMatchSettlement(payload.settlement) ?? undefined
         : undefined;
+    const pendingNegotiation =
+      payload.pendingNegotiation !== undefined
+        ? payload.pendingNegotiation === null
+          ? null
+          : parsePendingNegotiation(payload.pendingNegotiation) ?? undefined
+        : undefined;
+    const drawCooldownUntil = payload.drawCooldownUntil
+      ? parseDrawCooldownUntil(payload.drawCooldownUntil) ?? undefined
+      : undefined;
+    const negotiationEvent =
+      payload.negotiationEvent !== undefined
+        ? payload.negotiationEvent === null
+          ? null
+          : parseNegotiationEvent(payload.negotiationEvent) ?? undefined
+        : undefined;
 
     return {
       ok: true,
@@ -681,6 +837,9 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
           ...(startParameters ? { startParameters } : {}),
           ...(clock ? { clock } : {}),
           ...(settlement !== undefined ? { settlement } : {}),
+          ...(pendingNegotiation !== undefined ? { pendingNegotiation } : {}),
+          ...(drawCooldownUntil !== undefined ? { drawCooldownUntil } : {}),
+          ...(negotiationEvent !== undefined ? { negotiationEvent } : {}),
         },
       },
     };
@@ -912,7 +1071,7 @@ export function buildClientLobbyStart(roomId: string): ClientMessage {
 
 export function buildClientGameAction(
   roomId: string,
-  input: { requestId: string; matchId: string; stepNumber: number; action: MatchAction },
+  input: { requestId: string; matchId: string; stepNumber: number; revision?: number; action: MatchAction },
 ): ClientMessage {
   return {
     version: PROTOCOL_VERSION,
@@ -922,7 +1081,58 @@ export function buildClientGameAction(
     payload: {
       matchId: input.matchId,
       stepNumber: input.stepNumber,
+      revision: input.revision ?? 0,
       action: input.action,
+    },
+  };
+}
+
+export function buildClientGameNegotiate(
+  roomId: string,
+  input: { requestId: string; matchId: string; revision: number; kind: 'undo' | 'draw' },
+): ClientMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.negotiate',
+    requestId: input.requestId,
+    roomId,
+    payload: {
+      matchId: input.matchId,
+      revision: input.revision,
+      kind: input.kind,
+    },
+  };
+}
+
+export function buildClientGameNegotiateReply(
+  roomId: string,
+  input: { requestId: string; matchId: string; negotiationId: string; accept: boolean },
+): ClientMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.negotiate.reply',
+    requestId: input.requestId,
+    roomId,
+    payload: {
+      matchId: input.matchId,
+      negotiationId: input.negotiationId,
+      accept: input.accept,
+    },
+  };
+}
+
+export function buildClientGameResign(
+  roomId: string,
+  input: { requestId: string; matchId: string; revision: number },
+): ClientMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.resign',
+    requestId: input.requestId,
+    roomId,
+    payload: {
+      matchId: input.matchId,
+      revision: input.revision,
     },
   };
 }

@@ -118,6 +118,18 @@ class FakeConnection implements RoomConnection {
     return { ok: true };
   }
 
+  sendGameNegotiate(_kind: 'undo' | 'draw'): { ok: boolean; reason?: string } {
+    return { ok: true };
+  }
+
+  sendGameNegotiateReply(_agree: boolean): { ok: boolean; reason?: string } {
+    return { ok: true };
+  }
+
+  sendGameResign(): { ok: boolean; reason?: string } {
+    return { ok: true };
+  }
+
   requestGameSync(): void {}
 
   emit(state: Partial<ConnectionState>): void {

@@ -24,6 +24,7 @@ export interface BoardProps {
   trace?: TraceFeedback | null;
   perspective?: Perspective;
   hideHeader?: boolean;
+  disabled?: boolean;
 }
 
 type CellState = 'empty' | 'hidden' | 'revealed';
@@ -185,6 +186,7 @@ export function Board({
   perspective = 'red',
   selectedPosition,
   trace = null,
+  disabled = false,
 }: BoardProps) {
   const cells = buildBoardCells(gameState, selectedPosition, legalMoves, flip, perspective);
   const lastMove = findLastMove(gameState);
@@ -192,7 +194,8 @@ export function Board({
 
   return (
     <section
-      className="board-shell"
+      className={`board-shell${disabled ? ' is-disabled' : ''}`}
+      data-disabled={disabled ? 'true' : undefined}
       data-perspective={perspective}
       data-turn={gameState.winner ? 'finished' : gameState.currentTurn}
     >
@@ -222,7 +225,7 @@ export function Board({
         data-perspective={perspective}
       >
         {checkPulse ? <span aria-hidden="true" className="board-check-ripple" data-testid="check-ripple" /> : null}
-        <div className="board" role="grid" aria-label="翻牌中国象棋棋盘" data-perspective={perspective}>
+        <div className={`board${disabled ? ' is-disabled' : ''}`} role="grid" aria-label="翻牌中国象棋棋盘" data-perspective={perspective}>
           <BoardArtwork perspective={perspective} />
           <svg aria-hidden="true" className="board-trace-layer" focusable="false" viewBox="0 0 900 1000">
             {lastMove ? (
@@ -275,7 +278,12 @@ export function Board({
                 data-recent-action={cell.recentAction}
                 data-testid={cell.testId}
                 data-turn-state={cell.turnState}
-                onClick={() => onCellClick(cell.position)}
+                disabled={disabled}
+                onClick={() => {
+                  if (!disabled) {
+                    onCellClick(cell.position);
+                  }
+                }}
                 type="button"
               >
                 <span className="coordinate">{cell.coordinateLabel}</span>

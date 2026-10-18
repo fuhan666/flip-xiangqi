@@ -4,7 +4,7 @@
  * - 权威开局初始化、步数递增、行棋方校验与规则校验；
  * - 可传输的对局快照（去除 undoStack）。
  */
-import { applyAction, createInitialGameState, snapshotState } from '../game/index.js';
+import { applyAction, createInitialGameState, snapshotState, undoLastAction } from '../game/index.js';
 import type { GameAction, GameHistoryEntry, GameState, GameStateSnapshot, Piece, PieceType, Position } from '../game/index.js';
 import { parseStartParameters, type StartParameters } from './lobby.js';
 import {
@@ -15,6 +15,13 @@ import {
   type MatchClockSnapshot,
   type MatchSettlement,
 } from './match-clock.js';
+import {
+  parseDrawCooldownUntil,
+  parseNegotiationEvent,
+  parsePendingNegotiation,
+  type NegotiationEvent,
+  type PendingNegotiation,
+} from './negotiation.js';
 
 export {
   parseMatchClockSnapshot,
@@ -23,6 +30,14 @@ export {
   type MatchClockSnapshot,
   type MatchSettlement,
 } from './match-clock.js';
+
+export {
+  parseDrawCooldownUntil,
+  parseNegotiationEvent,
+  parsePendingNegotiation,
+  type NegotiationEvent,
+  type PendingNegotiation,
+} from './negotiation.js';
 
 export function createSeededRng(seed: number): () => number {
   let state = seed >>> 0;
@@ -45,6 +60,9 @@ export interface MatchState {
   gameState: GameState;
   clock: MatchClock;
   settlement: MatchSettlement | null;
+  pendingNegotiation: PendingNegotiation | null;
+  drawCooldownUntil: Record<string, number>;
+  negotiationEvent: NegotiationEvent | null;
 }
 
 export interface MatchSnapshot {
@@ -56,6 +74,9 @@ export interface MatchSnapshot {
   gameState: GameStateSnapshot;
   clock: MatchClockSnapshot;
   settlement: MatchSettlement | null;
+  pendingNegotiation: PendingNegotiation | null;
+  drawCooldownUntil: Record<string, number>;
+  negotiationEvent: NegotiationEvent | null;
 }
 
 export function isValidCoordinate(x: unknown, y: unknown): x is number {
@@ -290,6 +311,9 @@ export function parseMatchSnapshot(value: unknown): MatchSnapshot | null {
   }
 
   const settlement = raw.settlement ? parseMatchSettlement(raw.settlement) : null;
+  const pendingNegotiation = raw.pendingNegotiation ? parsePendingNegotiation(raw.pendingNegotiation) : null;
+  const drawCooldownUntil = raw.drawCooldownUntil ? parseDrawCooldownUntil(raw.drawCooldownUntil) ?? {} : {};
+  const negotiationEvent = raw.negotiationEvent ? parseNegotiationEvent(raw.negotiationEvent) : null;
 
   return {
     matchId: raw.matchId,
@@ -300,6 +324,9 @@ export function parseMatchSnapshot(value: unknown): MatchSnapshot | null {
     gameState,
     clock,
     settlement,
+    pendingNegotiation,
+    drawCooldownUntil,
+    negotiationEvent,
   };
 }
 
@@ -330,6 +357,9 @@ export function createMatch(input: {
     gameState,
     clock,
     settlement: null,
+    pendingNegotiation: null,
+    drawCooldownUntil: {},
+    negotiationEvent: null,
   };
 }
 
@@ -343,6 +373,9 @@ export function snapshotMatch(match: MatchState, now?: number): MatchSnapshot {
     gameState: snapshotState(match.gameState),
     clock: match.clock.getSnapshot(now),
     settlement: match.settlement ?? match.clock.getSettlement(),
+    pendingNegotiation: match.pendingNegotiation,
+    drawCooldownUntil: { ...match.drawCooldownUntil },
+    negotiationEvent: match.negotiationEvent,
   };
 }
 
@@ -358,6 +391,10 @@ export function applyMatchAction(
 ): MatchActionResult {
   if (match.settlement !== null || match.gameState.winner !== null) {
     return { ok: false, reason: '对局已经结束，请重新开局' };
+  }
+
+  if (match.pendingNegotiation !== null) {
+    return { ok: false, reason: '协商正在进行中，棋盘操作已锁定' };
   }
 
   // 1. 先进行时钟结算与超时判定
@@ -385,6 +422,9 @@ export function applyMatchAction(
   if (nextGameState.lastError) {
     return { ok: false, reason: nextGameState.lastError };
   }
+
+  // 成功动作在 advance 扣除该步思考时间后、切换回合前，保存服务端专用时钟检查点
+  match.clock.saveCheckpoint();
 
   // 行动成功推进时钟
   match.clock.onAction(now);
@@ -415,15 +455,53 @@ export function applyMatchAction(
 
 export function finalizeMatch(
   match: MatchState,
-  winner: 'red' | 'black',
+  winner: 'red' | 'black' | null,
   reason: EndgameReason,
   now?: number,
 ): MatchState {
+  if (winner === null) {
+    return finalizeMatchDraw(match, reason, now);
+  }
   const settlement = match.clock.finalize(winner, reason, now);
   match.gameState.winner = winner;
   return {
     ...match,
     revision: match.revision + 1,
     settlement,
+  };
+}
+
+export function finalizeMatchDraw(
+  match: MatchState,
+  reason: EndgameReason = 'draw-agreement',
+  now?: number,
+): MatchState {
+  const settlement = match.clock.finalizeDraw(reason, now);
+  match.gameState.statusMessage = '双方握手言和，平局';
+  return {
+    ...match,
+    revision: match.revision + 1,
+    settlement,
+  };
+}
+
+export function undoMatchAction(
+  match: MatchState,
+  now?: number,
+): { ok: true; match: MatchState } | { ok: false; reason: string } {
+  if (match.gameState.actionHistory.length === 0) {
+    return { ok: false, reason: '开局暂无走子记录，无法悔棋' };
+  }
+  const nextGameState = undoLastAction(match.gameState);
+  match.clock.undoLastAction(now);
+  return {
+    ok: true,
+    match: {
+      ...match,
+      stepNumber: Math.max(0, match.stepNumber - 1),
+      revision: match.revision + 1,
+      gameState: nextGameState,
+      settlement: null,
+    },
   };
 }

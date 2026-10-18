@@ -9,3 +9,5 @@ vitest.config.js
 vitest.config.d.ts
 test-results/
 playwright-report/
+attachments/
+evidence/
