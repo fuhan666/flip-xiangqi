@@ -7,6 +7,22 @@
 import { applyAction, createInitialGameState, snapshotState } from '../game/index.js';
 import type { GameAction, GameHistoryEntry, GameState, GameStateSnapshot, Piece, PieceType, Position } from '../game/index.js';
 import { parseStartParameters, type StartParameters } from './lobby.js';
+import {
+  MatchClock,
+  parseMatchClockSnapshot,
+  parseMatchSettlement,
+  type EndgameReason,
+  type MatchClockSnapshot,
+  type MatchSettlement,
+} from './match-clock.js';
+
+export {
+  parseMatchClockSnapshot,
+  parseMatchSettlement,
+  type EndgameReason,
+  type MatchClockSnapshot,
+  type MatchSettlement,
+} from './match-clock.js';
 
 export function createSeededRng(seed: number): () => number {
   let state = seed >>> 0;
@@ -24,16 +40,22 @@ export interface MatchState {
   matchId: string;
   seed: number;
   stepNumber: number;
+  revision: number;
   startParameters: StartParameters;
   gameState: GameState;
+  clock: MatchClock;
+  settlement: MatchSettlement | null;
 }
 
 export interface MatchSnapshot {
   matchId: string;
   seed: number;
   stepNumber: number;
+  revision: number;
   startParameters: StartParameters;
   gameState: GameStateSnapshot;
+  clock: MatchClockSnapshot;
+  settlement: MatchSettlement | null;
 }
 
 export function isValidCoordinate(x: unknown, y: unknown): x is number {
@@ -235,6 +257,11 @@ export function parseMatchSnapshot(value: unknown): MatchSnapshot | null {
     return null;
   }
 
+  const revision =
+    typeof raw.revision === 'number' && Number.isSafeInteger(raw.revision) && raw.revision >= 0
+      ? raw.revision
+      : 0;
+
   const startParameters = parseStartParameters(raw.startParameters);
   if (!startParameters) {
     return null;
@@ -245,12 +272,34 @@ export function parseMatchSnapshot(value: unknown): MatchSnapshot | null {
     return null;
   }
 
+  let clock: MatchClockSnapshot | null = null;
+  if (raw.clock) {
+    clock = parseMatchClockSnapshot(raw.clock);
+    if (!clock) {
+      return null;
+    }
+  } else {
+    // 兼容可能省略 clock 的测试数据
+    const hostSeat = startParameters.players.find((p) => p.role === 'host');
+    const dummyClock = new MatchClock({
+      baseTimeSeconds: startParameters.baseTimeSeconds,
+      incrementSeconds: startParameters.incrementSeconds,
+      hostSide: hostSeat?.side ?? 'red',
+    });
+    clock = dummyClock.getSnapshot();
+  }
+
+  const settlement = raw.settlement ? parseMatchSettlement(raw.settlement) : null;
+
   return {
     matchId: raw.matchId,
     seed: raw.seed,
     stepNumber: raw.stepNumber,
+    revision,
     startParameters,
     gameState,
+    clock,
+    settlement,
   };
 }
 
@@ -258,26 +307,42 @@ export function createMatch(input: {
   matchId: string;
   seed: number;
   startParameters: StartParameters;
+  nowFn?: () => number;
+  initialTime?: number;
 }): MatchState {
   const rng = createSeededRng(input.seed);
   const gameState = createInitialGameState(rng);
+  const hostSeat = input.startParameters.players.find((seat) => seat.role === 'host');
+  const clock = new MatchClock({
+    baseTimeSeconds: input.startParameters.baseTimeSeconds,
+    incrementSeconds: input.startParameters.incrementSeconds,
+    hostSide: hostSeat?.side ?? 'red',
+    nowFn: input.nowFn,
+    initialTime: input.initialTime,
+  });
 
   return {
     matchId: input.matchId,
     seed: input.seed,
     stepNumber: 0,
+    revision: 0,
     startParameters: input.startParameters,
     gameState,
+    clock,
+    settlement: null,
   };
 }
 
-export function snapshotMatch(match: MatchState): MatchSnapshot {
+export function snapshotMatch(match: MatchState, now?: number): MatchSnapshot {
   return {
     matchId: match.matchId,
     seed: match.seed,
     stepNumber: match.stepNumber,
+    revision: match.revision,
     startParameters: match.startParameters,
     gameState: snapshotState(match.gameState),
+    clock: match.clock.getSnapshot(now),
+    settlement: match.settlement ?? match.clock.getSettlement(),
   };
 }
 
@@ -289,9 +354,23 @@ export function applyMatchAction(
   match: MatchState,
   actorMemberId: string,
   action: GameAction,
+  now?: number,
 ): MatchActionResult {
-  if (match.gameState.winner !== null) {
+  if (match.settlement !== null || match.gameState.winner !== null) {
     return { ok: false, reason: '对局已经结束，请重新开局' };
+  }
+
+  // 1. 先进行时钟结算与超时判定
+  const advanceResult = match.clock.advance(now);
+  if (advanceResult.timeoutResult) {
+    match.settlement = advanceResult.timeoutResult;
+    match.gameState.winner = advanceResult.timeoutResult.winner;
+    match.revision++;
+    return { ok: false, reason: '对局已超时结束' };
+  }
+
+  if (match.clock.isPaused) {
+    return { ok: false, reason: '对手已离线，暂无法操作' };
   }
 
   const currentTurn = match.gameState.currentTurn;
@@ -307,15 +386,44 @@ export function applyMatchAction(
     return { ok: false, reason: nextGameState.lastError };
   }
 
+  // 行动成功推进时钟
+  match.clock.onAction(now);
+
+  let settlement: MatchSettlement | null = match.settlement;
+  if (nextGameState.winner !== null) {
+    const isKingCapture = nextGameState.recentAction?.consequences.some(
+      (c) => c.type === 'endgame' && c.reason === 'king-captured',
+    );
+    const reason: EndgameReason = isKingCapture ? 'king-captured' : 'checkmate';
+    settlement = match.clock.finalize(nextGameState.winner, reason, now);
+  }
+
   const nextMatch: MatchState = {
     ...match,
     stepNumber: match.stepNumber + 1,
+    revision: match.revision + 1,
     gameState: nextGameState,
+    settlement,
   };
 
   return {
     ok: true,
     match: nextMatch,
     resultingAction: nextGameState.recentAction!,
+  };
+}
+
+export function finalizeMatch(
+  match: MatchState,
+  winner: 'red' | 'black',
+  reason: EndgameReason,
+  now?: number,
+): MatchState {
+  const settlement = match.clock.finalize(winner, reason, now);
+  match.gameState.winner = winner;
+  return {
+    ...match,
+    revision: match.revision + 1,
+    settlement,
   };
 }

@@ -6,9 +6,11 @@ import {
   buildClientHello,
   buildClientLeave,
   buildClientLobbyReady,
+  buildClientLobbyReturn,
   buildClientLobbySettings,
   buildPing,
   buildPong,
+  buildServerGameClock,
   buildServerMessage,
   closeCodeForError,
   encodeMessage,
@@ -405,6 +407,83 @@ describe('heartbeat and session resumption envelopes', () => {
     if (parsedRejected.ok && parsedRejected.message.type === 'game.rejected') {
       expect(parsedRejected.message.payload.reason).toBe('非己方回合');
       expect(parsedRejected.message.payload.stepNumber).toBe(0);
+    }
+
+    // lobby.return
+    const clientReturn = encodeMessage(buildClientLobbyReturn('room-1', { matchId: 'm1', intent: 'rematch' }));
+    const parsedReturn = parseClientMessage(clientReturn);
+    expect(parsedReturn.ok).toBe(true);
+    if (parsedReturn.ok && parsedReturn.message.type === 'lobby.return') {
+      expect(parsedReturn.message.payload.intent).toBe('rematch');
+      expect(parsedReturn.message.payload.matchId).toBe('m1');
+    }
+
+    const badReturn = parseClientMessage(
+      JSON.stringify({ version: PROTOCOL_VERSION, type: 'lobby.return', roomId: 'r1', payload: { matchId: 'm1', intent: 'cheat' } }),
+    );
+    expect(badReturn.ok).toBe(false);
+
+    // game.clock
+    const clockSnap = {
+      turn: 'red' as const,
+      paused: false,
+      red: { baseTimeRemainingMs: 1000, stepTimeRemainingMs: 50, accumulatedDurationMs: 200 },
+      black: { baseTimeRemainingMs: 2000, stepTimeRemainingMs: 60, accumulatedDurationMs: 100 },
+      serverTime: 5000,
+      sampleSeq: 4,
+      disconnectGrace: null,
+    };
+    const serverClock = buildServerMessage(
+      buildServerGameClock('room-1', {
+        matchId: 'm1',
+        revision: 2,
+        sampleSeq: 4,
+        clock: clockSnap,
+      }),
+    );
+    const parsedClock = parseServerMessage(serverClock);
+    expect(parsedClock.ok).toBe(true);
+    if (parsedClock.ok && parsedClock.message.type === 'game.clock') {
+      expect(parsedClock.message.payload.revision).toBe(2);
+      expect(parsedClock.message.payload.clock.turn).toBe('red');
+    }
+
+    // game.state with revision, clock, settlement
+    const serverStateWithClock = buildServerMessage({
+      type: 'game.state',
+      roomId: 'room-1',
+      payload: {
+        matchId: 'match-1',
+        seed: 1234,
+        stepNumber: 3,
+        revision: 5,
+        state: {
+          currentTurn: 'red',
+          winner: 'black',
+          checkedCamp: null,
+          lastError: null,
+          statusMessage: '黑方获胜',
+          pieces: [],
+          actionHistory: [],
+          recentAction: null,
+        },
+        clock: clockSnap,
+        settlement: {
+          winner: 'black',
+          loser: 'red',
+          reason: 'step-timeout',
+          redDurationSeconds: 60,
+          blackDurationSeconds: 15,
+          endedAt: 6000,
+        },
+      },
+    });
+    const parsedStateWithClock = parseServerMessage(serverStateWithClock);
+    expect(parsedStateWithClock.ok).toBe(true);
+    if (parsedStateWithClock.ok && parsedStateWithClock.message.type === 'game.state') {
+      expect(parsedStateWithClock.message.payload.revision).toBe(5);
+      expect(parsedStateWithClock.message.payload.settlement?.reason).toBe('step-timeout');
+      expect(parsedStateWithClock.message.payload.clock?.turn).toBe('red');
     }
   });
 });

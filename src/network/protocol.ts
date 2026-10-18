@@ -18,18 +18,22 @@ import {
 import {
   parseGameStateSnapshot,
   parseMatchAction,
+  parseMatchClockSnapshot,
+  parseMatchSettlement,
   parseMatchSnapshot,
   type MatchAction,
+  type MatchClockSnapshot,
+  type MatchSettlement,
   type MatchSnapshot,
 } from './match.js';
 import type { GameStateSnapshot } from '../game/index.js';
 
 // 线格式使用的领域类型从协议入口统一再导出，调用方无需两个导入源。
 export type { LobbyRejectCode, LobbyState, SidePreference, StartParameters, TimeControlId } from './lobby.js';
-export type { MatchAction, MatchSnapshot } from './match.js';
+export type { EndgameReason, MatchAction, MatchClockSnapshot, MatchSettlement, MatchSnapshot } from './match.js';
 
-/** v3：增加 game.action、game.state、game.rejected、game.sync 权威对局协议。 */
-export const PROTOCOL_VERSION = 3;
+/** v4：增加局时/步时时钟锚点、90 秒断线宽限期、权威终局结算与回厅/再局协议。 */
+export const PROTOCOL_VERSION = 4;
 
 /** WebSocket 握手路径（房间服务同时在该路径上提供客人页面）。 */
 export const WS_PATH = '/ws';
@@ -115,12 +119,17 @@ export interface HelloPayload {
 export type ClientMessage =
   | (Envelope & { type: 'hello'; roomId: null | string; payload: HelloPayload })
   | (Envelope & { type: 'leave'; roomId: string; payload: Record<string, never> })
-  | (Envelope & { type: 'ping'; roomId: string; payload: { seq: number } })
-  | (Envelope & { type: 'pong'; roomId: string; payload: { seq: number } })
+  | (Envelope & { type: 'ping'; roomId: string; payload: { seq: number; clientTime?: number } })
+  | (Envelope & { type: 'pong'; roomId: string; payload: { seq: number; serverReceiveTime?: number; serverSendTime?: number } })
   | (Envelope & { type: 'lobby.settings'; roomId: string; payload: { sidePreference: SidePreference; timeControlId: TimeControlId } })
   | (Envelope & { type: 'lobby.lock'; roomId: string; payload: { locked: boolean } })
   | (Envelope & { type: 'lobby.ready'; roomId: string; payload: { ready: boolean; settingsVersion: number } })
   | (Envelope & { type: 'lobby.start'; roomId: string; payload: Record<string, never> })
+  | (Envelope & {
+      type: 'lobby.return';
+      roomId: string;
+      payload: { matchId: string; intent: 'return-lobby' | 'rematch' };
+    })
   | (Envelope & {
       type: 'game.action';
       requestId: string;
@@ -154,10 +163,20 @@ export type ServerMessage =
       };
     })
   | (Envelope & { type: 'members'; roomId: string; payload: { members: MemberSnapshot[] } })
-  | (Envelope & { type: 'ping'; roomId: string; payload: { seq: number } })
-  | (Envelope & { type: 'pong'; roomId: string; payload: { seq: number } })
+  | (Envelope & { type: 'ping'; roomId: string; payload: { seq: number; serverTime?: number } })
+  | (Envelope & { type: 'pong'; roomId: string; payload: { seq: number; serverReceiveTime?: number; serverSendTime?: number } })
   | (Envelope & { type: 'lobby.state'; roomId: string; payload: { lobby: LobbyState } })
   | (Envelope & { type: 'lobby.rejected'; roomId: string; payload: LobbyRejection })
+  | (Envelope & {
+      type: 'game.clock';
+      roomId: string;
+      payload: {
+        matchId: string;
+        revision: number;
+        sampleSeq: number;
+        clock: MatchClockSnapshot;
+      };
+    })
   | (Envelope & {
       type: 'game.state';
       roomId: string;
@@ -165,10 +184,13 @@ export type ServerMessage =
         matchId: string;
         seed: number;
         stepNumber: number;
+        revision?: number;
         state: GameStateSnapshot;
         actorMemberId?: string;
         action?: MatchAction;
         startParameters?: StartParameters;
+        clock?: MatchClockSnapshot;
+        settlement?: MatchSettlement | null;
       };
     })
   | (Envelope & {
@@ -285,9 +307,29 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
     if (typeof payload.seq !== 'number' || !Number.isInteger(payload.seq) || payload.seq < 0) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: `${message.type}-seq` };
     }
+    const clientTime =
+      typeof payload.clientTime === 'number' && Number.isFinite(payload.clientTime) ? payload.clientTime : undefined;
+    const serverReceiveTime =
+      typeof payload.serverReceiveTime === 'number' && Number.isFinite(payload.serverReceiveTime)
+        ? payload.serverReceiveTime
+        : undefined;
+    const serverSendTime =
+      typeof payload.serverSendTime === 'number' && Number.isFinite(payload.serverSendTime)
+        ? payload.serverSendTime
+        : undefined;
     return {
       ok: true,
-      message: { ...message, type: message.type, roomId: message.roomId, payload: { seq: payload.seq } },
+      message: {
+        ...message,
+        type: message.type,
+        roomId: message.roomId,
+        payload: {
+          seq: payload.seq,
+          ...(clientTime !== undefined ? { clientTime } : {}),
+          ...(serverReceiveTime !== undefined ? { serverReceiveTime } : {}),
+          ...(serverSendTime !== undefined ? { serverSendTime } : {}),
+        },
+      },
     };
   }
 
@@ -296,6 +338,28 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'leave-room-id' };
     }
     return { ok: true, message: { ...message, type: 'leave', roomId: message.roomId, payload: {} } };
+  }
+
+  if (message.type === 'lobby.return') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'lobby-return-room-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof payload.matchId !== 'string' || payload.matchId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'lobby-return-match-id' };
+    }
+    if (payload.intent !== 'return-lobby' && payload.intent !== 'rematch') {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'lobby-return-intent' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'lobby.return',
+        roomId: message.roomId,
+        payload: { matchId: payload.matchId, intent: payload.intent },
+      },
+    };
   }
 
   if (message.type === 'lobby.settings') {
@@ -463,9 +527,29 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     if (typeof payload.seq !== 'number' || !Number.isInteger(payload.seq) || payload.seq < 0) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: `${message.type}-seq` };
     }
+    const serverTime =
+      typeof payload.serverTime === 'number' && Number.isFinite(payload.serverTime) ? payload.serverTime : undefined;
+    const serverReceiveTime =
+      typeof payload.serverReceiveTime === 'number' && Number.isFinite(payload.serverReceiveTime)
+        ? payload.serverReceiveTime
+        : undefined;
+    const serverSendTime =
+      typeof payload.serverSendTime === 'number' && Number.isFinite(payload.serverSendTime)
+        ? payload.serverSendTime
+        : undefined;
     return {
       ok: true,
-      message: { ...message, type: message.type, roomId: message.roomId, payload: { seq: payload.seq } },
+      message: {
+        ...message,
+        type: message.type,
+        roomId: message.roomId,
+        payload: {
+          seq: payload.seq,
+          ...(serverTime !== undefined ? { serverTime } : {}),
+          ...(serverReceiveTime !== undefined ? { serverReceiveTime } : {}),
+          ...(serverSendTime !== undefined ? { serverSendTime } : {}),
+        },
+      },
     };
   }
 
@@ -502,6 +586,40 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     return { ok: true, message: { ...message, type: 'members', roomId: message.roomId, payload: { members } } };
   }
 
+  if (message.type === 'game.clock') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-clock-room-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof payload.matchId !== 'string' || payload.matchId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-clock-match-id' };
+    }
+    if (typeof payload.revision !== 'number' || !Number.isSafeInteger(payload.revision) || payload.revision < 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-clock-revision' };
+    }
+    if (typeof payload.sampleSeq !== 'number' || !Number.isInteger(payload.sampleSeq) || payload.sampleSeq < 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-clock-sample-seq' };
+    }
+    const clock = parseMatchClockSnapshot(payload.clock);
+    if (!clock) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-clock-clock' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.clock',
+        roomId: message.roomId,
+        payload: {
+          matchId: payload.matchId,
+          revision: payload.revision,
+          sampleSeq: payload.sampleSeq,
+          clock,
+        },
+      },
+    };
+  }
+
   if (message.type === 'game.state') {
     if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-room-id' };
@@ -525,6 +643,10 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     ) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-step-number' };
     }
+    const revision =
+      typeof payload.revision === 'number' && Number.isSafeInteger(payload.revision) && payload.revision >= 0
+        ? payload.revision
+        : 0;
     const state = parseGameStateSnapshot(payload.state);
     if (!state) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-state' };
@@ -534,6 +656,14 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     const startParameters = payload.startParameters
       ? parseStartParameters(payload.startParameters) ?? undefined
       : undefined;
+    const clock = payload.clock ? parseMatchClockSnapshot(payload.clock) ?? undefined : undefined;
+    const settlement =
+      payload.settlement !== undefined
+        ? payload.settlement === null
+          ? null
+          : parseMatchSettlement(payload.settlement) ?? undefined
+        : undefined;
+
     return {
       ok: true,
       message: {
@@ -544,10 +674,13 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
           matchId: payload.matchId,
           seed: payload.seed,
           stepNumber: payload.stepNumber,
+          revision,
           state,
           ...(actorMemberId ? { actorMemberId } : {}),
           ...(action ? { action } : {}),
           ...(startParameters ? { startParameters } : {}),
+          ...(clock ? { clock } : {}),
+          ...(settlement !== undefined ? { settlement } : {}),
         },
       },
     };
@@ -691,16 +824,66 @@ export function buildClientHello(input: {
   };
 }
 
-export function buildPing(roomId: string, seq: number): ClientMessage & ServerMessage {
-  return { version: PROTOCOL_VERSION, type: 'ping', roomId, payload: { seq } };
+export function buildPing(
+  roomId: string,
+  seq: number,
+  timing?: { clientTime?: number; serverTime?: number },
+): ClientMessage & ServerMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'ping',
+    roomId,
+    payload: {
+      seq,
+      ...(timing?.clientTime !== undefined ? { clientTime: timing.clientTime } : {}),
+      ...(timing?.serverTime !== undefined ? { serverTime: timing.serverTime } : {}),
+    },
+  };
 }
 
-export function buildPong(roomId: string, seq: number): ClientMessage & ServerMessage {
-  return { version: PROTOCOL_VERSION, type: 'pong', roomId, payload: { seq } };
+export function buildPong(
+  roomId: string,
+  seq: number,
+  timing?: { serverReceiveTime?: number; serverSendTime?: number },
+): ClientMessage & ServerMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'pong',
+    roomId,
+    payload: {
+      seq,
+      ...(timing?.serverReceiveTime !== undefined ? { serverReceiveTime: timing.serverReceiveTime } : {}),
+      ...(timing?.serverSendTime !== undefined ? { serverSendTime: timing.serverSendTime } : {}),
+    },
+  };
 }
 
 export function buildClientLeave(roomId: string): ClientMessage {
   return { version: PROTOCOL_VERSION, type: 'leave', roomId, payload: {} };
+}
+
+export function buildClientLobbyReturn(
+  roomId: string,
+  payload: { matchId: string; intent: 'return-lobby' | 'rematch' },
+): ClientMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'lobby.return',
+    roomId,
+    payload,
+  };
+}
+
+export function buildServerGameClock(
+  roomId: string,
+  payload: { matchId: string; revision: number; sampleSeq: number; clock: MatchClockSnapshot },
+): ServerMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.clock',
+    roomId,
+    payload,
+  };
 }
 
 export function buildClientLobbySettings(

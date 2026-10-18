@@ -112,6 +112,8 @@ class FakeConnection implements RoomConnection {
     this.setState({ ...this.state, pendingCommand: 'start', lastRejection: null });
   }
 
+  sendLobbyReturn(_intent: 'return-lobby' | 'rematch'): void {}
+
   sendGameAction(_action: MatchAction): { ok: boolean; reason?: string } {
     return { ok: true };
   }

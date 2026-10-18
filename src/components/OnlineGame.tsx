@@ -3,9 +3,12 @@ import type { Camp, GameHistoryConsequence, GameHistoryEndgameReason, GameState,
 import { getPieceAt, listLegalMoves, restoreState } from '../game/index.js';
 import type { ConnectionState, RoomConnection } from '../network/client.js';
 import { findTimeControl } from '../network/lobby.js';
+import type { MatchSettlement } from '../network/protocol.js';
 import { Board } from './Board.js';
 import { CapturedPieces } from './CapturedPieces.js';
+import { GameResultDialog } from './GameResultDialog.js';
 import { MoveHistory, actionSummary, campLabel } from './MoveHistory.js';
+import { PlayerClock } from './PlayerClock.js';
 import { StatusPanel } from './StatusPanel.js';
 import { ConnectionStatus } from './rooms/ConnectionStatus.js';
 import type { LegalMoveHint } from './useBoardFeedback.js';
@@ -64,6 +67,8 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
   const [selectedPosition, setSelectedPosition] = useState<Position | null>(null);
   const [interactionMessage, setInteractionMessage] = useState<string | null>(null);
   const [shuffling, setShuffling] = useState(true);
+  const [showCheckToast, setShowCheckToast] = useState(false);
+  const [, setGraceTick] = useState(0);
 
   // 首次开局短暂展示 ≤0.5 秒「洗牌中…」
   useEffect(() => {
@@ -99,6 +104,59 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
 
   const feedback = useOnlineBoardFeedback(rawGameState, game.lastAcceptedAction);
   const displayState = feedback.displayState;
+
+  // 1.5 秒将军横幅提示
+  useEffect(() => {
+    if (displayState.checkedCamp !== null) {
+      setShowCheckToast(true);
+      const timer = window.setTimeout(() => {
+        setShowCheckToast(false);
+      }, 1500);
+      return () => window.clearTimeout(timer);
+    } else {
+      setShowCheckToast(false);
+    }
+  }, [displayState.checkedCamp, displayState.actionHistory.length]);
+
+  // 90秒断线宽限期倒计时
+  const clock = game.clock;
+  const isGraceActive = Boolean(
+    clock?.paused &&
+    clock?.disconnectGrace &&
+    (clock.disconnectGrace.hostDeadlineMs !== null || clock.disconnectGrace.guestDeadlineMs !== null),
+  );
+  const graceDeadline = clock?.disconnectGrace?.guestDeadlineMs ?? clock?.disconnectGrace?.hostDeadlineMs ?? null;
+
+  useEffect(() => {
+    if (!isGraceActive) {
+      return;
+    }
+    const interval = setInterval(() => setGraceTick((t) => t + 1), 500);
+    return () => clearInterval(interval);
+  }, [isGraceActive]);
+
+  const graceSecondsRemaining = graceDeadline
+    ? Math.max(0, Math.ceil((graceDeadline - (Date.now() + (game.clockOffsetMs ?? 0))) / 1000))
+    : 90;
+
+  // 权威终局结算数据
+  const settlement: MatchSettlement | null = useMemo(() => {
+    if (game.settlement) {
+      return game.settlement;
+    }
+    if (displayState.winner) {
+      const endgameConsequence = displayState.recentAction?.consequences.find(isEndgameConsequence);
+      return {
+        winner: displayState.winner,
+        loser: displayState.winner === 'red' ? 'black' : 'red',
+        reason: (endgameConsequence as any)?.reason ?? 'checkmate',
+        redDurationSeconds: Math.floor((game.clock?.red.accumulatedDurationMs ?? 0) / 1000),
+        blackDurationSeconds: Math.floor((game.clock?.black.accumulatedDurationMs ?? 0) / 1000),
+        endedAt: Date.now(),
+      };
+    }
+    return null;
+  }, [game.settlement, displayState.winner, displayState.recentAction, game.clock]);
 
   const isMyTurn = displayState.winner === null && displayState.currentTurn === mySide;
   const isBusy = game.pendingAction !== null || connection.reconnecting;
@@ -263,8 +321,36 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
                 {opponentConnected ? '在线' : '已掉线'}
               </span>
             </span>
+
+            <PlayerClock
+              clockOffsetMs={game.clockOffsetMs}
+              clockSnapshot={game.clock}
+              isCurrentTurn={displayState.winner === null && displayState.currentTurn === opponentSide}
+              isPaused={Boolean(game.clock?.paused)}
+              label={opponentName}
+              side={opponentSide}
+              timeControlId={startParameters.timeControlId}
+            />
+
             <ConnectionStatus rtt={connection.rtt} status={connection.status} />
           </header>
+
+          {isGraceActive ? (
+            <div className="disconnect-grace-banner" data-testid="disconnect-grace-banner" role="status">
+              <span className="grace-pulse-dot" />
+              <span>
+                {opponentConnected
+                  ? '己方网络出现波动，对局时钟已暂停…'
+                  : `对手已掉线，对局时钟暂停中。等待重连（剩余 ${graceSecondsRemaining} 秒，共 90 秒）…`}
+              </span>
+            </div>
+          ) : null}
+
+          {showCheckToast ? (
+            <div className="check-toast-banner" data-testid="check-toast" role="alert">
+              将军！
+            </div>
+          ) : null}
 
           {shuffling ? (
             <div className="shuffling-banner" data-testid="shuffling-banner">
@@ -311,6 +397,16 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
               </span>
             </span>
 
+            <PlayerClock
+              clockOffsetMs={game.clockOffsetMs}
+              clockSnapshot={game.clock}
+              isCurrentTurn={isMyTurn}
+              isPaused={Boolean(game.clock?.paused)}
+              label={selfName}
+              side={mySide}
+              timeControlId={startParameters.timeControlId}
+            />
+
             <div className="online-turn-center">
               <span className="turn-indicator" data-testid="turn-indicator">
                 {turnLabel}
@@ -355,6 +451,15 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
           <CapturedPieces gameState={displayState} />
         </aside>
       </div>
+
+      {settlement ? (
+        <GameResultDialog
+          onRematch={() => client.sendLobbyReturn('rematch')}
+          onReturnLobby={() => client.sendLobbyReturn('return-lobby')}
+          settlement={settlement}
+          viewerSide={mySide}
+        />
+      ) : null}
     </div>
   );
 }

@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { OnlineGame } from '../OnlineGame.js';
-import type { ConnectionState, RoomConnection } from '../../network/client.js';
+import type { ConnectionState, GameClientState, RoomConnection } from '../../network/client.js';
 import { buildStartParameters, createLobbyState } from '../../network/lobby.js';
 import { createMatch, snapshotMatch } from '../../network/match.js';
 import { IDLE_CONNECTION_STATE } from '../rooms/connection-state.js';
@@ -27,6 +27,27 @@ describe('OnlineGame component', () => {
     return { startParameters, match, snapshot: snapshotMatch(match) };
   }
 
+  function buildTestGame(startParameters: any, snapshot: any, overrides: Partial<GameClientState> = {}): GameClientState {
+    return {
+      matchId: 'm1',
+      seed: 12345,
+      stepNumber: 0,
+      revision: 0,
+      startParameters,
+      confirmedState: snapshot.gameState,
+      displayState: snapshot.gameState,
+      clock: snapshot.clock,
+      settlement: null,
+      clockOffsetMs: 0,
+      pendingAction: null,
+      lastError: null,
+      lastRejectedReason: null,
+      statusNotice: null,
+      lastAcceptedAction: null,
+      ...overrides,
+    };
+  }
+
   it('renders start summary, snapshot, turn indicator, step counter, and shuffling banner', () => {
     const { startParameters, snapshot } = createTestMatch(true);
     const lobby = createLobbyState();
@@ -40,19 +61,7 @@ describe('OnlineGame component', () => {
       memberId: 'host-1',
       role: 'host',
       lobby,
-      game: {
-        matchId: 'm1',
-        seed: 12345,
-        stepNumber: 0,
-        startParameters,
-        confirmedState: snapshot.gameState,
-        displayState: snapshot.gameState,
-        pendingAction: null,
-        lastError: null,
-        lastRejectedReason: null,
-        statusNotice: null,
-        lastAcceptedAction: null,
-      },
+      game: buildTestGame(startParameters, snapshot),
     };
 
     const mockClient = {
@@ -92,19 +101,11 @@ describe('OnlineGame component', () => {
       memberId: 'host-1',
       role: 'host',
       lobby,
-      game: {
-        matchId: 'm1',
-        seed: 12345,
-        stepNumber: 0,
-        startParameters,
-        confirmedState: snapshot.gameState,
-        displayState: snapshot.gameState,
-        pendingAction: null,
+      game: buildTestGame(startParameters, snapshot, {
         lastError: '非法操作',
         lastRejectedReason: '非法操作',
         statusNotice: '你的操作未被采纳，请重新操作',
-        lastAcceptedAction: null,
-      },
+      }),
     };
 
     const mockClient = {
@@ -133,19 +134,7 @@ describe('OnlineGame component', () => {
       memberId: 'host-1',
       role: 'host',
       lobby,
-      game: {
-        matchId: 'm1',
-        seed: 12345,
-        stepNumber: 0,
-        startParameters,
-        confirmedState: snapshot.gameState,
-        displayState: snapshot.gameState,
-        pendingAction: null,
-        lastError: null,
-        lastRejectedReason: null,
-        statusNotice: null,
-        lastAcceptedAction: null,
-      },
+      game: buildTestGame(startParameters, snapshot),
     };
 
     const mockClient = {
@@ -190,19 +179,7 @@ describe('OnlineGame component', () => {
         { id: 'guest-1', role: 'guest', name: '客人', connected: true },
       ],
       lobby,
-      game: {
-        matchId: 'm1',
-        seed: 12345,
-        stepNumber: 0,
-        startParameters,
-        confirmedState: snapshot.gameState,
-        displayState: snapshot.gameState,
-        pendingAction: null,
-        lastError: null,
-        lastRejectedReason: null,
-        statusNotice: null,
-        lastAcceptedAction: null,
-      },
+      game: buildTestGame(startParameters, snapshot),
     };
 
     const { rerender } = render(<OnlineGame client={mockClient} connection={connection} onExit={vi.fn()} />);
@@ -268,19 +245,7 @@ describe('OnlineGame component', () => {
         { id: 'guest-1', role: 'guest', name: '客人', connected: true },
       ],
       lobby,
-      game: {
-        matchId: 'm1',
-        seed: 12345,
-        stepNumber: 0,
-        startParameters,
-        confirmedState: snapshot.gameState,
-        displayState: snapshot.gameState,
-        pendingAction: null,
-        lastError: null,
-        lastRejectedReason: null,
-        statusNotice: null,
-        lastAcceptedAction: null,
-      },
+      game: buildTestGame(startParameters, snapshot),
     };
 
     const mockClient = {
@@ -336,19 +301,7 @@ describe('OnlineGame component', () => {
         { id: 'guest-1', role: 'guest', name: '客人', connected: true },
       ],
       lobby,
-      game: {
-        matchId: 'm1',
-        seed: 12345,
-        stepNumber: 0,
-        startParameters,
-        confirmedState: snapshot.gameState,
-        displayState: snapshot.gameState,
-        pendingAction: null,
-        lastError: null,
-        lastRejectedReason: null,
-        statusNotice: null,
-        lastAcceptedAction: null,
-      },
+      game: buildTestGame(startParameters, snapshot),
     };
 
     const mockClient = {
@@ -367,6 +320,138 @@ describe('OnlineGame component', () => {
     expect(selfBar).toHaveClass('turn-active');
     expect(selfBar).toHaveAttribute('data-turn-state', 'active');
     expect(screen.getByTestId('turn-indicator')).toHaveTextContent('轮到你（红方）');
+  });
+
+  it('renders clocks, disconnect grace banner, and check toast', () => {
+    vi.setSystemTime(10_000);
+    const { startParameters, snapshot } = createTestMatch(true);
+    const lobby = createLobbyState();
+    lobby.phase = 'started';
+    lobby.startParameters = startParameters;
+
+    const connection: ConnectionState = {
+      ...IDLE_CONNECTION_STATE,
+      status: 'connected',
+      roomId: 'room-1',
+      memberId: 'host-1',
+      role: 'host',
+      members: [
+        { id: 'host-1', role: 'host', name: '房主', connected: true },
+        { id: 'guest-1', role: 'guest', name: '客人', connected: false },
+      ],
+      lobby,
+      game: {
+        matchId: 'm1',
+        seed: 12345,
+        stepNumber: 1,
+        revision: 10,
+        startParameters,
+        confirmedState: { ...snapshot.gameState, checkedCamp: 'black' },
+        displayState: { ...snapshot.gameState, checkedCamp: 'black' },
+        clock: {
+          ...snapshot.clock!,
+          paused: true,
+          disconnectGrace: {
+            hostDeadlineMs: null,
+            guestDeadlineMs: 100_000,
+            firstDroppedRole: 'guest',
+          },
+        },
+        settlement: null,
+        clockOffsetMs: 0,
+        pendingAction: null,
+        lastError: null,
+        lastRejectedReason: null,
+        statusNotice: null,
+        lastAcceptedAction: null,
+      },
+    };
+
+    const mockClient = {
+      sendGameAction: vi.fn(),
+      sendLobbyReturn: vi.fn(),
+    } as unknown as RoomConnection;
+
+    render(<OnlineGame client={mockClient} connection={connection} onExit={vi.fn()} />);
+
+    // 时钟存在
+    expect(screen.getByTestId('player-clock-red')).toBeInTheDocument();
+    expect(screen.getByTestId('player-clock-black')).toBeInTheDocument();
+
+    // 90秒宽限期横幅展示
+    expect(screen.getByTestId('disconnect-grace-banner')).toBeInTheDocument();
+    expect(screen.getByTestId('disconnect-grace-banner')).toHaveTextContent('90 秒');
+
+    // 将军横幅提示展示
+    expect(screen.getByTestId('check-toast')).toBeInTheDocument();
+    expect(screen.getByTestId('check-toast')).toHaveTextContent('将军！');
+
+    // 1.5s 后自动隐藏
+    act(() => {
+      vi.advanceTimersByTime(1600);
+    });
+    expect(screen.queryByTestId('check-toast')).not.toBeInTheDocument();
+  });
+
+  it('renders GameResultDialog on settlement and triggers rematch / return to lobby', () => {
+    const { startParameters, snapshot } = createTestMatch(true);
+    const lobby = createLobbyState();
+    lobby.phase = 'started';
+    lobby.startParameters = startParameters;
+
+    const connection: ConnectionState = {
+      ...IDLE_CONNECTION_STATE,
+      status: 'connected',
+      roomId: 'room-1',
+      memberId: 'host-1',
+      role: 'host',
+      lobby,
+      game: {
+        matchId: 'm1',
+        seed: 12345,
+        stepNumber: 5,
+        revision: 50,
+        startParameters,
+        confirmedState: snapshot.gameState,
+        displayState: snapshot.gameState,
+        clock: snapshot.clock,
+        settlement: {
+          winner: 'red',
+          loser: 'black',
+          reason: 'step-timeout',
+          redDurationSeconds: 45,
+          blackDurationSeconds: 60,
+          endedAt: 20_000,
+        },
+        clockOffsetMs: 0,
+        pendingAction: null,
+        lastError: null,
+        lastRejectedReason: null,
+        statusNotice: null,
+        lastAcceptedAction: null,
+      },
+    };
+
+    const mockClient = {
+      sendGameAction: vi.fn(),
+      sendLobbyReturn: vi.fn(),
+    } as unknown as RoomConnection;
+
+    render(<OnlineGame client={mockClient} connection={connection} onExit={vi.fn()} />);
+
+    // 弹窗展示
+    expect(screen.getByTestId('game-result-modal')).toBeInTheDocument();
+    expect(screen.getByTestId('result-outcome-title')).toHaveTextContent('胜利！');
+    expect(screen.getByTestId('result-reason')).toHaveTextContent('单步用时耗尽超时判负');
+    expect(screen.getByTestId('result-stats')).toHaveTextContent('红方总用时');
+
+    // 点击再来一局
+    fireEvent.click(screen.getByTestId('btn-rematch'));
+    expect(mockClient.sendLobbyReturn).toHaveBeenCalledWith('rematch');
+
+    // 点击返回大厅
+    fireEvent.click(screen.getByTestId('btn-return-lobby'));
+    expect(mockClient.sendLobbyReturn).toHaveBeenCalledWith('return-lobby');
   });
 });
 
