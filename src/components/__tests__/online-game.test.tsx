@@ -249,4 +249,124 @@ describe('OnlineGame component', () => {
     fireEvent.click(cellBtn);
     expect(mockClient.sendGameAction).toHaveBeenCalledTimes(2);
   });
+
+  it('adapts perspective and player info bars correctly when player is black vs red', () => {
+    // 房主为黑方（客人为红方）
+    const { startParameters, snapshot } = createTestMatch(false);
+    const lobby = createLobbyState();
+    lobby.phase = 'started';
+    lobby.startParameters = startParameters;
+
+    const connection: ConnectionState = {
+      ...IDLE_CONNECTION_STATE,
+      status: 'connected',
+      roomId: 'room-1',
+      memberId: 'host-1',
+      role: 'host',
+      members: [
+        { id: 'host-1', role: 'host', name: '房主', connected: true },
+        { id: 'guest-1', role: 'guest', name: '客人', connected: true },
+      ],
+      lobby,
+      game: {
+        matchId: 'm1',
+        seed: 12345,
+        stepNumber: 0,
+        startParameters,
+        confirmedState: snapshot.gameState,
+        displayState: snapshot.gameState,
+        pendingAction: null,
+        lastError: null,
+        lastRejectedReason: null,
+        statusNotice: null,
+        lastAcceptedAction: null,
+      },
+    };
+
+    const mockClient = {
+      sendGameAction: vi.fn().mockReturnValue({ ok: true }),
+      requestGameSync: vi.fn(),
+    } as unknown as RoomConnection;
+
+    const { container } = render(<OnlineGame client={mockClient} connection={connection} onExit={vi.fn()} />);
+
+    // 棋盘数据属性验证为黑方视角
+    const board = container.querySelector('.board');
+    expect(board).toHaveAttribute('data-perspective', 'black');
+
+    // 顶部对手信息条：客人（执红方）
+    const opponentBar = screen.getByTestId('online-opponent-bar');
+    expect(opponentBar).toContainElement(screen.getByTestId('member-guest'));
+    expect(screen.getByTestId('member-guest')).toHaveTextContent('客人');
+    expect(screen.getByTestId('member-guest')).toHaveTextContent('执红方');
+    expect(screen.getByTestId('member-guest')).toHaveTextContent('在线');
+    expect(opponentBar.querySelector('.connection-status')).toBeInTheDocument();
+
+    // 底部己方信息条：房主（执黑方）
+    const selfBar = screen.getByTestId('online-self-bar');
+    expect(selfBar).toContainElement(screen.getByTestId('member-host'));
+    expect(screen.getByTestId('member-host')).toHaveTextContent('房主');
+    expect(screen.getByTestId('member-host')).toHaveTextContent('执黑方');
+    expect(screen.getByTestId('member-host')).toHaveTextContent('在线');
+
+    // 当前为红方回合，黑方处于等待置灰状态
+    expect(selfBar).toHaveClass('turn-waiting');
+    expect(selfBar).toHaveAttribute('data-turn-state', 'waiting');
+    expect(screen.getByTestId('turn-indicator')).toHaveTextContent('等待对方行动');
+
+    // 退出按钮在底栏内
+    expect(selfBar.querySelector('[data-testid="close-room"]')).toBeInTheDocument();
+  });
+
+  it('renders golden glow active state on bottom bar during own turn', () => {
+    // 房主为红方（先手）
+    const { startParameters, snapshot } = createTestMatch(true);
+    const lobby = createLobbyState();
+    lobby.phase = 'started';
+    lobby.startParameters = startParameters;
+
+    const connection: ConnectionState = {
+      ...IDLE_CONNECTION_STATE,
+      status: 'connected',
+      roomId: 'room-1',
+      memberId: 'host-1',
+      role: 'host',
+      members: [
+        { id: 'host-1', role: 'host', name: '房主', connected: true },
+        { id: 'guest-1', role: 'guest', name: '客人', connected: true },
+      ],
+      lobby,
+      game: {
+        matchId: 'm1',
+        seed: 12345,
+        stepNumber: 0,
+        startParameters,
+        confirmedState: snapshot.gameState,
+        displayState: snapshot.gameState,
+        pendingAction: null,
+        lastError: null,
+        lastRejectedReason: null,
+        statusNotice: null,
+        lastAcceptedAction: null,
+      },
+    };
+
+    const mockClient = {
+      sendGameAction: vi.fn().mockReturnValue({ ok: true }),
+      requestGameSync: vi.fn(),
+    } as unknown as RoomConnection;
+
+    const { container } = render(<OnlineGame client={mockClient} connection={connection} onExit={vi.fn()} />);
+
+    // 棋盘数据属性验证为红方视角
+    const board = container.querySelector('.board');
+    expect(board).toHaveAttribute('data-perspective', 'red');
+
+    // 底部己方信息条：高亮金光 active
+    const selfBar = screen.getByTestId('online-self-bar');
+    expect(selfBar).toHaveClass('turn-active');
+    expect(selfBar).toHaveAttribute('data-turn-state', 'active');
+    expect(screen.getByTestId('turn-indicator')).toHaveTextContent('轮到你（红方）');
+  });
 });
+

@@ -7,6 +7,7 @@ import { Board } from './Board.js';
 import { CapturedPieces } from './CapturedPieces.js';
 import { MoveHistory, actionSummary, campLabel } from './MoveHistory.js';
 import { StatusPanel } from './StatusPanel.js';
+import { ConnectionStatus } from './rooms/ConnectionStatus.js';
 import type { LegalMoveHint } from './useBoardFeedback.js';
 import { useOnlineBoardFeedback } from './useOnlineBoardFeedback.js';
 
@@ -231,72 +232,119 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
       ? `轮到你（${campLabel(mySide)}）`
       : `等待对方行动（${campLabel(opponentSide)}）`;
 
+  const opponentRole = viewerRole === 'host' ? 'guest' : 'host';
+  const opponentMember =
+    connection.members.find((member) => member.role === opponentRole) ??
+    connection.members.find((member) => member.id !== connection.memberId);
+  const selfMember =
+    connection.members.find((member) => member.role === viewerRole) ??
+    connection.members.find((member) => member.id === connection.memberId);
+
+  const opponentConnected = opponentMember ? opponentMember.connected : false;
+  const selfConnected = selfMember ? selfMember.connected : connection.status === 'connected';
+
+  const opponentName = opponentMember?.name ?? opponentSeat?.name ?? (opponentRole === 'host' ? '房主' : '客人');
+  const selfName = selfMember?.name ?? selfSeat?.name ?? (viewerRole === 'host' ? '房主' : '客人');
+
   return (
     <div className="online-game-container" data-testid="online-game">
-      {/* 保持与已有大厅断言兼容的快照与摘要 */}
-      <section className="room-panel online-summary-panel">
-        <p className="room-notice" data-testid="lobby-started">
-          {startSummaryText}
-        </p>
-        <p className="room-hint" data-testid="start-snapshot">
-          {startSnapshotText}
-        </p>
-
-        <div className="online-players-bar">
-          {connection.members.map((member) => (
+      <div className="layout online-game-layout">
+        <div className="online-board-column">
+          {/* 顶部对手信息条 */}
+          <header className="online-opponent-bar" data-testid="online-opponent-bar">
             <span
-              key={member.id}
-              className={`online-player-badge ${member.connected ? 'online' : 'offline'}`}
-              data-testid={member.role === 'host' ? 'member-host' : 'member-guest'}
+              className={`online-player-badge online-player-top ${opponentConnected ? 'online' : 'offline'}`}
+              data-testid={opponentRole === 'host' ? 'member-host' : 'member-guest'}
             >
-              <span className="online-player-role">{member.role === 'host' ? '房主' : '客人'}</span>
-              <span className="online-player-name">{member.name}</span>
-              <span className={`online-player-status ${member.connected ? 'status-connected' : 'status-dropped'}`}>
-                {member.connected ? '在线' : '已掉线'}
+              <span className="online-player-role">{opponentRole === 'host' ? '房主' : '客人'}</span>
+              <span className="online-player-name">{opponentName}</span>
+              <span className={`online-player-camp camp-${opponentSide}`}>执{campLabel(opponentSide)}</span>
+              <span className={`online-player-status ${opponentConnected ? 'status-connected' : 'status-dropped'}`}>
+                {opponentConnected ? '在线' : '已掉线'}
               </span>
             </span>
-          ))}
-        </div>
+            <ConnectionStatus rtt={connection.rtt} status={connection.status} />
+          </header>
 
-        {shuffling ? (
-          <div className="shuffling-banner" data-testid="shuffling-banner">
-            洗牌中…
-          </div>
-        ) : null}
-
-        {game.statusNotice ? (
-          <p aria-live="assertive" className="room-error online-rejection-notice" data-testid="online-rejection-notice">
-            {game.statusNotice}
-          </p>
-        ) : null}
-
-        <div className="online-meta-bar">
-          <span className="turn-indicator" data-testid="turn-indicator">
-            {turnLabel}
-          </span>
-          <span className="step-counter" data-testid="step-number">
-            第 {game.stepNumber} 步
-          </span>
-          {isBusy && !displayState.winner ? (
-            <span className="online-busy-hint" data-testid="online-busy-hint">
-              {connection.reconnecting ? '重连中…' : '正在提交…'}
-            </span>
+          {shuffling ? (
+            <div className="shuffling-banner" data-testid="shuffling-banner">
+              洗牌中…
+            </div>
           ) : null}
-        </div>
-      </section>
 
-      <div className="layout">
-        <Board
-          captureGhost={feedback.captureGhost}
-          checkPulse={feedback.checkPulse}
-          flip={feedback.flip}
-          gameState={displayState}
-          legalMoves={legalMoves}
-          onCellClick={handleCellClick}
-          selectedPosition={selectedPosition}
-          trace={feedback.trace}
-        />
+          {game.statusNotice ? (
+            <p aria-live="assertive" className="room-error online-rejection-notice" data-testid="online-rejection-notice">
+              {game.statusNotice}
+            </p>
+          ) : null}
+
+          <Board
+            captureGhost={feedback.captureGhost}
+            checkPulse={feedback.checkPulse}
+            flip={feedback.flip}
+            gameState={displayState}
+            hideHeader={true}
+            legalMoves={legalMoves}
+            onCellClick={handleCellClick}
+            perspective={mySide}
+            selectedPosition={selectedPosition}
+            trace={feedback.trace}
+          />
+
+          {/* 底部己方信息条 */}
+          <footer
+            className={`online-self-bar ${
+              displayState.winner ? 'turn-finished' : isMyTurn ? 'turn-active' : 'turn-waiting'
+            }`}
+            data-testid="online-self-bar"
+            data-turn-state={displayState.winner ? 'finished' : isMyTurn ? 'active' : 'waiting'}
+          >
+            <span
+              className={`online-player-badge online-player-bottom ${selfConnected ? 'online' : 'offline'}`}
+              data-testid={viewerRole === 'host' ? 'member-host' : 'member-guest'}
+            >
+              <span className="online-player-role">{viewerRole === 'host' ? '房主' : '客人'}</span>
+              <span className="online-player-name">{selfName}</span>
+              <span className={`online-player-camp camp-${mySide}`}>执{campLabel(mySide)}</span>
+              <span className={`online-player-status ${selfConnected ? 'status-connected' : 'status-dropped'}`}>
+                {selfConnected ? '在线' : '已掉线'}
+              </span>
+            </span>
+
+            <div className="online-turn-center">
+              <span className="turn-indicator" data-testid="turn-indicator">
+                {turnLabel}
+              </span>
+              <span className="step-counter" data-testid="step-number">
+                第 {game.stepNumber} 步
+              </span>
+              {isBusy && !displayState.winner ? (
+                <span className="online-busy-hint" data-testid="online-busy-hint">
+                  {connection.reconnecting ? '重连中…' : '正在提交…'}
+                </span>
+              ) : null}
+            </div>
+
+            <button
+              className="panel-action-secondary online-exit-button"
+              data-testid={viewerRole === 'host' ? 'close-room' : 'leave-room'}
+              onClick={onExit}
+              type="button"
+            >
+              {viewerRole === 'host' ? '关闭房间' : '离开房间'}
+            </button>
+          </footer>
+        </div>
+
         <aside className="sidebar">
+          <section className="room-panel online-summary-panel">
+            <p className="room-notice" data-testid="lobby-started">
+              {startSummaryText}
+            </p>
+            <p className="room-hint" data-testid="start-snapshot">
+              {startSnapshotText}
+            </p>
+          </section>
           <MoveHistory recentAction={displayState.recentAction} />
           <StatusPanel
             currentGameSummary={buildGameResultSummary(displayState)}
@@ -305,16 +353,6 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
             recentCompletedGames={[]}
           />
           <CapturedPieces gameState={displayState} />
-          <div className="panel-actions">
-            <button
-              className="panel-action-secondary"
-              data-testid={viewerRole === 'host' ? 'close-room' : 'leave-room'}
-              onClick={onExit}
-              type="button"
-            >
-              {viewerRole === 'host' ? '关闭房间' : '离开房间'}
-            </button>
-          </div>
         </aside>
       </div>
     </div>

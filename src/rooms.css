@@ -790,8 +790,131 @@
 .online-game-container {
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 14px;
   width: 100%;
+}
+
+.room-shell-ingame {
+  max-width: 1440px;
+  width: 100%;
+  padding: clamp(10px, 1.4vw, 24px);
+  gap: 12px;
+}
+
+.online-game-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(320px, 360px);
+  gap: clamp(16px, 2vw, 28px);
+  align-items: flex-start;
+  width: 100%;
+}
+
+.online-board-column {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  max-width: 880px;
+  margin: 0 auto;
+}
+
+.online-opponent-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-sizing: border-box;
+  min-height: 48px;
+}
+
+.online-self-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+  box-sizing: border-box;
+  min-height: 52px;
+  transition: background 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease, color 0.2s ease, opacity 0.2s ease;
+}
+
+/* 轮到己方：泛金光 */
+.online-self-bar.turn-active {
+  background: linear-gradient(180deg, rgba(244, 219, 167, 0.18) 0%, rgba(215, 178, 119, 0.08) 100%);
+  border-color: rgba(244, 219, 167, 0.7);
+  box-shadow:
+    0 0 18px rgba(244, 219, 167, 0.38),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2),
+    inset 0 0 14px rgba(244, 219, 167, 0.22);
+}
+
+.online-self-bar.turn-active .turn-indicator {
+  color: #f7e0b5;
+  text-shadow: 0 0 8px rgba(244, 219, 167, 0.6);
+}
+
+/* 等待对方：置灰 */
+.online-self-bar.turn-waiting {
+  background: rgba(255, 255, 255, 0.02);
+  border-color: rgba(255, 255, 255, 0.06);
+  box-shadow: none;
+  opacity: 0.85;
+}
+
+.online-self-bar.turn-waiting .turn-indicator {
+  color: rgba(243, 237, 224, 0.5);
+  text-shadow: none;
+}
+
+/* 终局定格 */
+.online-self-bar.turn-finished {
+  background: rgba(215, 178, 119, 0.1);
+  border-color: rgba(215, 178, 119, 0.35);
+  box-shadow: none;
+}
+
+.online-turn-center {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.online-player-camp {
+  display: inline-flex;
+  align-items: center;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  letter-spacing: 0.06em;
+}
+
+.online-player-camp.camp-red {
+  color: #ff7675;
+  background: rgba(235, 77, 75, 0.18);
+  border: 1px solid rgba(235, 77, 75, 0.35);
+}
+
+.online-player-camp.camp-black {
+  color: #74b9ff;
+  background: rgba(9, 132, 227, 0.18);
+  border: 1px solid rgba(9, 132, 227, 0.35);
+}
+
+.online-exit-button {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 8px 16px;
+  border-radius: 10px;
+  white-space: nowrap;
 }
 
 .online-summary-panel {
@@ -897,9 +1020,44 @@
   font-style: italic;
 }
 
+@media (max-width: 1180px) {
+  .online-game-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .online-board-column {
+    max-width: none;
+  }
+}
+
+@media (max-width: 720px) {
+  .room-shell-ingame {
+    padding: 10px;
+  }
+
+  .online-opponent-bar,
+  .online-self-bar {
+    padding: 8px 12px;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .online-turn-center {
+    gap: 8px;
+  }
+
+  .turn-indicator {
+    font-size: 16px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .online-rejection-notice {
     animation: none;
+    transition: none;
+  }
+
+  .online-self-bar {
     transition: none;
   }
 }

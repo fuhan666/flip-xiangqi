@@ -1,5 +1,7 @@
 import { BOARD_HEIGHT, BOARD_WIDTH, PIECE_SYMBOLS, getPieceAt } from '../game';
 import type { Camp, GameState, Piece, Position } from '../game';
+import { displayToLogical, logicalToDisplay } from './board-perspective';
+import type { Perspective } from './board-perspective';
 import { BoardArtwork } from './BoardArtwork';
 import { PieceFace } from './PieceFace';
 import type {
@@ -11,7 +13,7 @@ import type {
   TraceFeedback,
 } from './useBoardFeedback';
 
-interface BoardProps {
+export interface BoardProps {
   gameState: GameState;
   selectedPosition: Position | null;
   onCellClick: (position: Position) => void;
@@ -20,6 +22,8 @@ interface BoardProps {
   flip?: FlipFeedback | null;
   legalMoves?: ReadonlyMap<string, LegalMoveHint>;
   trace?: TraceFeedback | null;
+  perspective?: Perspective;
+  hideHeader?: boolean;
 }
 
 type CellState = 'empty' | 'hidden' | 'revealed';
@@ -120,8 +124,9 @@ function findLastMove(gameState: GameState): LastMoveMarker | null {
   return null;
 }
 
-function intersectionPoint(position: Position): { cx: number; cy: number } {
-  return { cx: 50 + 100 * position.x, cy: 50 + 100 * position.y };
+function intersectionPoint(position: Position, perspective: Perspective = 'red'): { cx: number; cy: number } {
+  const display = logicalToDisplay(position, perspective);
+  return { cx: 50 + 100 * display.x, cy: 50 + 100 * display.y };
 }
 
 function buildBoardCells(
@@ -129,13 +134,14 @@ function buildBoardCells(
   selectedPosition: Position | null,
   legalMoves: ReadonlyMap<string, LegalMoveHint> | undefined,
   flip: FlipFeedback | null | undefined,
+  perspective: Perspective = 'red',
 ): BoardCellModel[] {
   const markers = getRecentActionMarkers(gameState);
   const cells: BoardCellModel[] = [];
 
-  for (let y = 0; y < BOARD_HEIGHT; y += 1) {
-    for (let x = 0; x < BOARD_WIDTH; x += 1) {
-      const position = { x, y };
+  for (let dy = 0; dy < BOARD_HEIGHT; dy += 1) {
+    for (let dx = 0; dx < BOARD_WIDTH; dx += 1) {
+      const position = displayToLogical({ x: dx, y: dy }, perspective);
       const key = positionKey(position);
       const piece = getPieceAt(gameState, position);
       const cellState = getCellState(piece);
@@ -149,7 +155,7 @@ function buildBoardCells(
 
       cells.push({
         cellState,
-        coordinateLabel: `${x},${y}`,
+        coordinateLabel: `${position.x},${position.y}`,
         flipPhase: flip && flip.cellKey === key ? flip.phase : null,
         isFaceDown: cellState === 'hidden',
         isSelected: position.x === selectedPosition?.x && position.y === selectedPosition?.y,
@@ -159,7 +165,7 @@ function buildBoardCells(
         pieceLabel: piece ? (piece.revealed ? PIECE_SYMBOLS[piece.camp][piece.type] : '暗') : '',
         position,
         recentAction,
-        testId: `cell-${x}-${y}`,
+        testId: `cell-${position.x}-${position.y}`,
         turnState: getTurnState(piece, gameState.currentTurn),
       });
     }
@@ -173,52 +179,64 @@ export function Board({
   checkPulse = null,
   flip = null,
   gameState,
+  hideHeader = false,
   legalMoves,
   onCellClick,
+  perspective = 'red',
   selectedPosition,
   trace = null,
 }: BoardProps) {
-  const cells = buildBoardCells(gameState, selectedPosition, legalMoves, flip);
+  const cells = buildBoardCells(gameState, selectedPosition, legalMoves, flip, perspective);
   const lastMove = findLastMove(gameState);
   const checkBanner = !gameState.winner && gameState.checkedCamp ? '将军警示：请立即应将' : null;
 
   return (
-    <section className="board-shell" data-turn={gameState.winner ? 'finished' : gameState.currentTurn}>
-      <div className="board-shell-header">
-        <div className="board-turn-indicator">
-          <span className="board-turn-label">回合焦点</span>
-          <strong className="board-turn-value">{currentTurnLabel(gameState)}</strong>
+    <section
+      className="board-shell"
+      data-perspective={perspective}
+      data-turn={gameState.winner ? 'finished' : gameState.currentTurn}
+    >
+      {!hideHeader ? (
+        <div className="board-shell-header">
+          <div className="board-turn-indicator">
+            <span className="board-turn-label">回合焦点</span>
+            <strong className="board-turn-value">{currentTurnLabel(gameState)}</strong>
+          </div>
+          <div className="board-stage-meta">
+            <span className="board-beta-badge">操作提示</span>
+            <p className="board-stage-copy">点击暗子翻开；选中己方明子后点击目标位置走子。</p>
+          </div>
+          <ul aria-label="棋盘状态说明" className="board-legend">
+            <li className="board-legend-item board-legend-item-hidden">暗子</li>
+            <li className="board-legend-item board-legend-item-active">己方明子</li>
+            <li className="board-legend-item board-legend-item-opponent">对方明子</li>
+            <li className="board-legend-item board-legend-item-selected">当前选中</li>
+            <li className="board-legend-item board-legend-item-recent">最近动作</li>
+          </ul>
         </div>
-        <div className="board-stage-meta">
-          <span className="board-beta-badge">操作提示</span>
-          <p className="board-stage-copy">点击暗子翻开；选中己方明子后点击目标位置走子。</p>
-        </div>
-        <ul aria-label="棋盘状态说明" className="board-legend">
-          <li className="board-legend-item board-legend-item-hidden">暗子</li>
-          <li className="board-legend-item board-legend-item-active">己方明子</li>
-          <li className="board-legend-item board-legend-item-opponent">对方明子</li>
-          <li className="board-legend-item board-legend-item-selected">当前选中</li>
-          <li className="board-legend-item board-legend-item-recent">最近动作</li>
-        </ul>
-      </div>
+      ) : null}
       {checkBanner ? <p className="board-check-banner">{checkBanner}</p> : null}
-      <div className="board-frame" data-check={gameState.winner ? 'none' : gameState.checkedCamp ?? 'none'}>
+      <div
+        className="board-frame"
+        data-check={gameState.winner ? 'none' : gameState.checkedCamp ?? 'none'}
+        data-perspective={perspective}
+      >
         {checkPulse ? <span aria-hidden="true" className="board-check-ripple" data-testid="check-ripple" /> : null}
-        <div className="board" role="grid" aria-label="翻牌中国象棋棋盘">
-          <BoardArtwork />
+        <div className="board" role="grid" aria-label="翻牌中国象棋棋盘" data-perspective={perspective}>
+          <BoardArtwork perspective={perspective} />
           <svg aria-hidden="true" className="board-trace-layer" focusable="false" viewBox="0 0 900 1000">
             {lastMove ? (
               <>
                 <circle
                   className="board-last-move-ring board-last-move-from"
-                  cx={intersectionPoint(lastMove.from).cx}
-                  cy={intersectionPoint(lastMove.from).cy}
+                  cx={intersectionPoint(lastMove.from, perspective).cx}
+                  cy={intersectionPoint(lastMove.from, perspective).cy}
                   r="44"
                 />
                 <circle
                   className="board-last-move-ring board-last-move-to"
-                  cx={intersectionPoint(lastMove.to).cx}
-                  cy={intersectionPoint(lastMove.to).cy}
+                  cx={intersectionPoint(lastMove.to, perspective).cx}
+                  cy={intersectionPoint(lastMove.to, perspective).cy}
                   r="48"
                 />
               </>
@@ -226,10 +244,10 @@ export function Board({
             {trace ? (
               <line
                 className="board-trace-line"
-                x1={intersectionPoint(trace.from).cx}
-                y1={intersectionPoint(trace.from).cy}
-                x2={intersectionPoint(trace.to).cx}
-                y2={intersectionPoint(trace.to).cy}
+                x1={intersectionPoint(trace.from, perspective).cx}
+                y1={intersectionPoint(trace.from, perspective).cy}
+                x2={intersectionPoint(trace.to, perspective).cx}
+                y2={intersectionPoint(trace.to, perspective).cy}
               />
             ) : null}
           </svg>
@@ -272,24 +290,27 @@ export function Board({
               </button>
             );
           })}
-          {captureGhost ? (
-            <span
-              aria-hidden="true"
-              className="capture-ghost"
-              data-testid="capture-ghost"
-              style={{
-                left: `${((50 + 100 * captureGhost.position.x) / 900) * 100}%`,
-                top: `${((50 + 100 * captureGhost.position.y) / 1000) * 100}%`,
-              }}
-            >
-              <PieceFace
-                cellState="revealed"
-                pieceCamp={captureGhost.camp}
-                pieceLabel={PIECE_SYMBOLS[captureGhost.camp][captureGhost.pieceType]}
-              />
-              <span className="piece-text">{PIECE_SYMBOLS[captureGhost.camp][captureGhost.pieceType]}</span>
-            </span>
-          ) : null}
+          {captureGhost ? (() => {
+            const displayGhost = logicalToDisplay(captureGhost.position, perspective);
+            return (
+              <span
+                aria-hidden="true"
+                className="capture-ghost"
+                data-testid="capture-ghost"
+                style={{
+                  left: `${((50 + 100 * displayGhost.x) / 900) * 100}%`,
+                  top: `${((50 + 100 * displayGhost.y) / 1000) * 100}%`,
+                }}
+              >
+                <PieceFace
+                  cellState="revealed"
+                  pieceCamp={captureGhost.camp}
+                  pieceLabel={PIECE_SYMBOLS[captureGhost.camp][captureGhost.pieceType]}
+                />
+                <span className="piece-text">{PIECE_SYMBOLS[captureGhost.camp][captureGhost.pieceType]}</span>
+              </span>
+            );
+          })() : null}
         </div>
       </div>
     </section>
