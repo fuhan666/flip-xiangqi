@@ -48,6 +48,15 @@ for (const viewport of [{ width: 1366, height: 768 }, { width: 1920, height: 108
       await Promise.all(pages.map((p, i) => faults[i].install(p)));
       await host.goto('/');
       await host.getByTestId('menu-create').click();
+      await expect(host.getByTestId('room-address-main').or(host.getByTestId('online-game'))).toBeVisible({ timeout: 10000 });
+      // A preceding failed test may leave a live room in the shared host runtime.
+      if (await host.getByTestId('online-game').isVisible()) {
+        await host.getByTestId('close-room').click();
+        await host.getByTestId('confirm-yes').click();
+        await expect(host.getByTestId('menu-create')).toBeVisible();
+        await host.getByTestId('menu-create').click();
+      }
+      await expect(host.getByTestId('room-address-main')).toBeVisible({ timeout: 10000 });
       const address = await host.getByTestId('room-address-main').textContent();
       const port = Number(address!.trim().split(':').at(-1));
       for (const page of [guest, spectator]) {
