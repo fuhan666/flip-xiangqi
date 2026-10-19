@@ -10,7 +10,7 @@
 import { formatAddress, toWebSocketUrl, type ParsedAddress } from './address.js';
 import { describeErrorCode, describeLobbyReject, describeRoomClosed } from './errors.js';
 import {
-  computeBackoffDelay,
+  computeReconnectDelay,
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_HEARTBEAT_TIMEOUT_MS,
   DEFAULT_RECONNECT_BUDGET_MS,
@@ -186,7 +186,16 @@ export interface RoomConnection {
 }
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 8_000;
+export const ACTION_RECOVERY_MS = 3_000;
+export const SYNC_TIMEOUT_MS = 3_000;
+export const STATE_AUDIT_INTERVAL_MS = 5_000;
 const SOCKET_OPEN = 1;
+
+function isStaleClockSample(incoming: MatchClockSnapshot, current: MatchClockSnapshot | null): boolean {
+  // Protocol 6 increments sampleSeq on clock transitions, not on every broadcast.
+  return current !== null && (incoming.sampleSeq < current.sampleSeq ||
+    (incoming.sampleSeq === current.sampleSeq && incoming.serverTime <= current.serverTime));
+}
 
 const IDLE_STATE: ConnectionState = {
   status: 'idle',
@@ -222,6 +231,7 @@ export interface RoomClientOptions {
   reconnectDelays?: readonly number[];
   reconnectBudgetMs?: number;
   clock?: { now(): number };
+  random?: () => number;
 }
 
 export class RoomClient implements RoomConnection {
@@ -232,6 +242,7 @@ export class RoomClient implements RoomConnection {
   private readonly reconnectDelays: readonly number[];
   private readonly reconnectBudgetMs: number;
   private readonly clock?: { now(): number };
+  private readonly random: () => number;
   private readonly listeners = new Set<(state: ConnectionState) => void>();
   private state: ConnectionState = IDLE_STATE;
   private socket: WebSocketLike | null = null;
@@ -254,7 +265,12 @@ export class RoomClient implements RoomConnection {
   private reconnectAttempt = 0;
   private reconnecting = false;
   private pendingSyncRequestId: string | null = null;
+  private syncTimer: ReturnType<typeof setTimeout> | null = null;
+  private actionRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  private stateAuditTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly retiredMatchIds = new Set<string>();
   private pendingChatRequestId: string | null = null;
+  private pendingControlRequestId: string | null = null;
 
   constructor(options: RoomClientOptions = {}) {
     this.webSocketFactory = options.webSocketFactory ?? defaultWebSocketFactory;
@@ -264,6 +280,7 @@ export class RoomClient implements RoomConnection {
     this.reconnectDelays = options.reconnectDelays ?? DEFAULT_RECONNECT_DELAYS;
     this.reconnectBudgetMs = options.reconnectBudgetMs ?? DEFAULT_RECONNECT_BUDGET_MS;
     this.clock = options.clock;
+    this.random = options.random ?? Math.random;
   }
 
   private now(): number {
@@ -596,6 +613,7 @@ export class RoomClient implements RoomConnection {
     }
 
     const requestId = generateRequestId();
+    this.pendingControlRequestId = requestId;
     try {
       socket.send(
         encodeMessage(
@@ -631,6 +649,7 @@ export class RoomClient implements RoomConnection {
     }
 
     const requestId = generateRequestId();
+    this.pendingControlRequestId = requestId;
     try {
       socket.send(
         encodeMessage(
@@ -666,6 +685,7 @@ export class RoomClient implements RoomConnection {
     }
 
     const requestId = generateRequestId();
+    this.pendingControlRequestId = requestId;
     try {
       socket.send(
         encodeMessage(
@@ -683,6 +703,7 @@ export class RoomClient implements RoomConnection {
   }
 
   requestGameSync(): void {
+    if (this.pendingSyncRequestId) return;
     const socket = this.socket;
     if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
       return;
@@ -693,10 +714,16 @@ export class RoomClient implements RoomConnection {
     }
     const requestId = generateRequestId();
     this.pendingSyncRequestId = requestId;
+    const generation = this.generation;
+    this.syncTimer = setTimeout(() => {
+      if (this.pendingSyncRequestId === requestId) {
+        this.handleConnectionLost(generation, 'SYNC_TIMEOUT');
+      }
+    }, SYNC_TIMEOUT_MS);
     try {
       socket.send(encodeMessage(buildClientGameSync(roomId, this.state.game?.matchId, requestId)));
     } catch {
-      // 忽略发送失败
+      this.handleConnectionLost(generation, 'SYNC_SEND_FAILED');
     }
   }
 
@@ -860,6 +887,7 @@ export class RoomClient implements RoomConnection {
       }
 
       this.startHeartbeat(generation);
+      this.startStateAudit(generation);
       return;
     }
 
@@ -907,6 +935,12 @@ export class RoomClient implements RoomConnection {
 
     if (message.type === 'lobby.state') {
       const isLobbyPhase = message.payload.lobby.phase === 'lobby';
+      if (isLobbyPhase && this.state.game) this.retiredMatchIds.add(this.state.game.matchId);
+      if (isLobbyPhase) {
+        this.pendingSyncRequestId = null;
+        if (this.syncTimer) clearTimeout(this.syncTimer);
+        this.syncTimer = null;
+      }
       // 权威状态到达即认为在途请求已有结果，同时清除上一条拒绝提示。
       this.setState({
         ...this.state,
@@ -929,15 +963,21 @@ export class RoomClient implements RoomConnection {
     }
 
     if (message.type === 'game.clock') {
-      const { matchId, clock, revision } = message.payload;
+      const { matchId, clock, revision, sampleSeq } = message.payload;
       const currentGame = this.state.game;
+      if (!currentGame && this.state.lobby?.phase === 'started') this.requestGameSync();
       if (currentGame && currentGame.matchId === matchId) {
+        if (revision > currentGame.revision) {
+          this.requestGameSync();
+          return;
+        }
+        if (revision < currentGame.revision || sampleSeq < (currentGame.clock?.sampleSeq ?? -1) ||
+          isStaleClockSample(clock, currentGame.clock)) return;
         this.setState({
           ...this.state,
           game: {
             ...currentGame,
             clock,
-            revision,
             clockOffsetMs: this.clockOffsetMs,
           },
         });
@@ -948,10 +988,19 @@ export class RoomClient implements RoomConnection {
     if (message.type === 'game.state') {
       const incoming = message.payload;
       const currentGame = this.state.game;
+      if (this.retiredMatchIds.has(incoming.matchId) || (currentGame && currentGame.matchId !== incoming.matchId)) return;
       const incomingRevision = incoming.revision ?? incoming.stepNumber * 10;
+      const isExplicitSync = Boolean(message.requestId && message.requestId === this.pendingSyncRequestId);
+      if (isExplicitSync) {
+        this.pendingSyncRequestId = null;
+        if (this.syncTimer) clearTimeout(this.syncTimer);
+        this.syncTimer = null;
+      }
+      if (message.requestId === this.pendingControlRequestId) this.pendingControlRequestId = null;
 
       if (currentGame && currentGame.matchId === incoming.matchId) {
         if (incomingRevision < currentGame.revision) {
+          if (isExplicitSync && currentGame.pendingAction) this.requestGameSync();
           return;
         }
         if (incomingRevision === currentGame.revision && incoming.stepNumber < currentGame.stepNumber) {
@@ -964,10 +1013,9 @@ export class RoomClient implements RoomConnection {
         return;
       }
 
-      const isExplicitSync = Boolean(message.requestId && message.requestId === this.pendingSyncRequestId);
-      if (isExplicitSync) {
-        this.pendingSyncRequestId = null;
-      }
+      const incomingClock = currentGame?.clock && incoming.clock &&
+        incomingRevision === currentGame.revision && isStaleClockSample(incoming.clock, currentGame.clock)
+        ? currentGame.clock : incoming.clock;
 
       // 同一步且相同 revision 的重复广播：更新已确认快照，但不得清除当前在途推测或回退乐观呈现
       if (
@@ -976,13 +1024,13 @@ export class RoomClient implements RoomConnection {
         incoming.stepNumber === currentGame.stepNumber &&
         incomingRevision === currentGame.revision
       ) {
-        if (currentGame.pendingAction !== null) {
+        if (currentGame.pendingAction !== null && !isExplicitSync) {
           this.setState({
             ...this.state,
             game: {
               ...currentGame,
               confirmedState: incoming.state,
-              clock: incoming.clock ?? currentGame.clock,
+              clock: incomingClock ?? currentGame.clock,
               settlement: incoming.settlement !== undefined ? incoming.settlement : currentGame.settlement,
               revision: incomingRevision,
               pendingNegotiation: incoming.pendingNegotiation !== undefined ? incoming.pendingNegotiation : currentGame.pendingNegotiation,
@@ -1055,7 +1103,7 @@ export class RoomClient implements RoomConnection {
           startParameters,
           confirmedState: incoming.state,
           displayState: incoming.state,
-          clock: incoming.clock ?? currentGame?.clock ?? null,
+          clock: incomingClock ?? currentGame?.clock ?? null,
           settlement: incoming.settlement !== undefined ? incoming.settlement : (currentGame?.settlement ?? null),
           clockOffsetMs: this.clockOffsetMs,
           pendingAction,
@@ -1079,6 +1127,16 @@ export class RoomClient implements RoomConnection {
       const incoming = message.payload;
       const currentGame = this.state.game;
       if (!currentGame || currentGame.matchId !== incoming.matchId) {
+        return;
+      }
+      // Rejections carry no revision. Only a currently pending action can own one.
+      // A snapshot request, rather than an uncorrelated rejection, repairs missed state.
+      if (!currentGame.pendingAction) {
+        if (message.requestId && message.requestId === this.pendingControlRequestId) {
+          this.pendingControlRequestId = null;
+          this.setState({ ...this.state, game: { ...currentGame, lastError: incoming.reason, statusNotice: incoming.reason } });
+          this.requestGameSync();
+        }
         return;
       }
 
@@ -1279,6 +1337,7 @@ export class RoomClient implements RoomConnection {
 
     this.clearTimer();
     this.stopHeartbeat();
+    this.stopStateRecovery();
     this.teardownSocket();
 
     // 仅已入房成员且有恢复凭据支持自动重连（客人/旁观者用 resumeToken，房主用 host token）
@@ -1336,6 +1395,7 @@ export class RoomClient implements RoomConnection {
     if (!this.reconnecting) {
       return;
     }
+    this.clearTimer();
 
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -1343,7 +1403,7 @@ export class RoomClient implements RoomConnection {
     }
 
     const elapsed = this.now() - (this.reconnectStartTime ?? this.now());
-    const delay = computeBackoffDelay(this.reconnectAttempt, this.reconnectDelays);
+    const delay = computeReconnectDelay(this.reconnectAttempt, this.reconnectDelays, this.random);
     const effectiveBudget = (this.state.game || this.state.lobby?.phase === 'started')
       ? Math.max(this.reconnectBudgetMs, 95_000)
       : this.reconnectBudgetMs;
@@ -1370,6 +1430,8 @@ export class RoomClient implements RoomConnection {
   }
 
   private attemptReconnect(): void {
+    // A manual retry may skip backoff, but must share an active handshake.
+    if (this.socket && this.socket.readyState <= SOCKET_OPEN) return;
     const isGuest = this.savedJoinOptions?.role === 'guest';
     const isSpectator = this.savedJoinOptions?.role === 'spectator';
     const isHost = this.savedJoinOptions?.role === 'host';
@@ -1515,6 +1577,26 @@ export class RoomClient implements RoomConnection {
     this.pendingPingSeq = null;
   }
 
+  private startStateAudit(generation: number): void {
+    if (this.stateAuditTimer) clearTimeout(this.stateAuditTimer);
+    this.stateAuditTimer = setTimeout(() => {
+      this.stateAuditTimer = null;
+      if (generation !== this.generation || this.state.status !== 'connected') return;
+      // Includes terminal positions: their final broadcast may be the lost message.
+      if ((this.state.game || this.state.lobby?.phase === 'started') && !this.state.game?.pendingAction) this.requestGameSync();
+      this.startStateAudit(generation);
+    }, STATE_AUDIT_INTERVAL_MS);
+  }
+
+  private stopStateRecovery(): void {
+    for (const timer of [this.syncTimer, this.actionRecoveryTimer, this.stateAuditTimer]) {
+      if (timer) clearTimeout(timer);
+    }
+    this.syncTimer = this.actionRecoveryTimer = this.stateAuditTimer = null;
+    this.pendingSyncRequestId = null;
+    this.pendingControlRequestId = null;
+  }
+
   private fail(generation: number, code: ErrorCode): void {
     if (generation !== this.generation) {
       return;
@@ -1549,6 +1631,7 @@ export class RoomClient implements RoomConnection {
   private teardown(): void {
     this.clearTimer();
     this.stopHeartbeat();
+    this.stopStateRecovery();
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -1568,6 +1651,20 @@ export class RoomClient implements RoomConnection {
   }
 
   private setState(state: ConnectionState): void {
+    const pending = state.game?.pendingAction;
+    if (pending?.requestId !== this.state.game?.pendingAction?.requestId) {
+      if (this.actionRecoveryTimer) clearTimeout(this.actionRecoveryTimer);
+      this.actionRecoveryTimer = null;
+      if (pending) {
+        const generation = this.generation;
+        this.actionRecoveryTimer = setTimeout(() => {
+          this.actionRecoveryTimer = null;
+          if (generation === this.generation && this.state.game?.pendingAction?.requestId === pending.requestId) {
+            this.requestGameSync();
+          }
+        }, ACTION_RECOVERY_MS);
+      }
+    }
     this.state = state;
     for (const listener of [...this.listeners]) {
       listener(state);

@@ -172,7 +172,7 @@ export class RoomServer {
   private readonly openSockets = new Set<WebSocket>();
   private readonly watchdogs = new Map<WebSocket, SocketWatchdog>();
   private guestResumeToken: string | null = null;
-  private readonly processedActions = new Map<string, { stepNumber: number; match: MatchState }>();
+  private readonly processedActions = new Map<string, { stepNumber: number }>();
   private readonly phraseCooldownUntil = new Map<string, number>();
   private readonly processedPhraseRequests = new Map<string, { event: QuickPhraseEvent }>();
   private host: RoomMember | null = null;
@@ -1226,6 +1226,7 @@ export class RoomServer {
     if (this.lobby.phase === 'started' && this.match) {
       if (this.match.pendingNegotiation) {
         this.clearNegotiationTimer();
+        this.match.clock.resumeNegotiation(this.now());
         this.match.pendingNegotiation = null;
         this.match.negotiationEvent = {
           id: `evt-${this.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -1411,7 +1412,7 @@ export class RoomServer {
         requestId: message.requestId,
         stepNumber: cached.stepNumber,
       });
-      const snap = snapshotMatch(cached.match, this.now());
+      const snap = snapshotMatch(this.match, this.now());
       try {
         socket.send(
           buildServerMessage({
@@ -1427,6 +1428,11 @@ export class RoomServer {
               startParameters: snap.startParameters,
               clock: snap.clock,
               ...(snap.settlement ? { settlement: snap.settlement } : {}),
+              pendingNegotiation: snap.pendingNegotiation,
+              drawCooldownUntil: snap.drawCooldownUntil,
+              phraseCooldownUntil: snap.phraseCooldownUntil,
+              negotiationEvent: snap.negotiationEvent,
+              matchEvents: snap.matchEvents,
             },
           }),
         );
@@ -1518,7 +1524,6 @@ export class RoomServer {
     if (message.requestId) {
       this.processedActions.set(message.requestId, {
         stepNumber: this.match.stepNumber,
-        match: this.match,
       });
       if (this.processedActions.size > 200) {
         const oldestKey = this.processedActions.keys().next().value;

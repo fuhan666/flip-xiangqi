@@ -203,7 +203,7 @@ describe('main menu', () => {
     expect(screen.getByTestId('menu-join')).toBeInTheDocument();
     expect(screen.getByTestId('menu-local')).toBeInTheDocument();
     expect(screen.getByTestId('menu-settings')).toBeInTheDocument();
-    expect(screen.getByTestId('app-version')).toHaveTextContent('v0.8.0');
+    expect(screen.getByTestId('app-version')).toHaveTextContent('v0.9.0');
 
     fireEvent.click(screen.getByTestId('menu-local'));
     await waitFor(() => expect(window.location.hash).toBe('#/local'));
