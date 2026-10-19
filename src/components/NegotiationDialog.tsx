@@ -4,12 +4,15 @@ import type { PendingNegotiation } from '../network/negotiation.js';
 export interface NegotiationDialogProps {
   pendingNegotiation: PendingNegotiation;
   isTarget: boolean;
+  /** 旁观视角：中立只读提示，不提供任何回应入口。 */
+  isSpectator?: boolean;
   onReply: (agree: boolean) => void;
 }
 
 export function NegotiationDialog({
   pendingNegotiation,
   isTarget,
+  isSpectator = false,
   onReply,
 }: NegotiationDialogProps) {
   const [now, setNow] = useState(() => Date.now());
@@ -27,19 +30,25 @@ export function NegotiationDialog({
   const progressPercent = Math.min(100, Math.max(0, (remainingMs / totalDuration) * 100));
 
   const isUndo = pendingNegotiation.type === 'undo';
-  const title = isTarget
+  const title = isSpectator
     ? isUndo
-      ? '对方申请悔棋'
-      : '对方请求和棋'
-    : isUndo
-      ? '悔棋申请已发出'
-      : '求和申请已发出';
+      ? '悔棋协商进行中'
+      : '求和协商进行中'
+    : isTarget
+      ? isUndo
+        ? '对方申请悔棋'
+        : '对方请求和棋'
+      : isUndo
+        ? '悔棋申请已发出'
+        : '求和申请已发出';
 
-  const promptText = isTarget
-    ? isUndo
-      ? '对方申请悔棋（回退 1 步），是否同意？'
-      : '对方请求和棋，是否同意？'
-    : '正在等待对方做出决定，棋盘与走子暂时锁定...';
+  const promptText = isSpectator
+    ? '对局双方正在协商，棋盘与走子暂时锁定...'
+    : isTarget
+      ? isUndo
+        ? '对方申请悔棋（回退 1 步），是否同意？'
+        : '对方请求和棋，是否同意？'
+      : '正在等待对方做出决定，棋盘与走子暂时锁定...';
 
   return (
     <div
@@ -66,7 +75,7 @@ export function NegotiationDialog({
 
         <p className="negotiation-prompt">{promptText}</p>
 
-        {isTarget ? (
+        {isTarget && !isSpectator ? (
           <div className="negotiation-actions">
             <button
               className="negotiation-btn negotiation-btn-agree"

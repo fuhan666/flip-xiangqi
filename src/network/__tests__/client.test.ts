@@ -888,3 +888,130 @@ describe('RoomClient', () => {
   });
 });
 
+
+describe('RoomClient spectator mode', () => {
+  const spectatorMembers = [
+    { id: 'host-1', role: 'host' as const, name: '房主', connected: true },
+    { id: 'guest-1', role: 'guest' as const, name: '客人', connected: true },
+    { id: 'spec-1', role: 'spectator' as const, name: '旁观1', connected: true },
+  ];
+
+  it('adopts the authoritative identity from welcome and reconnects as spectator', async () => {
+    const hellos: Array<Record<string, any>> = [];
+    const server = await startServer((socket) => {
+      socket.on('message', (data) => {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'hello') {
+          hellos.push(msg);
+          socket.send(
+            buildServerMessage({
+              type: 'welcome',
+              roomId: 'room-1',
+              payload: {
+                roomId: 'room-1',
+                memberId: 'spec-1',
+                // 普通加入被服务端分流为旁观：以 welcome 实际身份为准。
+                role: 'spectator',
+                name: '旁观1',
+                members: spectatorMembers,
+                lobby: createLobbyState(),
+                resumeToken: 'spec-token-1',
+              },
+            }),
+          );
+        }
+      });
+    });
+
+    const client = new RoomClient({
+      webSocketFactory: (url) => new NodeWebSocket(url) as unknown as WebSocketLike,
+      connectTimeoutMs: 2000,
+      reconnectDelays: [30, 60],
+    });
+    client.connect({ host: '127.0.0.1', port: server.port }, { role: 'guest', name: '客人' });
+    await waitUntil(() => client.getState().status === 'connected');
+    expect(client.getState().role).toBe('spectator');
+    expect(hellos[0].payload.role).toBe('guest');
+
+    for (const ws of server.wss.clients) {
+      ws.terminate();
+    }
+
+    await waitUntil(() => hellos.length >= 2 && client.getState().status === 'connected', 3000);
+    // 重连握手必须携带实际旁观身份与本人恢复凭据。
+    expect(hellos[1].payload.role).toBe('spectator');
+    expect(hellos[1].payload.resumeToken).toBe('spec-token-1');
+    client.disconnect();
+  });
+
+  it('blocks every game and lobby send with no network traffic and no optimistic state', async () => {
+    const startParameters = buildStartParameters({
+      roomId: 'room-1',
+      host: { memberId: 'host-1', name: '房主' },
+      guest: { memberId: 'guest-1', name: '客人' },
+      settings: { sidePreference: 'host-red', timeControlId: 'standard', locked: true, settingsVersion: 1 },
+      hostSide: 'red',
+    });
+    const match = createMatch({ matchId: 'm-1', seed: 42, startParameters });
+    const snap0 = snapshotMatch(match, 1000);
+
+    let serverSocket: NodeWebSocket | null = null;
+    const received: Array<Record<string, any>> = [];
+    const server = await startServer((socket) => {
+      serverSocket = socket;
+      socket.on('message', (data) => {
+        const msg = JSON.parse(data.toString());
+        received.push(msg);
+        if (msg.type === 'hello') {
+          socket.send(
+            buildServerMessage({
+              type: 'welcome',
+              roomId: 'room-1',
+              payload: {
+                roomId: 'room-1',
+                memberId: 'spec-1',
+                role: 'spectator',
+                name: '旁观1',
+                members: spectatorMembers,
+                lobby: createLobbyState(),
+                game: snap0,
+              },
+            }),
+          );
+        }
+      });
+    });
+
+    const client = makeClient();
+    client.connect({ host: '127.0.0.1', port: server.port }, { role: 'spectator', name: '旁观' });
+    await waitUntil(() => client.getState().game !== null);
+    expect(serverSocket).not.toBeNull();
+
+    const displayBefore = client.getState().game!.displayState;
+    const actionResult = client.sendGameAction({ type: 'flip', position: { x: 0, y: 3 } });
+    expect(actionResult.ok).toBe(false);
+    expect(actionResult.reason).toContain('旁观');
+
+    expect(client.sendGameNegotiate('undo').ok).toBe(false);
+    expect(client.sendGameNegotiateReply(true).ok).toBe(false);
+    expect(client.sendGameResign().ok).toBe(false);
+    expect(client.sendChatPhrase('phrase-greeting-1').ok).toBe(false);
+
+    client.sendLobbySettings('random', 'none');
+    client.sendLobbyLock(true);
+    client.sendLobbyReady(true);
+    client.sendLobbyStart();
+    client.sendLobbyReturn('rematch');
+
+    // 无任何消息发出（只有 hello），也无乐观局面。
+    expect(received.map((m) => m.type)).toEqual(['hello']);
+    expect(client.getState().game!.displayState).toBe(displayBefore);
+    expect(client.getState().game!.pendingAction).toBeNull();
+    expect(client.getState().pendingCommand).toBeNull();
+
+    // game.sync 是旁观者唯一可用的对局请求通道。
+    client.requestGameSync();
+    await waitUntil(() => received.some((m) => m.type === 'game.sync'));
+    client.disconnect();
+  });
+});

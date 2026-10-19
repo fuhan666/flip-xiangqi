@@ -1934,3 +1934,63 @@
     transition: none;
   }
 }
+
+/* ===== 旁观模式：名单、只读提示与结果层 ===== */
+
+.spectator-block {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.spectator-count {
+  margin: 0;
+  font-size: 13px;
+  color: rgba(243, 237, 224, 0.68);
+  letter-spacing: 0.08em;
+}
+
+.spectator-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.spectator-card {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px dashed rgba(255, 255, 255, 0.16);
+}
+
+.spectator-card-offline {
+  opacity: 0.55;
+}
+
+.spectator-badge {
+  font-size: 16px;
+  color: rgba(243, 237, 224, 0.6);
+}
+
+.spectator-readonly-note {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px dashed rgba(215, 178, 119, 0.32);
+  color: rgba(243, 237, 224, 0.72);
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  text-align: center;
+}
+
+.online-spectator-panel h2 {
+  margin-top: 0;
+}

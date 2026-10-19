@@ -76,12 +76,20 @@ test.describe('host-client room connection', () => {
     await screenshot(guestPage, '02-guest-joined');
     await screenshot(hostPage, '03-host-with-guest');
 
-    // 第三个客人：满员有明确文案。
+    // 第三个加入者：满员自动分流为旁观，不占执色席位。
     const thirdContext = await browser.newContext();
     const thirdPage = await openGuest(thirdContext, room.port);
     await thirdPage.getByTestId('join-submit').click();
-    await expect(thirdPage.getByTestId('join-connection-error')).toContainText('房间已关闭或人数已满', { timeout: 10_000 });
-    await screenshot(thirdPage, '04-guest-room-full');
+    await expect(thirdPage.getByTestId('spectator-waiting-note')).toBeVisible({ timeout: 10_000 });
+    await expect(thirdPage.getByTestId('spectator-count')).toHaveText('旁观 1 人在线');
+    await expect(hostPage.getByTestId('spectator-item')).toContainText('在线', { timeout: 10_000 });
+    await screenshot(thirdPage, '04-guest-auto-spectate');
+
+    // 旁观者主动退出：名单即时收起，不留下席位痕迹。
+    await thirdPage.getByTestId('leave-room').click();
+    await thirdPage.getByTestId('confirm-yes').click();
+    await expect(thirdPage.getByTestId('join-submit')).toBeVisible({ timeout: 5_000 });
+    await expect(hostPage.getByTestId('spectator-count')).toHaveText('旁观 0 人在线', { timeout: 10_000 });
 
     // 客人离开：房主端置灰并标注原因；席位可复用。
     await guestPage.getByTestId('leave-room').click();

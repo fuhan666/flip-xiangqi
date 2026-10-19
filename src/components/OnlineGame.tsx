@@ -13,6 +13,7 @@ import { NegotiationToast } from './NegotiationToast.js';
 import { PlayerClock } from './PlayerClock.js';
 import { StatusPanel } from './StatusPanel.js';
 import { ConnectionStatus } from './rooms/ConnectionStatus.js';
+import { SpectatorList } from './rooms/MemberList.js';
 import type { LegalMoveHint } from './useBoardFeedback.js';
 import { useOnlineBoardFeedback } from './useOnlineBoardFeedback.js';
 import { AudioControls } from './AudioControls.js';
@@ -70,6 +71,7 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
   const game = connection.game;
   const lobby = connection.lobby;
   const viewerRole = connection.role;
+  const isSpectator = viewerRole === 'spectator';
 
   const [selectedPosition, setSelectedPosition] = useState<Position | null>(null);
   const [interactionMessage, setInteractionMessage] = useState<string | null>(null);
@@ -110,7 +112,12 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
   }
 
   const startParameters = game.startParameters;
-  const mySide: Camp = connection.memberId === startParameters.redMemberId ? 'red' : 'black';
+  // 旁观视角固定红方在下；玩家视角按自己执色。
+  const mySide: Camp = isSpectator
+    ? 'red'
+    : connection.memberId === startParameters.redMemberId
+      ? 'red'
+      : 'black';
   const opponentSide: Camp = mySide === 'red' ? 'black' : 'red';
 
   const rawGameState: GameState = useMemo(
@@ -175,7 +182,9 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
     return null;
   }, [game.settlement, displayState.winner, displayState.recentAction, game.clock]);
 
-  const isMyTurn = displayState.winner === null && displayState.currentTurn === mySide;
+  const isMyTurn = !isSpectator && displayState.winner === null && displayState.currentTurn === mySide;
+  // 底部信息条归属（旁观视角固定红方在下）：只用于展示样式，不代表可操作。
+  const bottomActive = displayState.winner === null && displayState.currentTurn === mySide;
   const isBusy = game.pendingAction !== null || connection.reconnecting;
 
   const legalMoves = useMemo(() => {
@@ -199,6 +208,10 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
   }, [displayState, selectedPosition, isMyTurn, mySide]);
 
   const handleCellClick = (position: Position) => {
+    // 旁观者只读：不产生任何选中态、乐观局面或网络消息。
+    if (isSpectator) {
+      return;
+    }
     if (feedback.flip) {
       return;
     }
@@ -338,12 +351,16 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
   };
 
   const time = findTimeControl(startParameters.timeControlId);
-  const selfSeat = startParameters.players.find((seat) => seat.role === viewerRole);
-  const opponentSeat = startParameters.players.find((seat) => seat.role !== viewerRole);
-  const startSummaryText = `你执${selfSeat?.side === 'red' ? '红' : '黑'}，对手执${opponentSeat?.side === 'red' ? '红' : '黑'} · 局时 ${time.label}（${time.description}）`;
-
   const redSeat = startParameters.players.find((seat) => seat.side === 'red');
   const blackSeat = startParameters.players.find((seat) => seat.side === 'black');
+  const playerRole = viewerRole === 'host' || viewerRole === 'guest' ? viewerRole : null;
+  // 旁观视角固定红方在下：红方信息条在底部、黑方在顶部。
+  const selfSeat = playerRole ? startParameters.players.find((seat) => seat.role === playerRole) : redSeat;
+  const opponentSeat = playerRole ? startParameters.players.find((seat) => seat.role !== playerRole) : blackSeat;
+  const startSummaryText = isSpectator
+    ? `旁观视角（红方在下） · 局时 ${time.label}（${time.description}）`
+    : `你执${selfSeat?.side === 'red' ? '红' : '黑'}，对手执${opponentSeat?.side === 'red' ? '红' : '黑'} · 局时 ${time.label}（${time.description}）`;
+
   const preferenceText =
     startParameters.sidePreference === 'random'
       ? '随机分先'
@@ -354,23 +371,28 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
 
   const turnLabel = displayState.winner
     ? `${campLabel(displayState.winner)}获胜`
-    : isMyTurn
-      ? `轮到你（${campLabel(mySide)}）`
-      : `等待对方行动（${campLabel(opponentSide)}）`;
+    : isSpectator
+      ? `轮到${campLabel(displayState.currentTurn)}行动`
+      : isMyTurn
+        ? `轮到你（${campLabel(mySide)}）`
+        : `等待对方行动（${campLabel(opponentSide)}）`;
 
-  const opponentRole = viewerRole === 'host' ? 'guest' : 'host';
-  const opponentMember =
-    connection.members.find((member) => member.role === opponentRole) ??
-    connection.members.find((member) => member.id !== connection.memberId);
-  const selfMember =
-    connection.members.find((member) => member.role === viewerRole) ??
-    connection.members.find((member) => member.id === connection.memberId);
+  const opponentRole = isSpectator ? (blackSeat?.role ?? 'guest') : viewerRole === 'host' ? 'guest' : 'host';
+  const selfRole = isSpectator ? (redSeat?.role ?? 'host') : viewerRole === 'host' ? 'host' : 'guest';
+  const opponentMember = isSpectator
+    ? connection.members.find((member) => member.id === startParameters.blackMemberId)
+    : connection.members.find((member) => member.role === opponentRole) ??
+      connection.members.find((member) => member.id !== connection.memberId);
+  const selfMember = isSpectator
+    ? connection.members.find((member) => member.id === startParameters.redMemberId)
+    : connection.members.find((member) => member.role === selfRole) ??
+      connection.members.find((member) => member.id === connection.memberId);
 
   const opponentConnected = opponentMember ? opponentMember.connected : false;
   const selfConnected = selfMember ? selfMember.connected : connection.status === 'connected';
 
   const opponentName = opponentMember?.name ?? opponentSeat?.name ?? (opponentRole === 'host' ? '房主' : '客人');
-  const selfName = selfMember?.name ?? selfSeat?.name ?? (viewerRole === 'host' ? '房主' : '客人');
+  const selfName = selfMember?.name ?? selfSeat?.name ?? (selfRole === 'host' ? '房主' : '客人');
 
   const opponentPhraseEvent = useMemo(() => {
     if (!opponentMember?.id || !game.recentPhraseEvents) {
@@ -380,11 +402,12 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
   }, [opponentMember?.id, game.recentPhraseEvents]);
 
   const selfPhraseEvent = useMemo(() => {
-    if (!myMemberId || !game.recentPhraseEvents) {
+    const selfMemberId = isSpectator ? startParameters.redMemberId : myMemberId;
+    if (!selfMemberId || !game.recentPhraseEvents) {
       return null;
     }
-    return game.recentPhraseEvents[myMemberId] ?? null;
-  }, [myMemberId, game.recentPhraseEvents]);
+    return game.recentPhraseEvents[selfMemberId] ?? null;
+  }, [isSpectator, startParameters.redMemberId, myMemberId, game.recentPhraseEvents]);
 
   return (
     <div className="online-game-container" data-testid="online-game">
@@ -426,9 +449,11 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
             <div className="disconnect-grace-banner" data-testid="disconnect-grace-banner" role="status">
               <span className="grace-pulse-dot" />
               <span>
-                {opponentConnected
-                  ? '己方网络出现波动，对局时钟已暂停…'
-                  : `对手已掉线，对局时钟暂停中。等待重连（剩余 ${graceSecondsRemaining} 秒，共 90 秒）…`}
+                {isSpectator
+                  ? '有棋手连接中断，对局时钟暂停中，等待重连…'
+                  : opponentConnected
+                    ? '己方网络出现波动，对局时钟已暂停…'
+                    : `对手已掉线，对局时钟暂停中。等待重连（剩余 ${graceSecondsRemaining} 秒，共 90 秒）…`}
               </span>
             </div>
           ) : null}
@@ -454,7 +479,7 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
           <Board
             captureGhost={feedback.captureGhost}
             checkPulse={feedback.checkPulse}
-            disabled={isNegotiating || isMatchEnded}
+            disabled={isSpectator || isNegotiating || isMatchEnded}
             flip={feedback.flip}
             gameState={displayState}
             hideHeader={true}
@@ -468,16 +493,16 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
           {/* 底部己方信息条 */}
           <footer
             className={`online-self-bar ${
-              displayState.winner ? 'turn-finished' : isMyTurn ? 'turn-active' : 'turn-waiting'
+              displayState.winner ? 'turn-finished' : bottomActive ? 'turn-active' : 'turn-waiting'
             }`}
             data-testid="online-self-bar"
-            data-turn-state={displayState.winner ? 'finished' : isMyTurn ? 'active' : 'waiting'}
+            data-turn-state={displayState.winner ? 'finished' : bottomActive ? 'active' : 'waiting'}
           >
             <span
               className={`online-player-badge online-player-bottom ${selfConnected ? 'online' : 'offline'}`}
-              data-testid={viewerRole === 'host' ? 'member-host' : 'member-guest'}
+              data-testid={selfRole === 'host' ? 'member-host' : 'member-guest'}
             >
-              <span className="online-player-role">{viewerRole === 'host' ? '房主' : '客人'}</span>
+              <span className="online-player-role">{selfRole === 'host' ? '房主' : '客人'}</span>
               <span className="online-player-name">{selfName}</span>
               <span className={`online-player-camp camp-${mySide}`}>执{campLabel(mySide)}</span>
               <span className={`online-player-status ${selfConnected ? 'status-connected' : 'status-dropped'}`}>
@@ -514,6 +539,11 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
               ) : null}
             </div>
 
+            {isSpectator ? (
+              <p className="spectator-readonly-note" data-testid="spectator-readonly-note">
+                旁观中 · 只读观看，不可操作棋局
+              </p>
+            ) : (
             <div className="online-negotiation-actions">
               <QuickPhrasePanel
                 cooldownUntil={game.phraseCooldownUntil?.[myMemberId] ?? 0}
@@ -549,14 +579,15 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
                 认输
               </button>
             </div>
+            )}
 
             <button
               className="panel-action-secondary online-exit-button"
-              data-testid={viewerRole === 'host' ? 'close-room' : 'leave-room'}
+              data-testid={isSpectator ? 'spectate-exit' : viewerRole === 'host' ? 'close-room' : 'leave-room'}
               onClick={onExit}
               type="button"
             >
-              {viewerRole === 'host' ? '关闭房间' : '离开房间'}
+              {isSpectator ? '离开观看' : viewerRole === 'host' ? '关闭房间' : '离开房间'}
             </button>
           </footer>
         </div>
@@ -569,6 +600,10 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
             <p className="room-hint" data-testid="start-snapshot">
               {startSnapshotText}
             </p>
+          </section>
+          <section className="room-panel online-spectator-panel" data-testid="online-spectator-panel">
+            <h2>旁观者</h2>
+            <SpectatorList members={connection.members} selfId={connection.memberId} />
           </section>
           <MoveHistory recentAction={displayState.recentAction} />
           <StatusPanel
@@ -621,7 +656,8 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
 
       {game.pendingNegotiation ? (
         <NegotiationDialog
-          isTarget={game.pendingNegotiation.responderMemberId === connection.memberId}
+          isSpectator={isSpectator}
+          isTarget={!isSpectator && game.pendingNegotiation.responderMemberId === connection.memberId}
           onReply={(agree) => client.sendGameNegotiateReply(agree)}
           pendingNegotiation={game.pendingNegotiation}
         />
@@ -631,10 +667,11 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
 
       {settlement ? (
         <GameResultDialog
+          onLeave={onExit}
           onRematch={() => client.sendLobbyReturn('rematch')}
           onReturnLobby={() => client.sendLobbyReturn('return-lobby')}
           settlement={settlement}
-          viewerSide={mySide}
+          viewerSide={isSpectator ? null : mySide}
         />
       ) : null}
     </div>

@@ -68,13 +68,25 @@ import {
 } from './quick-chat.js';
 import { parseMatchEvents, type MatchEvent } from './match.js';
 
-/** v5：增加局内内置快捷短语互动与棋步结构化耗时记录。 */
-export const PROTOCOL_VERSION = 5;
+/** v6：增加只读旁观身份（spectator）与旁观者同步/恢复。 */
+export const PROTOCOL_VERSION = 6;
 
 /** WebSocket 握手路径（房间服务同时在该路径上提供客人页面）。 */
 export const WS_PATH = '/ws';
 
-export type Role = 'host' | 'guest';
+/** 执色玩家身份：只有 host/guest 占席位、参与准备就绪与对局动作。 */
+export type PlayerRole = 'host' | 'guest';
+
+/** 房间成员身份：两位执色玩家 + 可选的只读旁观者。 */
+export type Role = PlayerRole | 'spectator';
+
+export function isPlayerRole(value: unknown): value is PlayerRole {
+  return value === 'host' || value === 'guest';
+}
+
+export function isRole(value: unknown): value is Role {
+  return value === 'host' || value === 'guest' || value === 'spectator';
+}
 
 /** 成员离开原因：主动离开或意外掉线，用于卡片上的原因标注。 */
 export type MemberLeaveReason = 'left' | 'dropped';
@@ -352,7 +364,7 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
     const name = payload.name;
     const token = payload.token;
     const resumeToken = payload.resumeToken;
-    if (role !== 'host' && role !== 'guest') {
+    if (!isRole(role)) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'hello-role' };
     }
     if (typeof name !== 'string' || name.length === 0) {
@@ -707,7 +719,7 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     if (typeof message.roomId !== 'string' || typeof payload.memberId !== 'string') {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'welcome-identity' };
     }
-    if (payload.role !== 'host' && payload.role !== 'guest') {
+    if (!isRole(payload.role)) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'welcome-role' };
     }
     const members = parseMembers(payload.members);
@@ -719,6 +731,7 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     if (payload.game !== undefined && !game) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'welcome-game' };
     }
+    const defaultName = payload.role === 'host' ? '房主' : payload.role === 'guest' ? '客人' : '旁观';
     return {
       ok: true,
       message: {
@@ -729,7 +742,7 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
           roomId: message.roomId,
           memberId: payload.memberId,
           role: payload.role,
-          name: typeof payload.name === 'string' ? payload.name : payload.role === 'host' ? '房主' : '客人',
+          name: typeof payload.name === 'string' ? payload.name : defaultName,
           members,
           lobby,
           ...(typeof payload.resumeToken === 'string' ? { resumeToken: payload.resumeToken } : {}),
@@ -1060,7 +1073,8 @@ export function isLobbyRejectCode(value: unknown): value is LobbyRejectCode {
     value === 'STALE_VERSION' ||
     value === 'NOT_READY' ||
     value === 'MEMBER_MISSING' ||
-    value === 'ALREADY_STARTED'
+    value === 'ALREADY_STARTED' ||
+    value === 'SPECTATOR_READONLY'
   );
 }
 
@@ -1074,7 +1088,7 @@ function parseMembers(value: unknown): MemberSnapshot[] | null {
       return null;
     }
     const { id, role, name, connected, leaveReason } = entry;
-    if (typeof id !== 'string' || (role !== 'host' && role !== 'guest') || typeof name !== 'string' || typeof connected !== 'boolean') {
+    if (typeof id !== 'string' || !isRole(role) || typeof name !== 'string' || typeof connected !== 'boolean') {
       return null;
     }
     if (leaveReason !== undefined && leaveReason !== 'left' && leaveReason !== 'dropped') {

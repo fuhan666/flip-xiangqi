@@ -44,6 +44,7 @@ const LOBBY_REJECT_COPY: Record<LobbyRejectCode, string> = {
   NOT_READY: '还不能开始对局 —— 需要双方都已准备 —— 等待双方准备',
   MEMBER_MISSING: '还不能开始对局 —— 需要双方都在线并留在房间内 —— 请等对手重新加入后再开始',
   ALREADY_STARTED: '对局已经开始 —— 开局参数已冻结，不能重复开始或修改 —— 如需再来一局，请退出后重新建房',
+  SPECTATOR_READONLY: '旁观模式下不可操作 —— 你正在观看本局对局 —— 如需对弈，请返回菜单加入或创建房间',
 };
 
 export function describeLobbyReject(code: LobbyRejectCode): string {

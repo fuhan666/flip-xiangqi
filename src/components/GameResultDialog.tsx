@@ -1,13 +1,18 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { Camp } from '../game/types.js';
 import type { MatchSettlement } from '../network/protocol.js';
 import { formatTimeDisplay } from './PlayerClock.js';
 
 export interface GameResultDialogProps {
   settlement: MatchSettlement;
+  /** 玩家为己方执色；旁观者为 null（只展示胜方与原因，无任何对局发送入口）。 */
   viewerSide: Camp | null;
-  onRematch: () => void;
-  onReturnLobby: () => void;
+  /** 玩家模式：再来一局。 */
+  onRematch?: () => void;
+  /** 玩家模式：返回大厅（含 Escape 快捷路径）。 */
+  onReturnLobby?: () => void;
+  /** 旁观模式：离开观看。 */
+  onLeave?: () => void;
 }
 
 export function formatEndgameReason(
@@ -43,26 +48,39 @@ export function GameResultDialog({
   viewerSide,
   onRematch,
   onReturnLobby,
+  onLeave,
 }: GameResultDialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
-  const rematchBtnRef = useRef<HTMLButtonElement>(null);
+  const primaryBtnRef = useRef<HTMLButtonElement>(null);
+  // 旁观模式的本地关闭：仅隐藏结果层，继续观看，不发送任何对局消息。
+  const [dismissed, setDismissed] = useState(false);
 
+  const isSpectator = viewerSide === null;
   const isWinner = viewerSide !== null && settlement.winner === viewerSide;
   const isDraw = settlement.winner === null;
   const winnerCampLabel = settlement.winner === 'red' ? '红方' : '黑方';
 
-  // 挂载时自动聚焦到主操作按钮，按 Escape 可返回大厅
+  // 挂载时自动聚焦到主操作按钮；玩家按 Escape 返回大厅，旁观者仅本地收起结果层。
   useEffect(() => {
-    rematchBtnRef.current?.focus();
+    primaryBtnRef.current?.focus();
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onReturnLobby();
+      if (e.key !== 'Escape') {
+        return;
       }
+      if (isSpectator) {
+        setDismissed(true);
+        return;
+      }
+      onReturnLobby?.();
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onReturnLobby]);
+  }, [isSpectator, onReturnLobby]);
+
+  if (dismissed) {
+    return null;
+  }
 
   let outcomeTitle = isDraw
     ? '平局'
@@ -119,23 +137,47 @@ export function GameResultDialog({
         </div>
 
         <div className="game-result-actions">
-          <button
-            className="menu-primary btn-rematch"
-            data-testid="btn-rematch"
-            onClick={onRematch}
-            ref={rematchBtnRef}
-            type="button"
-          >
-            再来一局
-          </button>
-          <button
-            className="menu-outline btn-return-lobby"
-            data-testid="btn-return-lobby"
-            onClick={onReturnLobby}
-            type="button"
-          >
-            返回大厅
-          </button>
+          {isSpectator ? (
+            <>
+              <button
+                className="menu-primary btn-continue-watch"
+                data-testid="btn-continue-watch"
+                onClick={() => setDismissed(true)}
+                ref={primaryBtnRef}
+                type="button"
+              >
+                继续观看
+              </button>
+              <button
+                className="menu-outline btn-leave-watch"
+                data-testid="btn-leave-watch"
+                onClick={() => onLeave?.()}
+                type="button"
+              >
+                离开观看
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                className="menu-primary btn-rematch"
+                data-testid="btn-rematch"
+                onClick={onRematch}
+                ref={primaryBtnRef}
+                type="button"
+              >
+                再来一局
+              </button>
+              <button
+                className="menu-outline btn-return-lobby"
+                data-testid="btn-return-lobby"
+                onClick={onReturnLobby}
+                type="button"
+              >
+                返回大厅
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>

@@ -396,9 +396,19 @@ export class RoomClient implements RoomConnection {
     return this.joinedAddress;
   }
 
+  /** 旁观者只读：true 表示当前身份为旁观者。 */
+  private isSpectator(): boolean {
+    return this.state.role === 'spectator';
+  }
+
+  /** 旁观拦截：在生成乐观局面或发送任何消息之前返回拒绝原因。 */
+  private spectatorBlock(): { ok: false; reason: string } | null {
+    return this.isSpectator() ? { ok: false, reason: '旁观模式下不可操作，仅可观看' } : null;
+  }
+
   sendLobbySettings(sidePreference: SidePreference, timeControlId: TimeControlId): void {
     const roomId = this.state.roomId;
-    if (!roomId) {
+    if (!roomId || this.isSpectator()) {
       return;
     }
     this.sendLobbyRequest('settings', buildClientLobbySettings(roomId, { sidePreference, timeControlId }));
@@ -406,7 +416,7 @@ export class RoomClient implements RoomConnection {
 
   sendLobbyLock(locked: boolean): void {
     const roomId = this.state.roomId;
-    if (!roomId) {
+    if (!roomId || this.isSpectator()) {
       return;
     }
     this.sendLobbyRequest('lock', buildClientLobbyLock(roomId, locked));
@@ -415,7 +425,7 @@ export class RoomClient implements RoomConnection {
   sendLobbyReady(ready: boolean): void {
     const roomId = this.state.roomId;
     const settingsVersion = this.state.lobby?.settings.settingsVersion;
-    if (!roomId || typeof settingsVersion !== 'number') {
+    if (!roomId || typeof settingsVersion !== 'number' || this.isSpectator()) {
       return;
     }
     this.sendLobbyRequest('ready', buildClientLobbyReady(roomId, ready, settingsVersion));
@@ -423,7 +433,7 @@ export class RoomClient implements RoomConnection {
 
   sendLobbyStart(): void {
     const roomId = this.state.roomId;
-    if (!roomId) {
+    if (!roomId || this.isSpectator()) {
       return;
     }
     this.sendLobbyRequest('start', buildClientLobbyStart(roomId));
@@ -431,7 +441,7 @@ export class RoomClient implements RoomConnection {
 
   sendLobbyReturn(intent: 'return-lobby' | 'rematch'): void {
     const socket = this.socket;
-    if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
+    if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN || this.isSpectator()) {
       return;
     }
     const matchId = this.state.game?.matchId;
@@ -447,6 +457,10 @@ export class RoomClient implements RoomConnection {
   }
 
   sendGameAction(action: MatchAction): { ok: boolean; reason?: string } {
+    const blocked = this.spectatorBlock();
+    if (blocked) {
+      return blocked;
+    }
     const socket = this.socket;
     if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
       return { ok: false, reason: '连接未就绪' };
@@ -546,6 +560,10 @@ export class RoomClient implements RoomConnection {
   }
 
   sendGameNegotiate(kind: 'undo' | 'draw'): { ok: boolean; reason?: string } {
+    const blocked = this.spectatorBlock();
+    if (blocked) {
+      return blocked;
+    }
     const socket = this.socket;
     if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
       return { ok: false, reason: '连接未就绪' };
@@ -596,6 +614,10 @@ export class RoomClient implements RoomConnection {
   }
 
   sendGameNegotiateReply(agree: boolean): { ok: boolean; reason?: string } {
+    const blocked = this.spectatorBlock();
+    if (blocked) {
+      return blocked;
+    }
     const socket = this.socket;
     if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
       return { ok: false, reason: '连接未就绪' };
@@ -627,6 +649,10 @@ export class RoomClient implements RoomConnection {
   }
 
   sendGameResign(): { ok: boolean; reason?: string } {
+    const blocked = this.spectatorBlock();
+    if (blocked) {
+      return blocked;
+    }
     const socket = this.socket;
     if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
       return { ok: false, reason: '连接未就绪' };
@@ -675,6 +701,10 @@ export class RoomClient implements RoomConnection {
   }
 
   sendChatPhrase(phraseId: string): { ok: boolean; reason?: string } {
+    const blocked = this.spectatorBlock();
+    if (blocked) {
+      return blocked;
+    }
     const socket = this.socket;
     if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
       return { ok: false, reason: '连接未就绪' };
@@ -760,6 +790,15 @@ export class RoomClient implements RoomConnection {
       this.savedRoomId = message.payload.roomId;
       if (message.payload.resumeToken) {
         this.savedResumeToken = message.payload.resumeToken;
+      }
+      // 以 welcome 实际身份为准保存恢复参数：普通加入被分流为旁观、
+      // 或显式旁观进入时，重连必须携带正确身份与本人恢复凭据。
+      if (this.savedJoinOptions) {
+        this.savedJoinOptions = {
+          ...this.savedJoinOptions,
+          role: message.payload.role,
+          name: message.payload.name,
+        };
       }
 
       const incomingGame = message.payload.game;
@@ -1242,10 +1281,11 @@ export class RoomClient implements RoomConnection {
     this.stopHeartbeat();
     this.teardownSocket();
 
-    // 仅已入房成员且有恢复凭据支持自动重连（客人用 resumeToken，房主用 host token）
+    // 仅已入房成员且有恢复凭据支持自动重连（客人/旁观者用 resumeToken，房主用 host token）
     const isGuest = this.savedJoinOptions?.role === 'guest';
+    const isSpectator = this.savedJoinOptions?.role === 'spectator';
     const isHost = this.savedJoinOptions?.role === 'host';
-    const canReconnectGuest = isGuest && this.savedRoomId && this.savedResumeToken && this.savedAddress;
+    const canReconnectGuest = (isGuest || isSpectator) && this.savedRoomId && this.savedResumeToken && this.savedAddress;
     const canReconnectHost = isHost && this.savedRoomId && this.savedJoinOptions?.token && this.savedAddress;
 
     if (canReconnectGuest || canReconnectHost) {
@@ -1331,8 +1371,9 @@ export class RoomClient implements RoomConnection {
 
   private attemptReconnect(): void {
     const isGuest = this.savedJoinOptions?.role === 'guest';
+    const isSpectator = this.savedJoinOptions?.role === 'spectator';
     const isHost = this.savedJoinOptions?.role === 'host';
-    const hasCredentials = (isGuest && this.savedResumeToken) || (isHost && this.savedJoinOptions?.token);
+    const hasCredentials = ((isGuest || isSpectator) && this.savedResumeToken) || (isHost && this.savedJoinOptions?.token);
 
     if (
       !this.reconnecting ||
@@ -1383,7 +1424,7 @@ export class RoomClient implements RoomConnection {
               token: this.savedJoinOptions!.token,
             })
           : buildClientHello({
-              role: 'guest',
+              role: isSpectator ? 'spectator' : 'guest',
               name: this.savedJoinOptions!.name,
               roomId: this.savedRoomId,
               resumeToken: this.savedResumeToken!,

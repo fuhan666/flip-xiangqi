@@ -1,5 +1,12 @@
 import type { ReactNode } from 'react';
-import type { LobbyRejection, MemberSnapshot, Role, SidePreference, TimeControlId } from '../../network/protocol';
+import type {
+  LobbyRejection,
+  MemberSnapshot,
+  PlayerRole,
+  Role,
+  SidePreference,
+  TimeControlId,
+} from '../../network/protocol';
 import type { LobbyRequestKind } from '../../network/client';
 import {
   TIME_CONTROLS,
@@ -9,7 +16,7 @@ import {
   sideOptionViews,
   type LobbyState,
 } from '../../network/lobby';
-import { MemberList } from './MemberList';
+import { MemberList, SpectatorList } from './MemberList';
 
 interface RoomLobbyProps {
   members: MemberSnapshot[];
@@ -36,14 +43,18 @@ function sideSummary(lobby: LobbyState): string {
   return `房主：${describeSideDisplay(sides.host)} · 客人：${describeSideDisplay(sides.guest)}${suffix}`;
 }
 
-function startSummary(lobby: LobbyState, viewerRole: Role | null): string {
+function startSummary(lobby: LobbyState, viewerRole: PlayerRole | null): string {
   const parameters = lobby.startParameters;
   if (!parameters) {
     return '';
   }
+  const time = findTimeControl(parameters.timeControlId);
+  if (viewerRole === null) {
+    // 旁观视角：固定红方在下，只描述双方归属，不出玩家口吻文案。
+    return `旁观视角（红方在下） · 局时 ${time.label}（${time.description}）`;
+  }
   const selfSeat = parameters.players.find((seat) => seat.role === viewerRole);
   const opponentSeat = parameters.players.find((seat) => seat.role !== viewerRole);
-  const time = findTimeControl(parameters.timeControlId);
   return `你执${selfSeat?.side === 'red' ? '红' : '黑'}，对手执${opponentSeat?.side === 'red' ? '红' : '黑'} · 局时 ${time.label}（${time.description}）`;
 }
 
@@ -75,12 +86,14 @@ export function RoomLobby({
   reconnecting = false,
 }: RoomLobbyProps) {
   const started = lobby?.phase === 'started';
+  const isSpectator = viewerRole === 'spectator';
+  const playerRole: PlayerRole | null = viewerRole === 'host' || viewerRole === 'guest' ? viewerRole : null;
   const settingsEditable = Boolean(lobby && viewerRole === 'host' && !lobby.settings.locked && !started && !reconnecting);
-  const ownReady = Boolean(viewerRole && lobby?.ready[viewerRole]);
+  const ownReady = Boolean(playerRole && lobby?.ready[playerRole]);
   const allReady = Boolean(lobby && lobby.ready.host && lobby.ready.guest && lobby.presence.host && lobby.presence.guest);
   const busy = pendingCommand !== null || reconnecting;
   const startHint =
-    !lobby || started
+    !lobby || started || isSpectator
       ? null
       : allReady
         ? viewerRole === 'host'
@@ -95,6 +108,7 @@ export function RoomLobby({
       <section className="room-panel">
         <h2>房间成员</h2>
         <MemberList lobby={lobby} members={members} selfId={selfId} />
+        <SpectatorList members={members} selfId={selfId} />
         {connectionHint}
       </section>
 
@@ -110,7 +124,7 @@ export function RoomLobby({
           <fieldset className="setting-group" disabled={!settingsEditable}>
             <legend>分先方式</legend>
             <div className="setting-options" data-testid="setting-side-group">
-              {sideOptionViews(viewerRole ?? 'host').map((option) => (
+              {sideOptionViews(playerRole ?? 'host').map((option) => (
                 <label className="setting-option" key={option.id}>
                   <input
                     aria-label={option.label}
@@ -176,7 +190,9 @@ export function RoomLobby({
           ) : null}
           {viewerRole !== 'host' && !started ? (
             <p className="room-hint" data-testid="settings-readonly-note">
-              设置由房主决定 —— 你看到的是实时同步的结果
+              {isSpectator
+                ? '旁观模式：设置与准备均为只读 —— 你看到的是实时同步的结果'
+                : '设置由房主决定 —— 你看到的是实时同步的结果'}
             </p>
           ) : null}
         </section>
@@ -188,12 +204,16 @@ export function RoomLobby({
           {started ? (
             <>
               <p className="room-notice" data-testid="lobby-started">
-                {startSummary(lobby, viewerRole)}
+                {startSummary(lobby, playerRole)}
               </p>
               <p className="room-hint" data-testid="start-snapshot">
                 {startSnapshot(lobby)}
               </p>
             </>
+          ) : isSpectator ? (
+            <p className="room-hint" data-testid="spectator-waiting-note">
+              旁观中 —— 不参与准备与开局 —— 对局开始后自动进入观战
+            </p>
           ) : (
             <>
               <div className="panel-actions">

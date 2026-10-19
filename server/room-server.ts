@@ -94,6 +94,8 @@ export interface RoomServerOptions {
   nowFn?: () => number;
   /** 时钟广播周期（毫秒），默认 1000ms。 */
   clockIntervalMs?: number;
+  /** 旁观者掉线后的恢复窗口（毫秒），超时未恢复即清理记录，默认 95 秒。 */
+  spectatorResumeWindowMs?: number;
 }
 
 interface RoomMember {
@@ -103,14 +105,18 @@ interface RoomMember {
   socket: WebSocket | null;
   connected: boolean;
   leaveReason: MemberLeaveReason | null;
+  /** 旁观者独立恢复凭据；host/guest 沿用 host token / 全局 guest resumeToken。 */
+  resumeToken?: string;
 }
 
 type LobbyClientMessage = Extract<ClientMessage, { type: `lobby.${string}` }>;
 
 const HOST_NAME = '房主';
 const GUEST_NAME = '客人';
+const SPECTATOR_NAME = '旁观';
 const DEFAULT_MAX_PORT_ATTEMPTS = 20;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
+const DEFAULT_SPECTATOR_RESUME_WINDOW_MS = 95_000;
 const CLOSE_DRAIN_TIMEOUT_MS = 1_000;
 
 function memberSnapshot(member: RoomMember): MemberSnapshot {
@@ -171,6 +177,10 @@ export class RoomServer {
   private readonly processedPhraseRequests = new Map<string, { event: QuickPhraseEvent }>();
   private host: RoomMember | null = null;
   private guest: RoomMember | null = null;
+  /** 旁观者注册表：不占执色席位，各自持有独立恢复凭据。 */
+  private readonly spectators: RoomMember[] = [];
+  private spectatorNameSeq = 0;
+  private readonly spectatorExpiryTimers = new Map<string, NodeJS.Timeout>();
   private lobby: LobbyState;
   private match: MatchState | null = null;
   private closed = false;
@@ -244,6 +254,9 @@ export class RoomServer {
     }
     if (this.guest) {
       members.push(memberSnapshot(this.guest));
+    }
+    for (const spectator of this.spectators) {
+      members.push(memberSnapshot(spectator));
     }
     return members;
   }
@@ -338,6 +351,14 @@ export class RoomServer {
       this.guest.connected = false;
       this.guest.socket = null;
     }
+    for (const spectator of this.spectators) {
+      spectator.connected = false;
+      spectator.socket = null;
+    }
+    for (const timer of this.spectatorExpiryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.spectatorExpiryTimers.clear();
 
     this.clearAllWatchdogs();
     this.stopClockBroadcast();
@@ -675,7 +696,18 @@ export class RoomServer {
         clearTimeout(handshakeTimer);
 
         // 先落座再发 welcome：快照里带上本人 presence，其他成员收 lobby.state。
-        this.applyLobby({ type: 'member-joined', role: member.role }, socket);
+        // 旁观者不占执色、不进入准备就绪流程，不改动 presence/ready。
+        if (member.role !== 'spectator') {
+          this.applyLobby({ type: 'member-joined', role: member.role }, socket);
+        }
+
+        // 恢复凭据按真实身份发放：客人用全局 guest token，旁观者用本人独立 token。
+        const resumeToken =
+          member.role === 'guest'
+            ? this.guestResumeToken ?? undefined
+            : member.role === 'spectator'
+              ? member.resumeToken
+              : undefined;
 
         socket.send(
           buildServerMessage({
@@ -688,7 +720,7 @@ export class RoomServer {
               name: member.name,
               members: this.getMembers(),
               lobby: this.getLobby(),
-              ...(member.role === 'guest' && this.guestResumeToken ? { resumeToken: this.guestResumeToken } : {}),
+              ...(resumeToken ? { resumeToken } : {}),
               ...(this.match ? { game: snapshotMatch(this.match, this.now()) } : {}),
             },
           }),
@@ -704,7 +736,10 @@ export class RoomServer {
         return;
       }
 
-      const activeMember = joinedMember.role === 'host' ? this.host : this.guest;
+      // 席位与当前 socket 校验：玩家按席位记录比对，旁观者按本人记录比对，
+      // 防止旧 socket 在被新连接替换后继续操作。
+      const activeMember =
+        joinedMember.role === 'spectator' ? joinedMember : joinedMember.role === 'host' ? this.host : this.guest;
       if (!activeMember || activeMember.socket !== socket) {
         this.reject(socket, connectionId, 'UNAUTHORIZED', 'socket-superseded');
         return;
@@ -756,6 +791,17 @@ export class RoomServer {
         const member = joinedMember;
         joinedMember = null;
         this.depart(member, 'leave');
+        return;
+      }
+
+      // 旁观者只读：心跳、leave、game.sync 之外的一切消息在进入任何
+      // 会修改大厅/对局的 handler 前拒绝，且只回复请求方、无其他副作用。
+      if (joinedMember.role === 'spectator') {
+        if (message.type === 'game.sync') {
+          this.handleGameSync(socket, connectionId, joinedMember, message);
+          return;
+        }
+        this.rejectSpectatorAction(socket, message);
         return;
       }
 
@@ -889,6 +935,12 @@ export class RoomServer {
       return member;
     }
 
+    if (payload.role === 'spectator') {
+      // 显式旁观：始终不占执色席位。
+      return this.admitSpectator(socket, payload.resumeToken);
+    }
+
+    // 客人恢复只接受全局 guest token：旁观者/房主凭据禁止跨身份使用。
     if (payload.resumeToken) {
       if (!this.guestResumeToken || payload.resumeToken !== this.guestResumeToken || !this.guest) {
         this.reject(socket, 'guest', 'UNAUTHORIZED', 'bad-resume-token');
@@ -924,13 +976,12 @@ export class RoomServer {
     }
 
     if (this.guest?.connected) {
-      this.reject(socket, 'guest', 'ROOM_FULL', 'guest-slot-taken');
-      return null;
+      // 客人席位已被占用：普通加入自动分流为旁观者，不占执色、不参与准备就绪。
+      return this.admitSpectator(socket, undefined);
     }
     if (this.lobby.phase === 'started' && this.guest) {
-      // 开局后保持已冻结身份，不接受新成员替换。
-      this.reject(socket, 'guest', 'ROOM_FULL', 'guest-replace-after-start');
-      return null;
+      // 开局后保持已冻结身份，不接受新成员替换：后来者以旁观身份进入。
+      return this.admitSpectator(socket, undefined);
     }
 
     this.guestResumeToken = generateToken();
@@ -950,12 +1001,82 @@ export class RoomServer {
     return member;
   }
 
+  /**
+   * 旁观者准入：有恢复凭据时只认本人凭据并替换旧 socket（禁止跨身份 token），
+   * 无凭据时新建旁观记录；错误凭据一律拒绝，不回退为新成员。
+   */
+  private admitSpectator(socket: WebSocket, resumeToken: string | undefined): RoomMember | null {
+    if (resumeToken) {
+      const existing = this.spectators.find((member) => member.resumeToken && member.resumeToken === resumeToken);
+      if (!existing) {
+        this.reject(socket, 'spectator', 'UNAUTHORIZED', 'bad-resume-token');
+        return null;
+      }
+      const oldSocket = existing.socket;
+      if (oldSocket && oldSocket !== socket) {
+        this.clearSocketWatchdog(oldSocket);
+        try {
+          this.sendError(oldSocket, 'UNAUTHORIZED', 'socket-superseded');
+          oldSocket.close(closeCodeForError('UNAUTHORIZED'), 'socket-superseded');
+        } catch {
+          // 忽略关闭失败
+        }
+      }
+      existing.socket = socket;
+      existing.connected = true;
+      existing.leaveReason = null;
+      this.clearSpectatorExpiry(existing.id);
+      return existing;
+    }
+
+    this.spectatorNameSeq += 1;
+    const member: RoomMember = {
+      id: generateId(),
+      role: 'spectator',
+      name: `${SPECTATOR_NAME}${this.spectatorNameSeq}`,
+      socket,
+      connected: true,
+      leaveReason: null,
+      resumeToken: generateToken(),
+    };
+    this.spectators.push(member);
+    return member;
+  }
+
+  private clearSpectatorExpiry(memberId: string): void {
+    const timer = this.spectatorExpiryTimers.get(memberId);
+    if (timer) {
+      clearTimeout(timer);
+      this.spectatorExpiryTimers.delete(memberId);
+    }
+  }
+
+  /** 旁观者掉线后的恢复窗口：超时未恢复即清理记录并同步名单。 */
+  private scheduleSpectatorExpiry(member: RoomMember): void {
+    this.clearSpectatorExpiry(member.id);
+    const timer = setTimeout(() => {
+      this.spectatorExpiryTimers.delete(member.id);
+      const index = this.spectators.indexOf(member);
+      if (index >= 0 && !member.connected) {
+        this.spectators.splice(index, 1);
+        this.logger('ws.spectator_expired', { room: this.roomId, member: member.id });
+        this.broadcastMembers();
+      }
+    }, this.options.spectatorResumeWindowMs ?? DEFAULT_SPECTATOR_RESUME_WINDOW_MS);
+    timer.unref?.();
+    this.spectatorExpiryTimers.set(member.id, timer);
+  }
+
   private handleLobbyMessage(
     socket: WebSocket,
     connectionId: string,
     member: RoomMember,
     message: LobbyClientMessage,
   ): void {
+    // 旁观消息已在分发层拒绝；这里仅为类型收窄到执色玩家。
+    if (member.role === 'spectator') {
+      return;
+    }
     if (message.roomId !== this.roomId) {
       this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
       return;
@@ -1088,6 +1209,20 @@ export class RoomServer {
   }
 
   private handleMemberDrop(member: RoomMember): void {
+    if (member.role === 'spectator') {
+      if (member.socket) {
+        this.clearSocketWatchdog(member.socket);
+      }
+      member.connected = false;
+      member.socket = null;
+      member.leaveReason = 'dropped';
+      // 旁观者掉线不影响对局：不暂停时钟、不取消协商、不动 ready/presence/revision。
+      this.scheduleSpectatorExpiry(member);
+      this.logger('ws.spectator_dropped', { room: this.roomId, member: member.id });
+      this.broadcastMembers();
+      return;
+    }
+
     if (this.lobby.phase === 'started' && this.match) {
       if (this.match.pendingNegotiation) {
         this.clearNegotiationTimer();
@@ -1148,6 +1283,31 @@ export class RoomServer {
   }
 
   private depart(member: RoomMember, reason: 'leave'): void {
+    if (member.role === 'spectator') {
+      // 旁观者主动退出：撤销恢复凭据并清理记录，不影响对局与大厅状态。
+      this.clearSpectatorExpiry(member.id);
+      const index = this.spectators.indexOf(member);
+      if (index >= 0) {
+        this.spectators.splice(index, 1);
+      }
+      const socket = member.socket;
+      if (socket) {
+        this.clearSocketWatchdog(socket);
+      }
+      member.connected = false;
+      member.socket = null;
+      member.leaveReason = 'left';
+      member.resumeToken = undefined;
+      this.broadcastMembers();
+      this.logger('ws.spectator_left', { room: this.roomId, member: member.id, reason });
+      try {
+        socket?.close(1000, reason);
+      } catch {
+        // socket 已关闭。
+      }
+      return;
+    }
+
     if (this.lobby.phase === 'started' && this.match) {
       if (this.match.pendingNegotiation) {
         this.clearNegotiationTimer();
@@ -1922,6 +2082,10 @@ export class RoomServer {
     member: RoomMember,
     message: Extract<ClientMessage, { type: 'lobby.return' }>,
   ): void {
+    // 旁观消息已在分发层拒绝；这里仅为类型收窄到执色玩家。
+    if (member.role === 'spectator') {
+      return;
+    }
     if (message.roomId !== this.roomId) {
       this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
       return;
@@ -1977,6 +2141,67 @@ export class RoomServer {
           this.broadcastLobby();
         }
       }
+    }
+  }
+
+  /**
+   * 旁观者动作拒绝：按消息所属通道给出非致命拒绝（大厅/对局/快捷短语各自通道），
+   * 只回复请求方，不进入任何缓存、时钟、revision 或对局裁决逻辑。
+   */
+  private rejectSpectatorAction(socket: WebSocket, message: ClientMessage): void {
+    this.logger('ws.spectator_rejected', { room: this.roomId, type: message.type });
+    try {
+      if (message.type === 'chat.phrase') {
+        socket.send(
+          buildServerMessage(
+            buildServerChatPhraseRejected(
+              this.roomId,
+              {
+                matchId: message.payload.matchId,
+                requestId: message.requestId ?? '',
+                code: 'NOT_A_PLAYER',
+                message: '旁观者不可发送快捷短语',
+              },
+              message.requestId,
+            ),
+          ),
+        );
+        return;
+      }
+      if (
+        message.type === 'lobby.settings' ||
+        message.type === 'lobby.lock' ||
+        message.type === 'lobby.ready' ||
+        message.type === 'lobby.start' ||
+        message.type === 'lobby.return'
+      ) {
+        socket.send(
+          buildServerMessage({
+            type: 'lobby.rejected',
+            roomId: this.roomId,
+            payload: { code: 'SPECTATOR_READONLY', message: '旁观者不可执行大厅操作' },
+          }),
+        );
+        return;
+      }
+      const matchId =
+        message.type === 'game.action' ||
+        message.type === 'game.negotiate' ||
+        message.type === 'game.negotiate.reply' ||
+        message.type === 'game.resign'
+          ? message.payload.matchId
+          : '';
+      const snap = this.match ? snapshotMatch(this.match, this.now()) : null;
+      this.sendGameRejection(
+        socket,
+        matchId,
+        snap?.stepNumber ?? 0,
+        '旁观者不可操作对局',
+        snap ? snap.gameState : createEmptyGameState(),
+        message.requestId,
+      );
+    } catch {
+      // socket 已关闭。
     }
   }
 

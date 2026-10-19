@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { parseServerAddress, formatAddress } from '../../network/address';
+import { fetchRoomSummary, type RoomSummary } from '../../network/control-api';
 import type { RoomConnection, ConnectionState } from '../../network/client';
 import type { StorageLike } from '../../network/recent-rooms';
 import { loadRecentRooms, rememberRoom } from '../../network/recent-rooms';
@@ -30,6 +31,18 @@ function formatSavedAt(savedAt: number): string {
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+/** 房间公开摘要：以服务端只读接口为准；不可达时明确标注，不伪造人数。 */
+function roomSummaryText(summary: RoomSummary | null | undefined): string {
+  if (summary === undefined) {
+    return '人数查询中…';
+  }
+  if (summary === null) {
+    return '人数未知 · 房间暂不可达';
+  }
+  const phase = summary.phase === 'started' ? '对局中' : '大厅';
+  return `${phase} · 玩家 ${summary.playerCount}/2 · 旁观 ${summary.spectatorCount} 人`;
+}
+
 /** 客人加入：地址输入 + 最近房间 → 连接 → 房间成员。 */
 export function JoinRoomScreen({ createClient, storage, initialAddress, guestPage, onExit }: JoinRoomScreenProps) {
   const clientRef = useRef<RoomConnection | null>(null);
@@ -44,6 +57,7 @@ export function JoinRoomScreen({ createClient, storage, initialAddress, guestPag
   const [confirmLeave, setConfirmLeave] = useState(false);
   const [closedNotice, setClosedNotice] = useState<string | null>(null);
   const [recentRooms, setRecentRooms] = useState<RecentRoom[]>(() => loadRecentRooms(storage));
+  const [roomSummaries, setRoomSummaries] = useState<Record<string, RoomSummary | null>>({});
   const rememberedRef = useRef(false);
 
   useEffect(() => {
@@ -85,7 +99,40 @@ export function JoinRoomScreen({ createClient, storage, initialAddress, guestPag
     };
   }, []);
 
-  const handleJoin = useCallback(() => {
+  // 最近房间人数摘要：只读公开接口，按可见列表轻量刷新；失败只标注不可达。
+  const recentAddresses = recentRooms.map((room) => room.address).join('|');
+  useEffect(() => {
+    const addresses = recentAddresses.length > 0 ? recentAddresses.split('|') : [];
+    if (addresses.length === 0) {
+      return;
+    }
+    let cancelled = false;
+    const refresh = async () => {
+      const results = await Promise.all(
+        addresses.map(async (address) => [address, await fetchRoomSummary(address)] as const),
+      );
+      if (cancelled) {
+        return;
+      }
+      setRoomSummaries((previous) => {
+        const next: Record<string, RoomSummary | null> = { ...previous };
+        for (const [address, result] of results) {
+          next[address] = result.ok ? result.value : null;
+        }
+        return next;
+      });
+    };
+    void refresh();
+    const timer = window.setInterval(() => {
+      void refresh();
+    }, 15_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [recentAddresses]);
+
+  const handleJoin = useCallback((mode: 'player' | 'spectator') => {
     const parsed = parseServerAddress(address);
     if (!parsed.ok) {
       setFormError(parsed.message);
@@ -95,7 +142,11 @@ export function JoinRoomScreen({ createClient, storage, initialAddress, guestPag
     setClosedNotice(null);
     rememberedRef.current = false;
     setAddress(formatAddress(parsed.value));
-    clientRef.current?.connect(parsed.value, { role: 'guest', name: '客人' });
+    // 显式旁观始终不占执色；默认加入在满员/开局后由服务端自动分流为旁观。
+    clientRef.current?.connect(
+      parsed.value,
+      mode === 'spectator' ? { role: 'spectator', name: '旁观' } : { role: 'guest', name: '客人' },
+    );
   }, [address]);
 
   const handleLeave = useCallback(() => {
@@ -175,13 +226,31 @@ export function JoinRoomScreen({ createClient, storage, initialAddress, guestPag
               />
             </label>
             <div className="panel-actions">
-              <button className="panel-action-primary" data-testid="join-submit" disabled={connecting} onClick={handleJoin} type="button">
+              <button
+                className="panel-action-primary"
+                data-testid="join-submit"
+                disabled={connecting}
+                onClick={() => handleJoin('player')}
+                type="button"
+              >
                 {connecting ? '连接中…' : '加入'}
+              </button>
+              <button
+                className="panel-action-secondary"
+                data-testid="join-spectate"
+                disabled={connecting}
+                onClick={() => handleJoin('spectator')}
+                type="button"
+              >
+                旁观观战
               </button>
               <button className="panel-action-secondary" data-testid="join-back" onClick={() => onExit(null)} type="button">
                 返回菜单
               </button>
             </div>
+            <p className="room-hint" data-testid="join-spectate-hint">
+              房间满两人或对局已开始时，「加入」会自动以旁观身份进入 —— 也可点「旁观观战」直接围观
+            </p>
             {connecting ? (
               <p className="room-hint" data-testid="join-progress">
                 {slowNotice ? '仍在尝试连接，请稍候…' : '正在连接房间…'}
@@ -226,6 +295,9 @@ export function JoinRoomScreen({ createClient, storage, initialAddress, guestPag
                       type="button"
                     >
                       <code>{room.address}</code>
+                      <span className="recent-meta" data-testid="recent-room-summary">
+                        {roomSummaryText(roomSummaries[room.address])}
+                      </span>
                       <span className="recent-meta">{formatSavedAt(room.savedAt)}</span>
                     </button>
                   </li>
