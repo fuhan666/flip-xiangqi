@@ -48,6 +48,9 @@ describe('protocol envelope', () => {
     }
     expect(parsed.message.type).toBe('hello');
     expect(parsed.message.roomId).toBeNull();
+    if (parsed.message.type !== 'hello') {
+      return;
+    }
     expect(parsed.message.payload.role).toBe('guest');
     expect(parsed.message.payload.name).toBe('客人');
   });

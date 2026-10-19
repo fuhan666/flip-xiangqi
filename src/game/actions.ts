@@ -2,9 +2,11 @@ import { cloneState, getPieceAt, otherCamp, positionsEqual, restoreState, snapsh
 import { createInitialGameState } from './setup.js';
 import { hasAnyLegalAction, isInCheck, validateMove, violatesFacingKings } from './move-rules.js';
 import type {
+  ActionTimeContext,
   Camp,
   GameAction,
   GameHistoryAction,
+  GameHistoryActionKind,
   GameHistoryConsequence,
   GameHistoryEndgameReason,
   GameHistoryEntry,
@@ -48,9 +50,36 @@ function recordHistory(
   action: GameHistoryAction,
   consequences: GameHistoryConsequence[],
   resolution: TurnResolution,
+  timeContext?: ActionTimeContext | number | null,
 ): GameState {
+  const stepNumber = state.actionHistory.length + 1;
+  const turnNumber = stepNumber;
+  let kind: GameHistoryActionKind;
+  if (action.type === 'flip') {
+    kind = 'flip';
+  } else if (consequences.some((c) => c.type === 'capture')) {
+    kind = 'capture';
+  } else {
+    kind = 'move';
+  }
+
+  let durationSeconds: number | null = null;
+  if (typeof timeContext === 'number' && Number.isFinite(timeContext) && timeContext >= 0) {
+    durationSeconds = timeContext;
+  } else if (
+    timeContext &&
+    typeof timeContext === 'object' &&
+    typeof timeContext.durationSeconds === 'number' &&
+    Number.isFinite(timeContext.durationSeconds) &&
+    timeContext.durationSeconds >= 0
+  ) {
+    durationSeconds = timeContext.durationSeconds;
+  }
+
   const entry: GameHistoryEntry = {
-    turnNumber: state.actionHistory.length + 1,
+    stepNumber,
+    turnNumber,
+    kind,
     actor,
     action,
     consequences,
@@ -58,6 +87,7 @@ function recordHistory(
     checkedCamp: resolution.checkedCamp,
     winner: resolution.winner,
     statusMessage: resolution.statusMessage,
+    durationSeconds,
   };
 
   resolution.state.actionHistory = [...resolution.state.actionHistory, entry];
@@ -116,7 +146,11 @@ function finalizeTurn(state: GameState, actingCamp: Camp): TurnResolution {
   };
 }
 
-function applyFlip(state: GameState, action: Extract<GameAction, { type: 'flip' }>): GameState {
+function applyFlip(
+  state: GameState,
+  action: Extract<GameAction, { type: 'flip' }>,
+  timeContext?: ActionTimeContext | number | null,
+): GameState {
   const target = getPieceAt(state, action.position);
   if (!target) {
     return withError(state, '该位置没有可翻开的棋子');
@@ -158,14 +192,21 @@ function applyFlip(state: GameState, action: Extract<GameAction, { type: 'flip' 
     {
       type: 'flip',
       position: { ...action.position },
+      from: { ...action.position },
+      to: { ...action.position },
       piece: snapshotPiece(nextTarget),
     },
     consequences,
     resolution,
+    timeContext,
   );
 }
 
-function applyMove(state: GameState, action: Extract<GameAction, { type: 'move' }>): GameState {
+function applyMove(
+  state: GameState,
+  action: Extract<GameAction, { type: 'move' }>,
+  timeContext?: ActionTimeContext | number | null,
+): GameState {
   const piece = getPieceAt(state, action.from);
   if (!piece) {
     return withError(state, '起点没有棋子');
@@ -223,19 +264,24 @@ function applyMove(state: GameState, action: Extract<GameAction, { type: 'move' 
     },
     consequences,
     resolution,
+    timeContext,
   );
 }
 
-export function applyAction(state: GameState, action: GameAction): GameState {
+export function applyAction(
+  state: GameState,
+  action: GameAction,
+  timeContext?: ActionTimeContext | number | null,
+): GameState {
   if (state.winner) {
     return withError(state, '对局已经结束，请重新开局');
   }
 
   if (action.type === 'flip') {
-    return applyFlip(state, action);
+    return applyFlip(state, action, timeContext);
   }
 
-  return applyMove(state, action);
+  return applyMove(state, action, timeContext);
 }
 
 export function undoLastAction(state: GameState): GameState {

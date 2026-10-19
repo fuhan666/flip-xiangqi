@@ -15,6 +15,9 @@ import { StatusPanel } from './StatusPanel.js';
 import { ConnectionStatus } from './rooms/ConnectionStatus.js';
 import type { LegalMoveHint } from './useBoardFeedback.js';
 import { useOnlineBoardFeedback } from './useOnlineBoardFeedback.js';
+import { PhraseBubble } from './PhraseBubble.js';
+import { QuickPhrasePanel } from './QuickPhrasePanel.js';
+import type { QuickPhraseId } from '../network/quick-chat.js';
 
 interface GameResultSummary {
   archiveLabel: string;
@@ -324,6 +327,13 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
     }
   };
 
+  const handleSendPhrase = (phraseId: QuickPhraseId) => {
+    const res = client.sendChatPhrase(phraseId);
+    if (!res.ok && res.reason) {
+      setInteractionMessage(res.reason);
+    }
+  };
+
   const time = findTimeControl(startParameters.timeControlId);
   const selfSeat = startParameters.players.find((seat) => seat.role === viewerRole);
   const opponentSeat = startParameters.players.find((seat) => seat.role !== viewerRole);
@@ -359,6 +369,20 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
   const opponentName = opponentMember?.name ?? opponentSeat?.name ?? (opponentRole === 'host' ? '房主' : '客人');
   const selfName = selfMember?.name ?? selfSeat?.name ?? (viewerRole === 'host' ? '房主' : '客人');
 
+  const opponentPhraseEvent = useMemo(() => {
+    if (!opponentMember?.id || !game.recentPhraseEvents) {
+      return null;
+    }
+    return game.recentPhraseEvents[opponentMember.id] ?? null;
+  }, [opponentMember?.id, game.recentPhraseEvents]);
+
+  const selfPhraseEvent = useMemo(() => {
+    if (!myMemberId || !game.recentPhraseEvents) {
+      return null;
+    }
+    return game.recentPhraseEvents[myMemberId] ?? null;
+  }, [myMemberId, game.recentPhraseEvents]);
+
   return (
     <div className="online-game-container" data-testid="online-game">
       <div className="layout online-game-layout">
@@ -385,6 +409,11 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
               label={opponentName}
               side={opponentSide}
               timeControlId={startParameters.timeControlId}
+            />
+
+            <PhraseBubble
+              event={opponentPhraseEvent}
+              side="opponent"
             />
 
             <ConnectionStatus rtt={connection.rtt} status={connection.status} />
@@ -463,6 +492,11 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
               timeControlId={startParameters.timeControlId}
             />
 
+            <PhraseBubble
+              event={selfPhraseEvent}
+              side="self"
+            />
+
             <div className="online-turn-center">
               <span className="turn-indicator" data-testid="turn-indicator">
                 {turnLabel}
@@ -478,6 +512,12 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
             </div>
 
             <div className="online-negotiation-actions">
+              <QuickPhrasePanel
+                cooldownUntil={game.phraseCooldownUntil?.[myMemberId] ?? 0}
+                disabled={!isConnected || isMatchEnded || !opponentConnected}
+                onSendPhrase={handleSendPhrase}
+                serverClockOffsetMs={game.clockOffsetMs}
+              />
               <button
                 className="online-action-btn online-btn-undo"
                 data-testid="btn-undo"

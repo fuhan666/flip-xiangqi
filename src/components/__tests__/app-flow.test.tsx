@@ -16,8 +16,11 @@ function piece(overrides: Partial<Piece> & Pick<Piece, 'id' | 'camp' | 'type' | 
 
 function createFinishedGameState(overrides: Partial<GameState> = {}): GameState {
   const recentAction: GameHistoryEntry = {
+    stepNumber: 12,
     turnNumber: 12,
+    kind: 'capture',
     actor: 'red',
+    durationSeconds: null,
     action: {
       type: 'move',
       from: { x: 4, y: 1 },

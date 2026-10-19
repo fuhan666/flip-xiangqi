@@ -33,6 +33,8 @@ export interface HistoryPieceSnapshot {
 export interface FlipHistoryAction {
   type: 'flip';
   position: Position;
+  from?: Position;
+  to?: Position;
   piece: HistoryPieceSnapshot;
 }
 
@@ -44,6 +46,8 @@ export interface MoveHistoryAction {
 }
 
 export type GameHistoryAction = FlipHistoryAction | MoveHistoryAction;
+
+export type GameHistoryActionKind = 'flip' | 'move' | 'capture';
 
 export interface CaptureHistoryConsequence {
   type: 'capture';
@@ -69,8 +73,14 @@ export type GameHistoryConsequence =
   | CheckHistoryConsequence
   | EndgameHistoryConsequence;
 
+export interface ActionTimeContext {
+  durationSeconds?: number | null;
+}
+
 export interface GameHistoryEntry {
+  stepNumber: number;
   turnNumber: number;
+  kind: GameHistoryActionKind;
   actor: Camp;
   action: GameHistoryAction;
   consequences: GameHistoryConsequence[];
@@ -78,6 +88,7 @@ export interface GameHistoryEntry {
   checkedCamp: Camp | null;
   winner: Camp | null;
   statusMessage: string;
+  durationSeconds: number | null;
 }
 
 export interface GameStateSnapshot {

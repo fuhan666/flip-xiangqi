@@ -4,9 +4,11 @@ export { createInitialGameState } from './setup.js';
 export { createEmptyGameState, getPieceAt, restoreState, snapshotState } from './state.js';
 export { hasAnyLegalAction, isInCheck, listLegalMoves, validateMove } from './move-rules.js';
 export type {
+  ActionTimeContext,
   Camp,
   GameAction,
   GameHistoryAction,
+  GameHistoryActionKind,
   GameHistoryConsequence,
   GameHistoryEndgameReason,
   GameHistoryEntry,

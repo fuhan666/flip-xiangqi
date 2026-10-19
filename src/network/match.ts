@@ -22,6 +22,7 @@ import {
   type NegotiationEvent,
   type PendingNegotiation,
 } from './negotiation.js';
+import { parsePhraseCooldownUntil } from './quick-chat.js';
 
 export {
   parseMatchClockSnapshot,
@@ -38,6 +39,17 @@ export {
   type NegotiationEvent,
   type PendingNegotiation,
 } from './negotiation.js';
+
+export interface MatchEvent {
+  id: string;
+  type: string;
+  actorMemberId: string;
+  stepNumber: number;
+  revision: number;
+  result: string;
+  createdAt: number;
+  message?: string;
+}
 
 export function createSeededRng(seed: number): () => number {
   let state = seed >>> 0;
@@ -62,7 +74,9 @@ export interface MatchState {
   settlement: MatchSettlement | null;
   pendingNegotiation: PendingNegotiation | null;
   drawCooldownUntil: Record<string, number>;
+  phraseCooldownUntil: Record<string, number>;
   negotiationEvent: NegotiationEvent | null;
+  matchEvents: MatchEvent[];
 }
 
 export interface MatchSnapshot {
@@ -76,7 +90,9 @@ export interface MatchSnapshot {
   settlement: MatchSettlement | null;
   pendingNegotiation: PendingNegotiation | null;
   drawCooldownUntil: Record<string, number>;
+  phraseCooldownUntil?: Record<string, number>;
   negotiationEvent: NegotiationEvent | null;
+  matchEvents?: MatchEvent[];
 }
 
 export function isValidCoordinate(x: unknown, y: unknown): x is number {
@@ -213,38 +229,19 @@ export function parseGameStateSnapshot(value: unknown): GameStateSnapshot | null
 
   const actionHistory: GameHistoryEntry[] = [];
   for (const item of raw.actionHistory) {
-    if (!item || typeof item !== 'object') {
+    const parsed = parseHistoryEntry(item);
+    if (!parsed) {
       return null;
     }
-    const entry = item as Record<string, unknown>;
-    if (
-      typeof entry.turnNumber !== 'number' ||
-      !Number.isInteger(entry.turnNumber) ||
-      entry.turnNumber < 1 ||
-      (entry.actor !== 'red' && entry.actor !== 'black') ||
-      !entry.action ||
-      typeof entry.action !== 'object' ||
-      !Array.isArray(entry.consequences) ||
-      (entry.nextTurn !== null && entry.nextTurn !== 'red' && entry.nextTurn !== 'black') ||
-      (entry.checkedCamp !== null && entry.checkedCamp !== 'red' && entry.checkedCamp !== 'black') ||
-      (entry.winner !== null && entry.winner !== 'red' && entry.winner !== 'black') ||
-      typeof entry.statusMessage !== 'string'
-    ) {
+    actionHistory.push(parsed);
+  }
+
+  let recentAction: GameHistoryEntry | null = null;
+  if (raw.recentAction) {
+    recentAction = parseHistoryEntry(raw.recentAction);
+    if (!recentAction) {
       return null;
     }
-    const action = entry.action as Record<string, unknown>;
-    if (action.type === 'flip') {
-      if (!parsePosition(action.position)) {
-        return null;
-      }
-    } else if (action.type === 'move') {
-      if (!parsePosition(action.from) || !parsePosition(action.to)) {
-        return null;
-      }
-    } else {
-      return null;
-    }
-    actionHistory.push(item as GameHistoryEntry);
   }
 
   return {
@@ -255,8 +252,131 @@ export function parseGameStateSnapshot(value: unknown): GameStateSnapshot | null
     lastError: raw.lastError ?? null,
     statusMessage: raw.statusMessage,
     actionHistory,
-    recentAction: (raw.recentAction as GameHistoryEntry | null) ?? null,
+    recentAction,
   };
+}
+
+function parseHistoryEntry(item: unknown): GameHistoryEntry | null {
+  if (!item || typeof item !== 'object') {
+    return null;
+  }
+  const entry = item as Record<string, unknown>;
+  const stepNumber =
+    typeof entry.stepNumber === 'number'
+      ? entry.stepNumber
+      : typeof entry.turnNumber === 'number'
+        ? entry.turnNumber
+        : null;
+  if (typeof stepNumber !== 'number' || !Number.isInteger(stepNumber) || stepNumber < 1) {
+    return null;
+  }
+  const turnNumber =
+    typeof entry.turnNumber === 'number' && Number.isInteger(entry.turnNumber) && entry.turnNumber >= 1
+      ? entry.turnNumber
+      : stepNumber;
+
+  if (
+    (entry.actor !== 'red' && entry.actor !== 'black') ||
+    !entry.action ||
+    typeof entry.action !== 'object' ||
+    !Array.isArray(entry.consequences) ||
+    (entry.nextTurn !== null && entry.nextTurn !== 'red' && entry.nextTurn !== 'black') ||
+    (entry.checkedCamp !== null && entry.checkedCamp !== 'red' && entry.checkedCamp !== 'black') ||
+    (entry.winner !== null && entry.winner !== 'red' && entry.winner !== 'black') ||
+    typeof entry.statusMessage !== 'string'
+  ) {
+    return null;
+  }
+
+  if (
+    entry.durationSeconds !== undefined &&
+    entry.durationSeconds !== null &&
+    (typeof entry.durationSeconds !== 'number' || !Number.isFinite(entry.durationSeconds) || entry.durationSeconds < 0)
+  ) {
+    return null;
+  }
+
+  if (
+    entry.kind !== undefined &&
+    entry.kind !== 'flip' &&
+    entry.kind !== 'move' &&
+    entry.kind !== 'capture'
+  ) {
+    return null;
+  }
+
+  const action = entry.action as Record<string, unknown>;
+  if (action.type === 'flip') {
+    const pos = parsePosition(action.position);
+    if (!pos) {
+      return null;
+    }
+    if (action.from && !parsePosition(action.from)) {
+      return null;
+    }
+    if (action.to && !parsePosition(action.to)) {
+      return null;
+    }
+  } else if (action.type === 'move') {
+    if (!parsePosition(action.from) || !parsePosition(action.to)) {
+      return null;
+    }
+  } else {
+    return null;
+  }
+
+  const kind =
+    (entry.kind as GameHistoryEntry['kind']) ??
+    (action.type === 'flip'
+      ? 'flip'
+      : (entry.consequences as Array<{ type: string }>).some((c) => c.type === 'capture')
+        ? 'capture'
+        : 'move');
+
+  return {
+    ...(entry as unknown as GameHistoryEntry),
+    stepNumber,
+    turnNumber,
+    kind,
+    durationSeconds: (entry.durationSeconds as number | null) ?? null,
+  };
+}
+
+export function parseMatchEvents(value: unknown): MatchEvent[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const events: MatchEvent[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') {
+      return null;
+    }
+    const raw = item as Record<string, unknown>;
+    if (
+      typeof raw.id !== 'string' ||
+      !raw.id ||
+      typeof raw.type !== 'string' ||
+      !raw.type ||
+      typeof raw.actorMemberId !== 'string' ||
+      typeof raw.stepNumber !== 'number' ||
+      typeof raw.revision !== 'number' ||
+      typeof raw.result !== 'string' ||
+      typeof raw.createdAt !== 'number'
+    ) {
+      return null;
+    }
+    events.push({
+      id: raw.id,
+      type: raw.type,
+      actorMemberId: raw.actorMemberId,
+      stepNumber: raw.stepNumber,
+      revision: raw.revision,
+      result: raw.result,
+      createdAt: raw.createdAt,
+      ...(typeof raw.message === 'string' ? { message: raw.message } : {}),
+    });
+  }
+  return events;
 }
 
 export function parseMatchSnapshot(value: unknown): MatchSnapshot | null {
@@ -313,7 +433,9 @@ export function parseMatchSnapshot(value: unknown): MatchSnapshot | null {
   const settlement = raw.settlement ? parseMatchSettlement(raw.settlement) : null;
   const pendingNegotiation = raw.pendingNegotiation ? parsePendingNegotiation(raw.pendingNegotiation) : null;
   const drawCooldownUntil = raw.drawCooldownUntil ? parseDrawCooldownUntil(raw.drawCooldownUntil) ?? {} : {};
+  const phraseCooldownUntil = raw.phraseCooldownUntil ? parsePhraseCooldownUntil(raw.phraseCooldownUntil) ?? {} : {};
   const negotiationEvent = raw.negotiationEvent ? parseNegotiationEvent(raw.negotiationEvent) : null;
+  const matchEvents = Array.isArray(raw.matchEvents) ? parseMatchEvents(raw.matchEvents) ?? [] : [];
 
   return {
     matchId: raw.matchId,
@@ -326,7 +448,9 @@ export function parseMatchSnapshot(value: unknown): MatchSnapshot | null {
     settlement,
     pendingNegotiation,
     drawCooldownUntil,
+    phraseCooldownUntil,
     negotiationEvent,
+    matchEvents,
   };
 }
 
@@ -359,7 +483,9 @@ export function createMatch(input: {
     settlement: null,
     pendingNegotiation: null,
     drawCooldownUntil: {},
+    phraseCooldownUntil: {},
     negotiationEvent: null,
+    matchEvents: [],
   };
 }
 
@@ -375,7 +501,9 @@ export function snapshotMatch(match: MatchState, now?: number): MatchSnapshot {
     settlement: match.settlement ?? match.clock.getSettlement(),
     pendingNegotiation: match.pendingNegotiation,
     drawCooldownUntil: { ...match.drawCooldownUntil },
+    phraseCooldownUntil: { ...match.phraseCooldownUntil },
     negotiationEvent: match.negotiationEvent,
+    matchEvents: match.matchEvents.map((e) => ({ ...e })),
   };
 }
 
@@ -418,7 +546,8 @@ export function applyMatchAction(
     return { ok: false, reason: '非己方回合，请等待对方行动' };
   }
 
-  const nextGameState = applyAction(match.gameState, action);
+  const stepDurationSeconds = match.clock.getCurrentStepDurationSeconds();
+  const nextGameState = applyAction(match.gameState, action, { durationSeconds: stepDurationSeconds });
   if (nextGameState.lastError) {
     return { ok: false, reason: nextGameState.lastError };
   }
