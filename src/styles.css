@@ -1063,3 +1063,32 @@ button:disabled {
     display: none;
   }
 }
+.record-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-block: 12px; }
+.record-actions button, .replay-overlay button { min-height: 40px; padding: 8px 12px; cursor: pointer; }
+.record-actions button:disabled, .replay-overlay button:disabled { opacity: .45; cursor: default; }
+.replay-overlay { position: fixed; inset: 0; z-index: 1000; background: #21140f; color: #f3ede0; overflow: auto; padding: 16px; }
+.replay-heading { display: flex; justify-content: space-between; align-items: center; max-width: 1150px; margin: 0 auto 12px; }
+.replay-layout { display: grid; grid-template-columns: minmax(0, 650px) minmax(240px, 380px); gap: 20px; justify-content: center; }
+.replay-layout .board-shell { width: 100%; min-width: 0; }
+.replay-sidebar { min-width: 0; align-self: start; }
+.replay-moves { position: relative; max-height: 420px; overflow-y: auto; padding-left: 0; list-style: none; }
+.replay-moves button { width: 100%; text-align: left; border: 1px solid transparent; background: transparent; color: inherit; }
+.replay-moves button[aria-current="step"] { background: #734410; border-color: #e9bd7a; font-weight: bold; }
+.replay-overlay :focus-visible { outline: 3px solid #8e4817; outline-offset: 2px; }
+@media (max-width: 760px) {
+  .replay-overlay { padding: 8px; }
+  .replay-layout { grid-template-columns: minmax(0, 1fr); }
+  .replay-moves { max-height: 240px; }
+}
+
+.replay-header { position: sticky; top: -16px; z-index: 5; background: #21140f; max-width: 1150px; margin: 0 auto 16px; padding-block: 8px; }
+.replay-heading h2 { margin: 0; }
+.replay-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.replay-overlay .board-shell.is-disabled, .replay-overlay .board.is-disabled, .replay-overlay .cell:disabled { opacity: 1; cursor: default; }
+.replay-overlay .board-trace-line { animation: none; opacity: 1; stroke: #8e3f20; }
+.replay-overlay button { border: 1px solid #a47e50; border-radius: 8px; background: #3b291b; color: #f3ede0; }
+.replay-overlay .cell { border-radius: 0; background: transparent; border: 0; padding: 0; min-height: 0; }
+.replay-overlay .replay-moves button { border-color: transparent; background: transparent; }
+.replay-overlay .replay-moves button[aria-current="step"] { background: #734410; border-color: #e9bd7a; }
+.replay-overlay .board-frame { --page-chrome: 200px; }
+@media (max-width: 760px) { .replay-header { top: -8px; } }

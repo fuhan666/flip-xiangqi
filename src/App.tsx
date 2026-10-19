@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import {
   applyAction,
   createInitialGameState,
@@ -17,6 +17,10 @@ import { useBoardFeedback } from './components/useBoardFeedback';
 import type { LegalMoveHint } from './components/useBoardFeedback';
 import { AudioControls } from './components/AudioControls';
 import { useLocalGameAudio } from './components/useGameAudio';
+
+import { createRecord } from './records/record';
+import type { GameRecord } from './records/record';
+import { GameRecordControls, RecordImporter, RecordReplay } from './components/GameRecordControls';
 
 interface GameResultSummary {
   archiveLabel: string;
@@ -84,6 +88,20 @@ function hasRevealedOpponentNonKingPieces(gameState: GameState): boolean {
 export default function App({ initialState }: AppProps) {
   const seedState = useMemo(() => initialState ?? createInitialGameState(), [initialState]);
   const [gameState, setGameState] = useState<GameState>(seedState);
+  const [opening, setOpening] = useState(() => seedState.undoStack[0] ?? seedState);
+  const gameStart = useRef(Date.now());
+  const gameEnd = useRef<number | null>(seedState.winner ? Date.now() : null);
+  const [replay, setReplay] = useState<GameRecord | null>(null);
+  const closeReplay = useCallback(() => setReplay(null), []);
+  const commitState = (next: GameState) => {
+    if (next.winner && gameEnd.current === null) gameEnd.current = Date.now();
+    if (!next.winner) gameEnd.current = null;
+    setGameState(next);
+  };
+  const record = useMemo(() => gameState.winner ? createRecord(opening, gameState,
+    { mode: 'local', seats: { red: '本地红方', black: '本地黑方' } },
+    { winner: gameState.winner, reason: gameState.recentAction?.consequences.find((c) => c.type === 'endgame')?.reason ?? 'checkmate',
+      durationSeconds: Math.max(0, ((gameEnd.current ?? Date.now()) - gameStart.current) / 1000), timeBasis: 'elapsed' }) : null, [gameState, opening]);
   const [recentCompletedGames, setRecentCompletedGames] = useState<GameResultSummary[]>([]);
   const [selectedPosition, setSelectedPosition] = useState<Position | null>(null);
   const [interactionMessage, setInteractionMessage] = useState<string | null>(null);
@@ -128,7 +146,7 @@ export default function App({ initialState }: AppProps) {
       const nextState = applyAction(gameState, { type: 'flip', position }, { durationSeconds });
       setSelectedPosition(null);
       setInteractionMessage(null);
-      setGameState(nextState);
+      commitState(nextState);
       return;
     }
 
@@ -168,7 +186,7 @@ export default function App({ initialState }: AppProps) {
       stepStartTimeRef.current = Date.now();
       const nextState = applyAction(gameState, { type: 'move', from: selectedPosition, to: position }, { durationSeconds });
       setInteractionMessage(null);
-      setGameState(nextState);
+      commitState(nextState);
       setSelectedPosition(null);
     }
   };
@@ -181,7 +199,11 @@ export default function App({ initialState }: AppProps) {
     stepStartTimeRef.current = Date.now();
     setSelectedPosition(null);
     setInteractionMessage(null);
-    setGameState(restartGame());
+    const next = restartGame();
+    gameStart.current = Date.now();
+    gameEnd.current = null;
+    setOpening(next);
+    setGameState(next);
   };
 
   const handleRestart = () => {
@@ -196,7 +218,7 @@ export default function App({ initialState }: AppProps) {
     stepStartTimeRef.current = Date.now();
     setSelectedPosition(null);
     setInteractionMessage(null);
-    setGameState((current) => undoLastAction(current));
+    commitState(undoLastAction(gameState));
   };
 
   return (
@@ -227,6 +249,7 @@ export default function App({ initialState }: AppProps) {
             gameState={displayState}
             interactionMessage={interactionMessage}
             recentCompletedGames={recentCompletedGames}
+            recordControls={record ? <GameRecordControls record={record} onReplay={setReplay} /> : undefined}
           />
           <CapturedPieces gameState={displayState} />
           <GameControls
@@ -236,9 +259,11 @@ export default function App({ initialState }: AppProps) {
             onRestart={handleRestart}
             onUndo={handleUndo}
           />
+          <RecordImporter onReplay={setReplay} />
           <AudioControls />
         </aside>
       </div>
+      <RecordReplay record={replay} onClose={closeReplay} />
     </main>
   );
 }

@@ -25,6 +25,7 @@ export interface BoardProps {
   perspective?: Perspective;
   hideHeader?: boolean;
   disabled?: boolean;
+  currentActionOnly?: boolean;
 }
 
 type CellState = 'empty' | 'hidden' | 'revealed';
@@ -187,9 +188,10 @@ export function Board({
   selectedPosition,
   trace = null,
   disabled = false,
+  currentActionOnly = false,
 }: BoardProps) {
   const cells = buildBoardCells(gameState, selectedPosition, legalMoves, flip, perspective);
-  const lastMove = findLastMove(gameState);
+  const lastMove = currentActionOnly && gameState.recentAction?.action.type !== 'move' ? null : findLastMove(gameState);
   const checkBanner = !gameState.winner && gameState.checkedCamp ? '将军警示：请立即应将' : null;
 
   return (

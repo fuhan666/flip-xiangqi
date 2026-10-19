@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { OnlineGame } from '../OnlineGame.js';
 import type { ConnectionState, GameClientState, RoomConnection } from '../../network/client.js';
 import { buildStartParameters, createLobbyState } from '../../network/lobby.js';
-import { createMatch, snapshotMatch } from '../../network/match.js';
+import { applyMatchAction, createMatch, finalizeMatch, snapshotMatch, undoMatchAction } from '../../network/match.js';
+import { parseRecord } from '../../records/record';
 import { IDLE_CONNECTION_STATE } from '../rooms/connection-state.js';
 
 describe('OnlineGame component', () => {
@@ -50,6 +51,50 @@ describe('OnlineGame component', () => {
       ...overrides,
     };
   }
+
+  it.each(['resignation', 'draw-agreement', 'match-timeout', 'step-timeout', 'disconnect-timeout'] as const)('exports identical confirmed records for both sides after undo and %s; replay sends nothing', async (reason) => {
+    const { startParameters, match } = createTestMatch(true);
+    const first = match.gameState.pieces.find((p) => !p.revealed)!.position!;
+    const accepted = applyMatchAction(match, startParameters.redMemberId, { type: 'flip', position: first });
+    if (!accepted.ok) throw new Error('first flip rejected');
+    const second = accepted.match.gameState.pieces.find((p) => !p.revealed)!.position!;
+    const speculative = applyMatchAction(accepted.match, startParameters.blackMemberId, { type: 'flip', position: second });
+    if (!speculative.ok) throw new Error('second flip rejected');
+    const undone = undoMatchAction(speculative.match);
+    if (!undone.ok) throw new Error('undo rejected');
+    const ended = finalizeMatch(undone.match, reason === 'draw-agreement' ? null : 'red', reason);
+    const snapshot = snapshotMatch(ended);
+    const lobby = createLobbyState(); lobby.phase = 'started'; lobby.startParameters = startParameters;
+    const connection: ConnectionState = { ...IDLE_CONNECTION_STATE, status:'connected', roomId:'room-1', memberId:'host-1', role:'host', lobby,
+      game: buildTestGame(startParameters, snapshot, { confirmedState: snapshot.gameState, displayState: speculative.match.gameState, settlement: snapshot.settlement }) };
+    const mockClient = { sendGameAction: vi.fn(), sendLobbyReturn: vi.fn(), requestGameSync: vi.fn() } as unknown as RoomConnection;
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    const { rerender } = render(<OnlineGame client={mockClient} connection={connection} onExit={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name:'导出棋谱' }));
+    await act(async () => fireEvent.click(screen.getByRole('button', { name:'复制 JSON' })));
+    const firstJSON = writeText.mock.calls[0][0] as string;
+    const record = parseRecord(firstJSON);
+    expect(record.moves).toHaveLength(1);
+    expect(record.result.reason).toBe(reason);
+    expect(firstJSON).not.toContain('host-1');
+    expect(firstJSON).not.toContain('room-1');
+    rerender(<OnlineGame client={mockClient} connection={{ ...connection, memberId:'guest-1', role:'guest' }} onExit={vi.fn()} />);
+    await act(async () => fireEvent.click(screen.getByRole('button', { name:'复制 JSON' })));
+    expect(writeText.mock.calls[1][0]).toBe(firstJSON);
+    fireEvent.click(screen.getByRole('button', { name:'开始复盘' }));
+    expect(screen.queryByTestId('game-result-modal')).not.toBeInTheDocument();
+    const viewer = screen.getByTestId('replay-viewer');
+    expect(viewer.querySelector('.board')).toHaveAttribute('data-perspective','black');
+    fireEvent.keyDown(window, { key:'End' });
+    fireEvent.click(viewer.querySelector('[data-testid="cell-4-9"]')!);
+    fireEvent.keyDown(window, { key:'ArrowLeft' });
+    fireEvent.keyDown(window, { key:'Escape' });
+    expect(screen.getByTestId('game-result-modal')).toBeInTheDocument();
+    expect(mockClient.sendGameAction).not.toHaveBeenCalled();
+    expect(mockClient.sendLobbyReturn).not.toHaveBeenCalled();
+    expect(mockClient.requestGameSync).not.toHaveBeenCalled();
+  });
 
   it('renders start summary, snapshot, turn indicator, step counter, and shuffling banner', () => {
     const { startParameters, snapshot } = createTestMatch(true);
