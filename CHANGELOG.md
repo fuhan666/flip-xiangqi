@@ -13,7 +13,7 @@
 - 服务端权威计时器：局时（不计时、快棋、标准局、慢棋）与步时（30s/60s/90s）1Hz 平滑广播、读秒脉动预警；90 秒断线宽限保护期与重连无缝恢复
 - 悔棋/认输/求和协商流：双向 30 秒应答倒计时弹窗、行棋互斥锁定；悔棋单步时钟回滚与重走主线保留；求和 10 秒冷却与认输二次确认
 - 棋谱记录基础设施（为 v0.9 铺路）：连续 stepNumber 步数、flip/move/capture 动作分类、吃子快照、权威思考时间 durationSeconds 注入及独立的 matchEvents 协商留痕轨迹
-- 自动化端到端套件：新增 `e2e/online-quick-chat.e2e.ts` 与 `e2e/online-release.e2e.ts`，覆盖短语交互、频控气泡、全链路走子终局及多视口响应式走查
+- 自动化端到端套件：新增 `e2e/online-quick-chat.e2e.ts`、`e2e/online-release.e2e.ts` 与 `e2e/online-checkmate.e2e.ts`，覆盖短语交互、频控气泡、双端真实将死终局、悔棋同意回滚、求和拒绝/冷却/同意与断线重连全链路回归及多视口响应式走查
 - 版本说明文档：新增 `docs/releases/v0.8.0.md`
 
 ### Changed
