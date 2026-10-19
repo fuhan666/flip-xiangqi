@@ -863,16 +863,17 @@ describe('RoomClient', () => {
           payload: {
             matchId: 'm-1',
             sampleSeq: 1,
-            revision: 5,
+            revision: snap0.revision,
             clock: {
               ...snap0.clock!,
+              sampleSeq: 1,
               red: { ...snap0.clock!.red, baseTimeRemainingMs: 1195_000 },
             },
           },
         }),
       );
       await waitUntil(() => client.getState().game?.clock?.red.baseTimeRemainingMs === 1195_000);
-      expect(client.getState().game?.revision).toBe(5);
+      expect(client.getState().game?.revision).toBe(snap0.revision);
 
       // 发送 lobby.return (rematch)
       const receivedMessages: any[] = [];

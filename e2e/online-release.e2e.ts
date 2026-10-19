@@ -118,18 +118,18 @@ async function joinRoom(page: Page, address: string): Promise<void> {
   await expect(page.getByTestId('lobby-ready-toggle')).toBeVisible({ timeout: 10_000 });
 }
 
-test.describe('v0.8.0 online release full lifecycle and settlement regression', () => {
-  test('verifies version v0.8.0, full match loop, phrase exchange, resignation and settlement', async ({ browser }) => {
+test.describe('v0.9.0 online release full lifecycle and settlement regression', () => {
+  test('verifies version v0.9.0, full match loop, phrase exchange, resignation and settlement', async ({ browser }) => {
     const hostContext = await browser.newContext({ viewport: { width: 1366, height: 768 } });
     const hostPage = await hostContext.newPage();
     const hostErrors = watchConsole(hostPage);
 
-    // 1. 验证首页版本号显示为 v0.8.0
+    // 1. 验证首页版本号显示为 v0.9.0
     await hostPage.goto('/');
     const versionBadge = hostPage.getByTestId('app-version');
     await expect(versionBadge).toBeVisible();
-    await expect(versionBadge).toHaveText('v0.8.0');
-    await captureEvidence(hostPage, 'online-release-01-version-v0.8.0.png');
+    await expect(versionBadge).toHaveText('v0.9.0');
+    await captureEvidence(hostPage, 'online-release-01-version-v0.9.0.png');
 
     // 2. 房主建房
     const room = await createRoom(hostPage);

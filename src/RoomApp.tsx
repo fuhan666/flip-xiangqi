@@ -9,7 +9,7 @@ import { SettingsScreen } from './components/rooms/SettingsScreen';
 import { useAudioUnlock } from './components/useGameAudio';
 import './rooms.css';
 
-export const APP_VERSION = 'v0.8.0';
+export const APP_VERSION = 'v0.9.0';
 const ROOM_PORT_KEY = 'flip-xiangqi.room-port';
 
 type Screen = 'menu' | 'create' | 'join' | 'settings';

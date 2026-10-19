@@ -105,3 +105,8 @@ export function computeBackoffDelay(attempt: number, delays: readonly number[] =
   const index = Math.max(0, Math.min(attempt, delays.length - 1));
   return delays[index];
 }
+
+/** Bounded jitter prevents clients on the same LAN from retrying in lockstep. */
+export function computeReconnectDelay(attempt: number, delays: readonly number[], random = Math.random): number {
+  return Math.round(computeBackoffDelay(attempt, delays) * (0.8 + Math.max(0, Math.min(1, random())) * 0.2));
+}

@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 const flip = (x: number, y: number) => [x,y];
 const move = (x: number, y: number, tx: number, ty: number) => [x,y,tx,ty];
 const actions = [flip(7,2), flip(2,3), move(7,2,5,2), flip(1,0), flip(7,7), flip(7,0), move(7,7,7,4), flip(8,0), move(7,4,2,4), flip(0,0), move(2,4,2,3), flip(8,6), move(2,3,2,4), flip(0,3), move(2,4,6,4), flip(2,9), flip(3,9), flip(4,6), move(3,9,3,5), flip(6,3), move(3,5,6,5), flip(2,6), move(6,5,6,3), flip(8,9), move(5,2,4,2)];
-test('full game with undo -> TXT/JSON download -> read-only replay and local import at both viewport sizes', async ({ page }, testInfo) => {
+test('full game with undo -> TXT/JSON download -> read-only replay and local import at three viewport sizes', async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1366, height: 768 });
   await page.addInitScript(() => {
     let seed = 2; let preamble = 2;
@@ -39,8 +39,8 @@ test('full game with undo -> TXT/JSON download -> read-only replay and local imp
   const text = await readFile((await txt.path())!, 'utf8');
   expect(text.split('\n').filter((l) => /^\d+\./.test(l))).toHaveLength(25);
   await page.getByRole('button', { name:'开始复盘' }).click();
-  for (const width of [1366, 683]) {
-    await page.setViewportSize({ width, height:768 });
+  for (const [width, height] of [[1366, 768], [1920, 1080], [683, 768]]) {
+    await page.setViewportSize({ width, height });
     const replay = page.getByRole('dialog', { name:'棋谱复盘' });
     await replay.getByRole('button', { name:'首步', exact:true }).click({ force:true });
     await expect(replay.locator('.cell[data-cell-state="hidden"]')).toHaveCount(30);
@@ -61,7 +61,7 @@ test('full game with undo -> TXT/JSON download -> read-only replay and local imp
     expect(toolbar!.x + toolbar!.width).toBeLessThanOrEqual(width);
     await page.screenshot({ path:testInfo.outputPath(`replay-${width}.png`) });
     await page.keyboard.press('Escape');
-    if (width === 1366) {
+    if (width !== 683) {
       await page.getByLabel('选择 JSON 棋谱').setInputFiles(jsonPath!);
     }
   }

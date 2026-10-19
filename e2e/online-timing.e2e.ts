@@ -154,10 +154,11 @@ test.describe('online turn timing, countdown warnings, disconnection grace, and 
         roomId: lastClock.roomId,
         payload: {
           matchId: lastClock.payload.matchId,
-          revision: (lastClock.payload.revision ?? 0) + 1,
+          revision: lastClock.payload.revision ?? 0,
           sampleSeq: (lastClock.payload.sampleSeq ?? 0) + 1,
           clock: {
             ...lastClock.payload.clock,
+            sampleSeq: (lastClock.payload.sampleSeq ?? 0) + 1,
             serverTime: Date.now(),
             paused: false,
             activeCamp: 'red',
