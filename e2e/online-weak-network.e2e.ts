@@ -51,6 +51,8 @@ for (const viewport of [{ width: 1366, height: 768 }, { width: 1920, height: 108
       await expect(host.getByTestId('room-address-main').or(host.getByTestId('online-game'))).toBeVisible({ timeout: 10000 });
       // A preceding failed test may leave a live room in the shared host runtime.
       if (await host.getByTestId('online-game').isVisible()) {
+        const returnButton = host.getByTestId('btn-return-lobby');
+        if (await returnButton.isVisible()) await returnButton.click();
         await host.getByTestId('close-room').click();
         await host.getByTestId('confirm-yes').click();
         await expect(host.getByTestId('menu-create')).toBeVisible();
