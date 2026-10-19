@@ -1,9 +1,11 @@
+import type { ReactNode } from 'react';
 import { useEffect, useRef, useState } from 'react';
 import type { Camp } from '../game/types.js';
 import type { MatchSettlement } from '../network/protocol.js';
 import { formatTimeDisplay } from './PlayerClock.js';
 
 export interface GameResultDialogProps {
+  recordControls?: ReactNode;
   settlement: MatchSettlement;
   /** 玩家为己方执色；旁观者为 null（只展示胜方与原因，无任何对局发送入口）。 */
   viewerSide: Camp | null;
@@ -45,6 +47,7 @@ export function formatEndgameReason(
 
 export function GameResultDialog({
   settlement,
+  recordControls,
   viewerSide,
   onRematch,
   onReturnLobby,
@@ -136,6 +139,7 @@ export function GameResultDialog({
           </div>
         </div>
 
+        {recordControls}
         <div className="game-result-actions">
           {isSpectator ? (
             <>

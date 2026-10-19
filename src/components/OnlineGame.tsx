@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { Camp, GameHistoryConsequence, GameHistoryEndgameReason, GameState, Position } from '../game/types.js';
-import { getPieceAt, listLegalMoves, restoreState } from '../game/index.js';
+import { createInitialGameState, getPieceAt, listLegalMoves, restoreState } from '../game/index.js';
 import type { ConnectionState, RoomConnection } from '../network/client.js';
 import { findTimeControl } from '../network/lobby.js';
 import type { MatchSettlement } from '../network/protocol.js';
@@ -21,6 +21,11 @@ import { useOnlineGameAudio } from './useGameAudio.js';
 import { PhraseBubble } from './PhraseBubble.js';
 import { QuickPhrasePanel } from './QuickPhrasePanel.js';
 import type { QuickPhraseId } from '../network/quick-chat.js';
+
+import { createSeededRng } from '../network/match';
+import { createRecord } from '../records/record';
+import type { GameRecord } from '../records/record';
+import { GameRecordControls, RecordReplay } from './GameRecordControls';
 
 interface GameResultSummary {
   archiveLabel: string;
@@ -68,6 +73,8 @@ export interface OnlineGameProps {
 }
 
 export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
+  const [replay, setReplay] = useState<GameRecord | null>(null);
+  const closeReplay = useCallback(() => setReplay(null), []);
   const game = connection.game;
   const lobby = connection.lobby;
   const viewerRole = connection.role;
@@ -181,6 +188,13 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
     }
     return null;
   }, [game.settlement, displayState.winner, displayState.recentAction, game.clock]);
+
+  const record = useMemo(() => game.settlement ? createRecord(
+    createInitialGameState(createSeededRng(game.seed)), game.confirmedState,
+    { mode: 'online', seed: game.seed, seats: { red: startParameters.players.find((p) => p.side === 'red')?.role === 'host' ? '房主' : '客人', black: startParameters.players.find((p) => p.side === 'black')?.role === 'host' ? '房主' : '客人' } },
+    { winner: game.settlement.winner, reason: game.settlement.reason,
+      durationSeconds: game.settlement.redDurationSeconds + game.settlement.blackDurationSeconds, timeBasis: 'player-clocks' },
+  ) : null, [game.seed, game.confirmedState, game.settlement, startParameters]);
 
   const isMyTurn = !isSpectator && displayState.winner === null && displayState.currentTurn === mySide;
   // 底部信息条归属（旁观视角固定红方在下）：只用于展示样式，不代表可操作。
@@ -665,8 +679,9 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
 
       <NegotiationToast event={game.negotiationEvent} />
 
-      {settlement ? (
+      {settlement && !replay ? (
         <GameResultDialog
+          recordControls={record ? <GameRecordControls record={record} onReplay={setReplay} /> : undefined}
           onLeave={onExit}
           onRematch={() => client.sendLobbyReturn('rematch')}
           onReturnLobby={() => client.sendLobbyReturn('return-lobby')}
@@ -674,6 +689,7 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
           viewerSide={isSpectator ? null : mySide}
         />
       ) : null}
+      <RecordReplay record={replay} perspective={mySide} onClose={closeReplay} />
     </div>
   );
 }

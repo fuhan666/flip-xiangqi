@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { PIECE_SYMBOLS } from '../game';
 import type { Camp, GameHistoryConsequence, GameHistoryEntry, HistoryPieceSnapshot, Position, GameState } from '../game';
 
@@ -9,6 +10,7 @@ interface GameResultSummary {
 }
 
 interface StatusPanelProps {
+  recordControls?: ReactNode;
   currentGameSummary: GameResultSummary | null;
   gameState: GameState;
   interactionMessage: string | null;
@@ -85,7 +87,7 @@ function buildLiveFeedback(gameState: GameState): LiveFeedbackSummary {
   };
 }
 
-export function StatusPanel({ currentGameSummary, gameState, interactionMessage, recentCompletedGames }: StatusPanelProps) {
+export function StatusPanel({ recordControls, currentGameSummary, gameState, interactionMessage, recentCompletedGames }: StatusPanelProps) {
   const currentTurnLabel = gameState.winner ? '对局结束' : campLabel(gameState.currentTurn);
   const checkLabel = gameState.checkedCamp ? `${campLabel(gameState.checkedCamp)}被将军` : '无';
   const winnerLabel = gameState.winner ? `${campLabel(gameState.winner)}胜利` : '进行中';
@@ -126,6 +128,7 @@ export function StatusPanel({ currentGameSummary, gameState, interactionMessage,
       {currentGameSummary ? (
         <div className="status-summary-card">
           <h3>本局结果</h3>
+          {recordControls}
           <div className="status-list">
             <div className="status-item status-item-alert">
               <span className="status-label">胜方</span>
