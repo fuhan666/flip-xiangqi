@@ -33,6 +33,8 @@ function cloneHistoryAction(action: GameHistoryAction): GameHistoryAction {
     return {
       ...action,
       position: { ...action.position },
+      from: { ...(action.from ?? action.position) },
+      to: { ...(action.to ?? action.position) },
       piece: cloneHistoryPieceSnapshot(action.piece),
     };
   }
@@ -60,6 +62,10 @@ function cloneHistoryConsequence(consequence: GameHistoryConsequence): GameHisto
 function cloneHistoryEntry(entry: GameHistoryEntry): GameHistoryEntry {
   return {
     ...entry,
+    stepNumber: entry.stepNumber ?? entry.turnNumber,
+    turnNumber: entry.turnNumber,
+    kind: entry.kind ?? (entry.action.type === 'flip' ? 'flip' : entry.consequences.some((c) => c.type === 'capture') ? 'capture' : 'move'),
+    durationSeconds: entry.durationSeconds ?? null,
     action: cloneHistoryAction(entry.action),
     consequences: entry.consequences.map(cloneHistoryConsequence),
   };

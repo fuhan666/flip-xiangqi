@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import {
   applyAction,
   createInitialGameState,
@@ -85,6 +85,7 @@ export default function App({ initialState }: AppProps) {
   const [recentCompletedGames, setRecentCompletedGames] = useState<GameResultSummary[]>([]);
   const [selectedPosition, setSelectedPosition] = useState<Position | null>(null);
   const [interactionMessage, setInteractionMessage] = useState<string | null>(null);
+  const stepStartTimeRef = useRef<number>(Date.now());
   const feedback = useBoardFeedback(gameState);
   const displayState = feedback.displayState;
   const canUndo = gameState.undoStack.length > 0;
@@ -119,7 +120,9 @@ export default function App({ initialState }: AppProps) {
     const piece = getPieceAt(gameState, position);
 
     if (piece && !piece.revealed) {
-      const nextState = applyAction(gameState, { type: 'flip', position });
+      const durationSeconds = Math.max(1, Math.round((Date.now() - stepStartTimeRef.current) / 1000));
+      stepStartTimeRef.current = Date.now();
+      const nextState = applyAction(gameState, { type: 'flip', position }, { durationSeconds });
       setSelectedPosition(null);
       setInteractionMessage(null);
       setGameState(nextState);
@@ -158,7 +161,9 @@ export default function App({ initialState }: AppProps) {
     }
 
     if (selectedPosition) {
-      const nextState = applyAction(gameState, { type: 'move', from: selectedPosition, to: position });
+      const durationSeconds = Math.max(1, Math.round((Date.now() - stepStartTimeRef.current) / 1000));
+      stepStartTimeRef.current = Date.now();
+      const nextState = applyAction(gameState, { type: 'move', from: selectedPosition, to: position }, { durationSeconds });
       setInteractionMessage(null);
       setGameState(nextState);
       setSelectedPosition(null);
@@ -170,6 +175,7 @@ export default function App({ initialState }: AppProps) {
       setRecentCompletedGames((current) => [currentGameSummary, ...current].slice(0, 3));
     }
 
+    stepStartTimeRef.current = Date.now();
     setSelectedPosition(null);
     setInteractionMessage(null);
     setGameState(restartGame());
@@ -184,6 +190,7 @@ export default function App({ initialState }: AppProps) {
   };
 
   const handleUndo = () => {
+    stepStartTimeRef.current = Date.now();
     setSelectedPosition(null);
     setInteractionMessage(null);
     setGameState((current) => undoLastAction(current));

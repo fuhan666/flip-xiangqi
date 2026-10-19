@@ -81,7 +81,13 @@ export class MatchClock {
 
   private red: PlayerClockState;
   private black: PlayerClockState;
-  private checkpoints: Array<{ turn: Camp; red: PlayerClockState; black: PlayerClockState }> = [];
+  private currentStepDurationMs = 0;
+  private checkpoints: Array<{
+    turn: Camp;
+    red: PlayerClockState;
+    black: PlayerClockState;
+    currentStepDurationMs: number;
+  }> = [];
 
   private hostGraceDeadlineMs: number | null = null;
   private guestGraceDeadlineMs: number | null = null;
@@ -98,6 +104,7 @@ export class MatchClock {
 
     const startTime = options.initialTime ?? this.nowFn();
     this.lastTickTime = startTime;
+    this.currentStepDurationMs = 0;
 
     const initialBase = options.baseTimeSeconds !== null ? Math.max(0, options.baseTimeSeconds * 1000) : null;
     const initialStep = options.baseTimeSeconds !== null ? Math.max(0, options.incrementSeconds * 1000) : null;
@@ -124,6 +131,14 @@ export class MatchClock {
 
   public get isPaused(): boolean {
     return this.paused || this.isNegotiationPaused;
+  }
+
+  public getCurrentStepDurationMs(): number {
+    return this.currentStepDurationMs;
+  }
+
+  public getCurrentStepDurationSeconds(): number {
+    return Math.max(0, Math.round(this.currentStepDurationMs / 1000));
   }
 
   public getSettlement(): MatchSettlement | null {
@@ -159,6 +174,7 @@ export class MatchClock {
       turn: this.turn,
       red: clonePlayerClockState(this.red),
       black: clonePlayerClockState(this.black),
+      currentStepDurationMs: this.currentStepDurationMs,
     });
   }
 
@@ -170,6 +186,7 @@ export class MatchClock {
     this.turn = cp.turn;
     this.red = clonePlayerClockState(cp.red);
     this.black = clonePlayerClockState(cp.black);
+    this.currentStepDurationMs = cp.currentStepDurationMs;
     this.lastTickTime = now;
     this.sampleSeq++;
     return true;
@@ -214,6 +231,7 @@ export class MatchClock {
 
     const active = this.turn === 'red' ? this.red : this.black;
     active.accumulatedDurationMs += elapsed;
+    this.currentStepDurationMs += elapsed;
 
     if (this.isTimed) {
       if (active.baseTimeRemainingMs !== null) {
@@ -250,6 +268,9 @@ export class MatchClock {
     if (this.isPaused) {
       return { ok: false, reason: '对局处于暂停冻结状态，暂无法操作' };
     }
+
+    // 重置本步耗时
+    this.currentStepDurationMs = 0;
 
     // 切换行动方并重置新回合步时
     this.turn = this.turn === 'red' ? 'black' : 'red';

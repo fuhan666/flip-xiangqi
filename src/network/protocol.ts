@@ -30,8 +30,27 @@ import type { GameStateSnapshot } from '../game/index.js';
 
 // 线格式使用的领域类型从协议入口统一再导出，调用方无需两个导入源。
 export type { LobbyRejectCode, LobbyState, SidePreference, StartParameters, TimeControlId } from './lobby.js';
-export type { EndgameReason, MatchAction, MatchClockSnapshot, MatchSettlement, MatchSnapshot } from './match.js';
+export type { EndgameReason, MatchAction, MatchClockSnapshot, MatchEvent, MatchSettlement, MatchSnapshot } from './match.js';
 export type { NegotiationEvent, NegotiationEventType, NegotiationType, PendingNegotiation } from './negotiation.js';
+export type {
+  QuickPhrase,
+  QuickPhraseCategory,
+  QuickPhraseEvent,
+  QuickPhraseId,
+  QuickChatRejectCode,
+  QuickChatRejection,
+} from './quick-chat.js';
+export {
+  QUICK_PHRASES,
+  QUICK_PHRASE_COOLDOWN_MS,
+  QUICK_PHRASE_DISPLAY_DURATION_MS,
+  getQuickPhraseById,
+  getQuickPhraseText,
+  isQuickPhraseId,
+  parsePhraseCooldownUntil,
+  parseQuickChatRejection,
+  parseQuickPhraseEvent,
+} from './quick-chat.js';
 
 import {
   parseDrawCooldownUntil,
@@ -40,9 +59,17 @@ import {
   type NegotiationEvent,
   type PendingNegotiation,
 } from './negotiation.js';
+import {
+  parsePhraseCooldownUntil,
+  parseQuickChatRejection,
+  parseQuickPhraseEvent,
+  type QuickChatRejection,
+  type QuickPhraseEvent,
+} from './quick-chat.js';
+import { parseMatchEvents, type MatchEvent } from './match.js';
 
-/** v4：增加局时/步时时钟锚点、90 秒断线宽限期、权威终局结算与回厅/再局协议，支持双方协商。 */
-export const PROTOCOL_VERSION = 4;
+/** v5：增加局内内置快捷短语互动与棋步结构化耗时记录。 */
+export const PROTOCOL_VERSION = 5;
 
 /** WebSocket 握手路径（房间服务同时在该路径上提供客人页面）。 */
 export const WS_PATH = '/ws';
@@ -115,7 +142,7 @@ interface Envelope {
   type: string;
   requestId?: string;
   roomId: string | null;
-  payload?: Record<string, unknown>;
+  payload?: unknown;
 }
 
 export interface HelloPayload {
@@ -167,6 +194,12 @@ export type ClientMessage =
       type: 'game.sync';
       roomId: string;
       payload: { matchId?: string };
+    })
+  | (Envelope & {
+      type: 'chat.phrase';
+      requestId: string;
+      roomId: string;
+      payload: { matchId: string; phraseId: string };
     });
 
 export interface LobbyRejection {
@@ -191,7 +224,11 @@ export type ServerMessage =
     })
   | (Envelope & { type: 'members'; roomId: string; payload: { members: MemberSnapshot[] } })
   | (Envelope & { type: 'ping'; roomId: string; payload: { seq: number; serverTime?: number } })
-  | (Envelope & { type: 'pong'; roomId: string; payload: { seq: number; serverReceiveTime?: number; serverSendTime?: number } })
+  | (Envelope & {
+      type: 'pong';
+      roomId: string;
+      payload: { seq: number; serverReceiveTime?: number; serverSendTime?: number; clientSendTime?: number };
+    })
   | (Envelope & { type: 'lobby.state'; roomId: string; payload: { lobby: LobbyState } })
   | (Envelope & { type: 'lobby.rejected'; roomId: string; payload: LobbyRejection })
   | (Envelope & {
@@ -220,7 +257,9 @@ export type ServerMessage =
         settlement?: MatchSettlement | null;
         pendingNegotiation?: PendingNegotiation | null;
         drawCooldownUntil?: Record<string, number>;
+        phraseCooldownUntil?: Record<string, number>;
         negotiationEvent?: NegotiationEvent | null;
+        matchEvents?: MatchEvent[];
       };
     })
   | (Envelope & {
@@ -232,6 +271,17 @@ export type ServerMessage =
         reason: string;
         state: GameStateSnapshot;
       };
+    })
+  | (Envelope & {
+      type: 'chat.phrase';
+      roomId: string;
+      payload: QuickPhraseEvent;
+    })
+  | (Envelope & {
+      type: 'chat.phrase.rejected';
+      roomId: string;
+      requestId?: string;
+      payload: QuickChatRejection;
     })
   | (Envelope & { type: 'room.closed'; roomId: string; payload: { reason: RoomClosedReason } })
   | (Envelope & { type: 'error'; roomId: string | null; payload: { code: ServerErrorCode; message: string } });
@@ -611,6 +661,35 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
     };
   }
 
+  if (message.type === 'chat.phrase') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'chat-phrase-room-id' };
+    }
+    if (typeof message.requestId !== 'string' || message.requestId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'chat-phrase-request-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof payload.matchId !== 'string' || payload.matchId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'chat-phrase-match-id' };
+    }
+    if (typeof payload.phraseId !== 'string' || payload.phraseId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'chat-phrase-invalid-phrase-id' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'chat.phrase',
+        requestId: message.requestId,
+        roomId: message.roomId,
+        payload: {
+          matchId: payload.matchId,
+          phraseId: payload.phraseId,
+        },
+      },
+    };
+  }
+
   return { ok: false, code: 'INVALID_MESSAGE', detail: `unknown-type=${message.type}` };
 }
 
@@ -813,12 +892,18 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     const drawCooldownUntil = payload.drawCooldownUntil
       ? parseDrawCooldownUntil(payload.drawCooldownUntil) ?? undefined
       : undefined;
+    const phraseCooldownUntil = payload.phraseCooldownUntil
+      ? parsePhraseCooldownUntil(payload.phraseCooldownUntil) ?? undefined
+      : undefined;
     const negotiationEvent =
       payload.negotiationEvent !== undefined
         ? payload.negotiationEvent === null
           ? null
           : parseNegotiationEvent(payload.negotiationEvent) ?? undefined
         : undefined;
+    const matchEvents = Array.isArray(payload.matchEvents)
+      ? parseMatchEvents(payload.matchEvents) ?? undefined
+      : undefined;
 
     return {
       ok: true,
@@ -839,7 +924,9 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
           ...(settlement !== undefined ? { settlement } : {}),
           ...(pendingNegotiation !== undefined ? { pendingNegotiation } : {}),
           ...(drawCooldownUntil !== undefined ? { drawCooldownUntil } : {}),
+          ...(phraseCooldownUntil !== undefined ? { phraseCooldownUntil } : {}),
           ...(negotiationEvent !== undefined ? { negotiationEvent } : {}),
+          ...(matchEvents !== undefined ? { matchEvents } : {}),
         },
       },
     };
@@ -880,6 +967,45 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
           reason: payload.reason,
           state,
         },
+      },
+    };
+  }
+
+  if (message.type === 'chat.phrase') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'chat-phrase-room-id' };
+    }
+    const payload = parseQuickPhraseEvent(message.payload);
+    if (!payload) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'chat-phrase-payload' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'chat.phrase',
+        roomId: message.roomId,
+        payload,
+      },
+    };
+  }
+
+  if (message.type === 'chat.phrase.rejected') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'chat-phrase-rejected-room-id' };
+    }
+    const payload = parseQuickChatRejection(message.payload);
+    if (!payload) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'chat-phrase-rejected-payload' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'chat.phrase.rejected',
+        roomId: message.roomId,
+        ...(message.requestId ? { requestId: message.requestId } : {}),
+        payload,
       },
     };
   }
@@ -1148,6 +1274,45 @@ export function buildClientGameSync(
     roomId,
     ...(requestId ? { requestId } : {}),
     payload: { ...(matchId ? { matchId } : {}) },
+  };
+}
+
+export function buildClientChatPhrase(
+  roomId: string,
+  input: { requestId: string; matchId: string; phraseId: string },
+): ClientMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'chat.phrase',
+    requestId: input.requestId,
+    roomId,
+    payload: {
+      matchId: input.matchId,
+      phraseId: input.phraseId,
+    },
+  };
+}
+
+export function buildServerChatPhrase(roomId: string, payload: QuickPhraseEvent): ServerMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'chat.phrase',
+    roomId,
+    payload,
+  };
+}
+
+export function buildServerChatPhraseRejected(
+  roomId: string,
+  payload: QuickChatRejection,
+  requestId?: string,
+): ServerMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'chat.phrase.rejected',
+    roomId,
+    ...(requestId ? { requestId } : {}),
+    payload,
   };
 }
 

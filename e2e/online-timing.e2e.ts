@@ -149,7 +149,7 @@ test.describe('online turn timing, countdown warnings, disconnection grace, and 
     await hostPage.evaluate(() => {
       const lastClock = (window as any).__lastClock;
       const urgentClock = {
-        version: 4,
+        version: lastClock.version ?? 5,
         type: 'game.clock',
         roomId: lastClock.roomId,
         payload: {

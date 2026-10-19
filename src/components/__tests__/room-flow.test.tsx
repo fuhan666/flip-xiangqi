@@ -131,6 +131,9 @@ class FakeConnection implements RoomConnection {
   }
 
   requestGameSync(): void {}
+  sendChatPhrase(_phraseId: string): { ok: boolean; reason?: string } {
+    return { ok: true };
+  }
 
   emit(state: Partial<ConnectionState>): void {
     this.setState({ ...this.state, ...state });
@@ -200,7 +203,7 @@ describe('main menu', () => {
     expect(screen.getByTestId('menu-join')).toBeInTheDocument();
     expect(screen.getByTestId('menu-local')).toBeInTheDocument();
     expect(screen.getByTestId('menu-settings')).toBeInTheDocument();
-    expect(screen.getByTestId('app-version')).toHaveTextContent('v0.7.0');
+    expect(screen.getByTestId('app-version')).toHaveTextContent('v0.8.0');
 
     fireEvent.click(screen.getByTestId('menu-local'));
     await waitFor(() => expect(window.location.hash).toBe('#/local'));

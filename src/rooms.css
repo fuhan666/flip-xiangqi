@@ -819,6 +819,7 @@
 }
 
 .online-opponent-bar {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -832,6 +833,7 @@
 }
 
 .online-self-bar {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1413,9 +1415,9 @@
 }
 
 .online-action-btn {
-  min-height: 38px;
+  min-height: 44px;
   min-width: 44px;
-  padding: 6px 14px;
+  padding: 8px 14px;
   font-size: 0.88rem;
   font-weight: 600;
   border-radius: 8px;
@@ -1425,6 +1427,10 @@
   cursor: pointer;
   transition: all 0.2s ease;
   white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
 }
 
 .online-action-btn:hover:not(:disabled) {
@@ -1439,6 +1445,16 @@
   color: rgba(255, 255, 255, 0.35);
 }
 
+.online-btn-phrase {
+  border-color: rgba(94, 186, 125, 0.4);
+  color: #7bed9f;
+}
+
+.online-btn-phrase:hover:not(:disabled) {
+  background: rgba(94, 186, 125, 0.2);
+  border-color: #2ed573;
+}
+
 .online-btn-resign {
   border-color: rgba(235, 77, 75, 0.4);
   color: #ff7675;
@@ -1447,6 +1463,184 @@
 .online-btn-resign:hover:not(:disabled) {
   background: rgba(235, 77, 75, 0.2);
   border-color: #eb4d4b;
+}
+
+/* 快捷短语互动弹窗与容器 */
+.quick-phrase-container {
+  position: relative;
+  display: inline-flex;
+}
+
+.quick-phrase-popover {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 0;
+  width: 320px;
+  max-width: calc(100vw - 32px);
+  background: #231911;
+  border: 1.5px solid #d7b277;
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.7);
+  z-index: 100;
+  padding: 12px;
+  animation: popover-fade-in 0.18s ease-out;
+  box-sizing: border-box;
+}
+
+@keyframes popover-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.quick-phrase-popover-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  border-bottom: 1px solid rgba(215, 178, 119, 0.25);
+  padding-bottom: 6px;
+}
+
+.quick-phrase-popover-title {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #f7e0b5;
+}
+
+.quick-phrase-close-btn {
+  background: transparent;
+  border: none;
+  color: #d7b277;
+  font-size: 1.3rem;
+  line-height: 1;
+  cursor: pointer;
+  min-width: 44px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  transition: background 0.15s ease;
+}
+
+.quick-phrase-close-btn:hover {
+  background: rgba(215, 178, 119, 0.2);
+}
+
+.quick-phrase-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.quick-phrase-item-btn {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 8px 10px;
+  font-size: 0.82rem;
+  line-height: 1.3;
+  font-weight: 500;
+  border-radius: 8px;
+  border: 1px solid rgba(215, 178, 119, 0.3);
+  background: rgba(45, 33, 24, 0.9);
+  color: #f7e0b5;
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  word-break: break-all;
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+}
+
+.quick-phrase-item-btn:hover {
+  background: rgba(215, 178, 119, 0.25);
+  border-color: #d7b277;
+  color: #fff;
+  transform: translateY(-1px);
+}
+
+.quick-phrase-item-btn:active {
+  transform: translateY(0);
+}
+
+/* 浮动短语互动气泡（3 秒平滑淡出） */
+.quick-phrase-bubble {
+  position: absolute;
+  z-index: 50;
+  max-width: 260px;
+  padding: 8px 14px;
+  border-radius: 12px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  line-height: 1.35;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+  animation: phrase-bubble-fade 3s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+  word-wrap: break-word;
+  background: #fffbe6;
+  color: #5c3a1e;
+  border: 1.5px solid #d4af37;
+  box-sizing: border-box;
+}
+
+.phrase-bubble-opponent {
+  top: calc(100% + 8px);
+  left: 20px;
+}
+
+.phrase-bubble-opponent .phrase-bubble-tail {
+  position: absolute;
+  top: -7px;
+  left: 24px;
+  width: 0;
+  height: 0;
+  border-left: 7px solid transparent;
+  border-right: 7px solid transparent;
+  border-bottom: 7px solid #d4af37;
+}
+
+.phrase-bubble-self {
+  bottom: calc(100% + 8px);
+  left: 20px;
+}
+
+.phrase-bubble-self .phrase-bubble-tail {
+  position: absolute;
+  bottom: -7px;
+  left: 24px;
+  width: 0;
+  height: 0;
+  border-left: 7px solid transparent;
+  border-right: 7px solid transparent;
+  border-top: 7px solid #d4af37;
+}
+
+@keyframes phrase-bubble-fade {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) scale(0.95);
+  }
+  8% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  80% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
 }
 
 /* 协商锁定状态下的棋盘样式 */
@@ -1733,7 +1927,9 @@
   .check-toast-banner,
   .game-result-dialog,
   .negotiation-dialog-panel,
-  .negotiation-toast {
+  .negotiation-toast,
+  .quick-phrase-bubble,
+  .quick-phrase-popover {
     animation: none;
     transition: none;
   }

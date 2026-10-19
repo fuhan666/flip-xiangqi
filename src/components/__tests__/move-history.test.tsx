@@ -5,8 +5,11 @@ import type { GameHistoryEntry } from '../../game';
 
 function createHistoryEntry(overrides: Partial<GameHistoryEntry> = {}): GameHistoryEntry {
   return {
+    stepNumber: overrides.stepNumber ?? 1,
     turnNumber: 1,
+    kind: overrides.kind ?? 'move',
     actor: 'red',
+    durationSeconds: overrides.durationSeconds ?? null,
     action: {
       type: 'move',
       from: { x: 0, y: 9 },

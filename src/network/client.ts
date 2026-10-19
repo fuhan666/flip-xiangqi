@@ -22,6 +22,7 @@ import {
   buildClientGameNegotiateReply,
   buildClientGameResign,
   buildClientGameSync,
+  buildClientChatPhrase,
   buildClientHello,
   buildClientLeave,
   buildClientLobbyLock,
@@ -33,6 +34,7 @@ import {
   buildPong,
   closeCodeForError,
   encodeMessage,
+  isQuickPhraseId,
   parseServerMessage,
   serverErrorCodeForCloseCode,
   PROTOCOL_VERSION,
@@ -41,10 +43,12 @@ import {
   type LobbyRejection,
   type MatchAction,
   type MatchClockSnapshot,
+  type MatchEvent,
   type MatchSettlement,
   type MemberSnapshot,
   type NegotiationEvent,
   type PendingNegotiation,
+  type QuickPhraseEvent,
   type Role,
   type RoomClosedReason,
   type ServerErrorCode,
@@ -90,7 +94,11 @@ export interface GameClientState {
   lastAcceptedAction: AcceptedGameAction | null;
   pendingNegotiation: PendingNegotiation | null;
   drawCooldownUntil: Record<string, number>;
+  phraseCooldownUntil?: Record<string, number>;
   negotiationEvent: NegotiationEvent | null;
+  recentPhraseEvents?: Record<string, QuickPhraseEvent>;
+  recentPhraseEvent?: QuickPhraseEvent | null;
+  matchEvents?: MatchEvent[];
 }
 
 export interface ConnectionState {
@@ -167,6 +175,8 @@ export interface RoomConnection {
   sendGameResign(): { ok: boolean; reason?: string };
   /** 显式请求权威对局同步。 */
   requestGameSync(): void;
+  /** 发送快捷短语互动（服务端白名单与冷却防刷）。 */
+  sendChatPhrase(phraseId: string): { ok: boolean; reason?: string };
 }
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 8_000;
@@ -238,6 +248,7 @@ export class RoomClient implements RoomConnection {
   private reconnectAttempt = 0;
   private reconnecting = false;
   private pendingSyncRequestId: string | null = null;
+  private pendingChatRequestId: string | null = null;
 
   constructor(options: RoomClientOptions = {}) {
     this.webSocketFactory = options.webSocketFactory ?? defaultWebSocketFactory;
@@ -656,6 +667,50 @@ export class RoomClient implements RoomConnection {
     }
   }
 
+  sendChatPhrase(phraseId: string): { ok: boolean; reason?: string } {
+    const socket = this.socket;
+    if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
+      return { ok: false, reason: '连接未就绪' };
+    }
+    const game = this.state.game;
+    if (!game) {
+      return { ok: false, reason: '对局未开始' };
+    }
+    if (game.settlement !== null || game.displayState.winner !== null) {
+      return { ok: false, reason: '对局已结束' };
+    }
+    if (!isQuickPhraseId(phraseId)) {
+      return { ok: false, reason: '非法预置短语' };
+    }
+    const memberId = this.state.memberId;
+    if (!memberId) {
+      return { ok: false, reason: '未登录身份' };
+    }
+    const now = this.now();
+    const cooldownUntil = game.phraseCooldownUntil?.[memberId] ?? 0;
+    if (now < cooldownUntil) {
+      const remaining = Math.ceil((cooldownUntil - now) / 1000);
+      return { ok: false, reason: `短语发送冷却中（剩余 ${remaining} 秒）` };
+    }
+
+    const requestId = generateRequestId();
+    this.pendingChatRequestId = requestId;
+    try {
+      socket.send(
+        encodeMessage(
+          buildClientChatPhrase(this.state.roomId!, {
+            requestId,
+            matchId: game.matchId,
+            phraseId,
+          }),
+        ),
+      );
+    } catch {
+      return { ok: false, reason: '网络发送失败' };
+    }
+    return { ok: true };
+  }
+
   /** 发送大厅请求：记录在途类别供界面防连点；发送失败按本地错误提示，不动连接。 */
   private sendLobbyRequest(kind: LobbyRequestKind, message: ClientMessage): void {
     const socket = this.socket;
@@ -721,7 +776,11 @@ export class RoomClient implements RoomConnection {
           lastAcceptedAction: null,
           pendingNegotiation: incomingGame.pendingNegotiation ?? null,
           drawCooldownUntil: incomingGame.drawCooldownUntil ?? {},
+          phraseCooldownUntil: incomingGame.phraseCooldownUntil ?? {},
           negotiationEvent: incomingGame.negotiationEvent ?? null,
+          recentPhraseEvents: {},
+          recentPhraseEvent: null,
+          matchEvents: incomingGame.matchEvents ?? [],
         };
       } else if (message.payload.lobby.phase === 'lobby') {
         gameClientState = null;
@@ -882,7 +941,11 @@ export class RoomClient implements RoomConnection {
               revision: incomingRevision,
               pendingNegotiation: incoming.pendingNegotiation !== undefined ? incoming.pendingNegotiation : currentGame.pendingNegotiation,
               drawCooldownUntil: incoming.drawCooldownUntil ?? currentGame.drawCooldownUntil,
+              phraseCooldownUntil: incoming.phraseCooldownUntil ?? currentGame.phraseCooldownUntil,
               negotiationEvent: incoming.negotiationEvent !== undefined ? incoming.negotiationEvent : currentGame.negotiationEvent,
+              recentPhraseEvents: currentGame.recentPhraseEvents,
+              recentPhraseEvent: currentGame.recentPhraseEvent,
+              matchEvents: incoming.matchEvents ?? currentGame.matchEvents,
             },
           });
           return;
@@ -954,7 +1017,11 @@ export class RoomClient implements RoomConnection {
           lastAcceptedAction,
           pendingNegotiation: incoming.pendingNegotiation !== undefined ? incoming.pendingNegotiation : (currentGame?.pendingNegotiation ?? null),
           drawCooldownUntil: incoming.drawCooldownUntil ?? currentGame?.drawCooldownUntil ?? {},
+          phraseCooldownUntil: incoming.phraseCooldownUntil ?? currentGame?.phraseCooldownUntil ?? {},
           negotiationEvent: incoming.negotiationEvent !== undefined ? incoming.negotiationEvent : (currentGame?.negotiationEvent ?? null),
+          recentPhraseEvents: currentGame?.recentPhraseEvents ?? {},
+          recentPhraseEvent: currentGame?.recentPhraseEvent ?? null,
+          matchEvents: incoming.matchEvents ?? currentGame?.matchEvents ?? [],
         },
       });
       return;
@@ -1011,6 +1078,62 @@ export class RoomClient implements RoomConnection {
           lastAcceptedAction: null,
         },
       });
+      return;
+    }
+
+    if (message.type === 'chat.phrase') {
+      const event = message.payload;
+      const currentGame = this.state.game;
+      if (currentGame && currentGame.matchId === event.matchId) {
+        if (message.requestId && message.requestId === this.pendingChatRequestId) {
+          this.pendingChatRequestId = null;
+        }
+        const nextCooldownUntil = {
+          ...(currentGame.phraseCooldownUntil ?? {}),
+          [event.senderMemberId]: event.nextAllowedAt,
+        };
+        const nextRecentPhraseEvents = {
+          ...(currentGame.recentPhraseEvents ?? {}),
+          [event.senderMemberId]: event,
+        };
+        this.setState({
+          ...this.state,
+          game: {
+            ...currentGame,
+            phraseCooldownUntil: nextCooldownUntil,
+            recentPhraseEvents: nextRecentPhraseEvents,
+            recentPhraseEvent: event,
+          },
+        });
+      }
+      return;
+    }
+
+    if (message.type === 'chat.phrase.rejected') {
+      const rejection = message.payload;
+      const currentGame = this.state.game;
+      if (currentGame && currentGame.matchId === rejection.matchId) {
+        if (message.requestId && message.requestId === this.pendingChatRequestId) {
+          this.pendingChatRequestId = null;
+        }
+        const memberId = this.state.memberId;
+        const nextCooldownUntil = rejection.retryAt && memberId
+          ? {
+              ...(currentGame.phraseCooldownUntil ?? {}),
+              [memberId]: rejection.retryAt,
+            }
+          : currentGame.phraseCooldownUntil;
+
+        this.setState({
+          ...this.state,
+          game: {
+            ...currentGame,
+            phraseCooldownUntil: nextCooldownUntil,
+            statusNotice: rejection.message,
+            lastRejectedReason: rejection.message,
+          },
+        });
+      }
       return;
     }
 

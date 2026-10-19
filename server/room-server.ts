@@ -36,6 +36,7 @@ import {
 import {
   DRAW_COOLDOWN_MS,
   NEGOTIATION_TIMEOUT_MS,
+  type NegotiationEvent,
   type NegotiationEventType,
   type PendingNegotiation,
 } from '../src/network/negotiation.js';
@@ -43,14 +44,21 @@ import { createEmptyGameState } from '../src/game/index.js';
 import type { GameStateSnapshot } from '../src/game/index.js';
 import {
   buildPong,
+  buildServerChatPhrase,
+  buildServerChatPhraseRejected,
   buildServerGameClock,
   buildServerMessage,
   closeCodeForError,
+  getQuickPhraseText,
+  isQuickPhraseId,
   parseClientMessage,
+  QUICK_PHRASE_COOLDOWN_MS,
   WS_PATH,
   type ClientMessage,
   type MemberSnapshot,
   type MemberLeaveReason,
+  type QuickChatRejection,
+  type QuickPhraseEvent,
   type Role,
   type RoomClosedReason,
   type ServerErrorCode,
@@ -159,6 +167,8 @@ export class RoomServer {
   private readonly watchdogs = new Map<WebSocket, SocketWatchdog>();
   private guestResumeToken: string | null = null;
   private readonly processedActions = new Map<string, { stepNumber: number; match: MatchState }>();
+  private readonly phraseCooldownUntil = new Map<string, number>();
+  private readonly processedPhraseRequests = new Map<string, { event: QuickPhraseEvent }>();
   private host: RoomMember | null = null;
   private guest: RoomMember | null = null;
   private lobby: LobbyState;
@@ -334,6 +344,8 @@ export class RoomServer {
     this.clearClockTimer();
     this.clearNegotiationTimer();
     this.processedActions.clear();
+    this.phraseCooldownUntil.clear();
+    this.processedPhraseRequests.clear();
     this.guestResumeToken = null;
     this.match = null;
 
@@ -378,6 +390,36 @@ export class RoomServer {
     }, delay);
   }
 
+  private recordMatchEvent(
+    type: NegotiationEventType | 'game-started' | 'game-ended',
+    actorMemberId: string,
+    result: string,
+    message: string,
+    now: number = this.now(),
+  ): NegotiationEvent {
+    const event: NegotiationEvent = {
+      id: `evt-${now}-${Math.random().toString(36).slice(2, 7)}`,
+      type: type as NegotiationEventType,
+      actorMemberId,
+      createdAt: now,
+      message,
+    };
+    if (this.match) {
+      this.match.negotiationEvent = event;
+      this.match.matchEvents.push({
+        id: event.id,
+        type,
+        actorMemberId,
+        stepNumber: this.match.stepNumber,
+        revision: this.match.revision,
+        result,
+        createdAt: now,
+        message,
+      });
+    }
+    return event;
+  }
+
   private handleNegotiationTimeout(matchId: string, negotiationId: string): void {
     if (!this.match || this.match.matchId !== matchId) {
       return;
@@ -396,13 +438,7 @@ export class RoomServer {
 
     const eventType: NegotiationEventType = pending.type === 'undo' ? 'undo-timeout' : 'draw-timeout';
     const message = pending.type === 'undo' ? '悔棋申请超时未应答，已自动拒绝' : '求和申请超时未应答，已自动拒绝';
-    this.match.negotiationEvent = {
-      id: `evt-${now}-${Math.random().toString(36).slice(2, 7)}`,
-      type: eventType,
-      actorMemberId: pending.initiatorMemberId,
-      createdAt: now,
-      message,
-    };
+    this.recordMatchEvent(eventType, pending.initiatorMemberId, 'timeout', message, now);
 
     this.match.pendingNegotiation = null;
     this.match.revision++;
@@ -763,6 +799,11 @@ export class RoomServer {
         return;
       }
 
+      if (message.type === 'chat.phrase') {
+        this.handleChatPhrase(socket, connectionId, joinedMember, message);
+        return;
+      }
+
       this.reject(socket, connectionId, 'INVALID_MESSAGE', 'unexpected-type');
     });
 
@@ -980,6 +1021,8 @@ export class RoomServer {
         settingsVersion: result.state.settings.settingsVersion,
       });
       if (result.state.phase === 'started' && !this.match) {
+        this.phraseCooldownUntil.clear();
+        this.processedPhraseRequests.clear();
         const seed = this.drawSeed();
         const matchId = generateId();
         this.match = createMatch({
@@ -1478,13 +1521,7 @@ export class RoomServer {
 
     const eventType: NegotiationEventType = message.payload.kind === 'undo' ? 'undo-request' : 'draw-request';
     const eventMsg = message.payload.kind === 'undo' ? '对方发起了悔棋申请' : '对方发起了求和申请';
-    this.match.negotiationEvent = {
-      id: `evt-${now}-${Math.random().toString(36).slice(2, 7)}`,
-      type: eventType,
-      actorMemberId: member.id,
-      createdAt: now,
-      message: eventMsg,
-    };
+    this.recordMatchEvent(eventType, member.id, 'requested', eventMsg, now);
 
     this.scheduleNegotiationDeadline(this.match.matchId, negotiationId, deadline);
     this.broadcastGameState({ requestId: message.requestId });
@@ -1538,13 +1575,7 @@ export class RoomServer {
           this.match.clock.resumeNegotiation(now);
           this.match.pendingNegotiation = null;
           this.processedActions.clear();
-          this.match.negotiationEvent = {
-            id: `evt-${now}-${Math.random().toString(36).slice(2, 7)}`,
-            type: 'undo-accepted',
-            actorMemberId: member.id,
-            createdAt: now,
-            message: '对方同意了悔棋申请，棋盘已回退一步',
-          };
+          this.recordMatchEvent('undo-accepted', member.id, 'accepted', '对方同意了悔棋申请，棋盘已回退一步', now);
           this.broadcastGameState({ requestId: message.requestId });
           this.scheduleClockDeadline();
         }
@@ -1553,13 +1584,7 @@ export class RoomServer {
         this.match.pendingNegotiation = null;
         this.stopClockBroadcast();
         this.clearClockTimer();
-        this.match.negotiationEvent = {
-          id: `evt-${now}-${Math.random().toString(36).slice(2, 7)}`,
-          type: 'draw-accepted',
-          actorMemberId: member.id,
-          createdAt: now,
-          message: '双方同意握手言和，对局平局',
-        };
+        this.recordMatchEvent('draw-accepted', member.id, 'accepted', '双方同意握手言和，对局平局', now);
         this.broadcastGameState({ requestId: message.requestId });
       }
     } else {
@@ -1568,13 +1593,7 @@ export class RoomServer {
         this.match.clock.resumeNegotiation(now);
         this.match.pendingNegotiation = null;
         this.match.revision++;
-        this.match.negotiationEvent = {
-          id: `evt-${now}-${Math.random().toString(36).slice(2, 7)}`,
-          type: 'undo-rejected',
-          actorMemberId: member.id,
-          createdAt: now,
-          message: '对方拒绝了悔棋申请',
-        };
+        this.recordMatchEvent('undo-rejected', member.id, 'rejected', '对方拒绝了悔棋申请', now);
         this.broadcastGameState({ requestId: message.requestId });
         this.scheduleClockDeadline();
       } else if (pending.type === 'draw') {
@@ -1582,13 +1601,7 @@ export class RoomServer {
         this.match.clock.resumeNegotiation(now);
         this.match.pendingNegotiation = null;
         this.match.revision++;
-        this.match.negotiationEvent = {
-          id: `evt-${now}-${Math.random().toString(36).slice(2, 7)}`,
-          type: 'draw-rejected',
-          actorMemberId: member.id,
-          createdAt: now,
-          message: '对方拒绝了求和申请',
-        };
+        this.recordMatchEvent('draw-rejected', member.id, 'rejected', '对方拒绝了求和申请', now);
         this.broadcastGameState({ requestId: message.requestId });
         this.scheduleClockDeadline();
       }
@@ -1636,13 +1649,7 @@ export class RoomServer {
     this.match = finalizeMatch(this.match, winningCamp, 'resignation', now);
     this.stopClockBroadcast();
     this.clearClockTimer();
-    this.match.negotiationEvent = {
-      id: `evt-${now}-${Math.random().toString(36).slice(2, 7)}`,
-      type: 'resigned',
-      actorMemberId: member.id,
-      createdAt: now,
-      message: `${member.name} 认输，对局结束`,
-    };
+    this.recordMatchEvent('resigned', member.id, 'resigned', `${member.name} 认输，对局结束`, now);
     this.broadcastGameState({ requestId: message.requestId });
   }
 
@@ -1696,7 +1703,9 @@ export class RoomServer {
             ...(snap.settlement ? { settlement: snap.settlement } : {}),
             pendingNegotiation: snap.pendingNegotiation,
             drawCooldownUntil: snap.drawCooldownUntil,
+            phraseCooldownUntil: snap.phraseCooldownUntil,
             negotiationEvent: snap.negotiationEvent,
+            matchEvents: snap.matchEvents,
           },
         }),
       );
@@ -1729,7 +1738,9 @@ export class RoomServer {
         ...(snap.settlement ? { settlement: snap.settlement } : {}),
         pendingNegotiation: snap.pendingNegotiation,
         drawCooldownUntil: snap.drawCooldownUntil,
+        phraseCooldownUntil: snap.phraseCooldownUntil,
         negotiationEvent: snap.negotiationEvent,
+        matchEvents: snap.matchEvents,
         ...(options?.actorMemberId ? { actorMemberId: options.actorMemberId } : {}),
         ...(options?.action ? { action: options.action } : {}),
       },
@@ -1742,6 +1753,165 @@ export class RoomServer {
         } catch {
           // 忽略发送失败
         }
+      }
+    }
+  }
+
+  private handleChatPhrase(
+    socket: WebSocket,
+    connectionId: string,
+    member: RoomMember | null,
+    message: Extract<ClientMessage, { type: 'chat.phrase' }>,
+  ): void {
+    if (message.roomId !== this.roomId) {
+      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
+      return;
+    }
+
+    if (!member) {
+      this.reject(socket, connectionId, 'UNAUTHORIZED', 'unadmitted-member');
+      return;
+    }
+
+    if (
+      !this.match ||
+      this.lobby.phase !== 'started' ||
+      this.match.settlement !== null ||
+      this.match.gameState.winner !== null
+    ) {
+      this.sendChatPhraseRejection(
+        socket,
+        {
+          matchId: message.payload.matchId,
+          requestId: message.requestId,
+          code: 'MATCH_NOT_ACTIVE',
+          message: '对局未处于进行中',
+        },
+        message.requestId,
+      );
+      return;
+    }
+
+    if (member.id !== this.host?.id && member.id !== this.guest?.id) {
+      this.sendChatPhraseRejection(
+        socket,
+        {
+          matchId: message.payload.matchId,
+          requestId: message.requestId,
+          code: 'NOT_A_PLAYER',
+          message: '非对局玩家',
+        },
+        message.requestId,
+      );
+      return;
+    }
+
+    if (!this.host?.connected || !this.guest?.connected) {
+      this.sendChatPhraseRejection(
+        socket,
+        {
+          matchId: message.payload.matchId,
+          requestId: message.requestId,
+          code: 'MATCH_NOT_ACTIVE',
+          message: '对方已离线，暂无法发送短语',
+        },
+        message.requestId,
+      );
+      return;
+    }
+
+    if (!isQuickPhraseId(message.payload.phraseId)) {
+      this.sendChatPhraseRejection(
+        socket,
+        {
+          matchId: message.payload.matchId,
+          requestId: message.requestId,
+          code: 'INVALID_PHRASE',
+          message: '非法预置短语',
+        },
+        message.requestId,
+      );
+      return;
+    }
+
+    if (message.requestId && this.processedPhraseRequests.has(message.requestId)) {
+      // 相同请求重传不重复广播或延长冷却
+      return;
+    }
+
+    const now = this.now();
+    const cooldownUntil = this.phraseCooldownUntil.get(member.id) ?? 0;
+    if (now < cooldownUntil) {
+      const remainingSeconds = Math.ceil((cooldownUntil - now) / 1000);
+      this.sendChatPhraseRejection(
+        socket,
+        {
+          matchId: message.payload.matchId,
+          requestId: message.requestId,
+          code: 'COOLDOWN',
+          message: `短语发送冷却中，请等待 ${remainingSeconds} 秒`,
+          retryAt: cooldownUntil,
+        },
+        message.requestId,
+      );
+      return;
+    }
+
+    const nextAllowedAt = now + QUICK_PHRASE_COOLDOWN_MS;
+    this.phraseCooldownUntil.set(member.id, nextAllowedAt);
+    if (this.match) {
+      this.match.phraseCooldownUntil[member.id] = nextAllowedAt;
+    }
+
+    const event: QuickPhraseEvent = {
+      eventId: generateId(),
+      matchId: this.match.matchId,
+      senderMemberId: member.id,
+      phraseId: message.payload.phraseId,
+      text: getQuickPhraseText(message.payload.phraseId)!,
+      sentAt: now,
+      nextAllowedAt,
+    };
+
+    if (message.requestId) {
+      this.processedPhraseRequests.set(message.requestId, { event });
+      if (this.processedPhraseRequests.size > 200) {
+        const oldestKey = this.processedPhraseRequests.keys().next().value;
+        if (oldestKey) {
+          this.processedPhraseRequests.delete(oldestKey);
+        }
+      }
+    }
+
+    this.logger('chat.phrase', {
+      room: this.roomId,
+      matchId: this.match.matchId,
+      member: member.id,
+      phraseId: message.payload.phraseId,
+    });
+
+    const text = buildServerMessage(buildServerChatPhrase(this.roomId, event));
+    for (const s of this.openSockets) {
+      if (s.readyState === 1) {
+        try {
+          s.send(text);
+        } catch {
+          // 忽略单个发送失败
+        }
+      }
+    }
+  }
+
+  private sendChatPhraseRejection(
+    socket: WebSocket,
+    rejection: QuickChatRejection,
+    requestId?: string,
+  ): void {
+    if (socket.readyState === 1) {
+      try {
+        socket.send(buildServerMessage(buildServerChatPhraseRejected(this.roomId, rejection, requestId)));
+      } catch {
+        // 忽略发送失败
       }
     }
   }
@@ -1775,6 +1945,8 @@ export class RoomServer {
       this.clearNegotiationTimer();
       this.match = null;
       this.processedActions.clear();
+      this.phraseCooldownUntil.clear();
+      this.processedPhraseRequests.clear();
 
       this.lobby = {
         ...this.lobby,
