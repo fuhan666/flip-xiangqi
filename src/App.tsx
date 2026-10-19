@@ -15,6 +15,8 @@ import { GameControls } from './components/GameControls';
 import { StatusPanel } from './components/StatusPanel';
 import { useBoardFeedback } from './components/useBoardFeedback';
 import type { LegalMoveHint } from './components/useBoardFeedback';
+import { AudioControls } from './components/AudioControls';
+import { useLocalGameAudio } from './components/useGameAudio';
 
 interface GameResultSummary {
   archiveLabel: string;
@@ -87,6 +89,7 @@ export default function App({ initialState }: AppProps) {
   const [interactionMessage, setInteractionMessage] = useState<string | null>(null);
   const stepStartTimeRef = useRef<number>(Date.now());
   const feedback = useBoardFeedback(gameState);
+  useLocalGameAudio(gameState);
   const displayState = feedback.displayState;
   const canUndo = gameState.undoStack.length > 0;
   const currentGameSummary = buildGameResultSummary(gameState);
@@ -233,6 +236,7 @@ export default function App({ initialState }: AppProps) {
             onRestart={handleRestart}
             onUndo={handleUndo}
           />
+          <AudioControls />
         </aside>
       </div>
     </main>

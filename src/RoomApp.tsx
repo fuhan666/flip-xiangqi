@@ -6,6 +6,7 @@ import { CreateRoomScreen } from './components/rooms/CreateRoomScreen';
 import { JoinRoomScreen } from './components/rooms/JoinRoomScreen';
 import { MenuScreen } from './components/rooms/MenuScreen';
 import { SettingsScreen } from './components/rooms/SettingsScreen';
+import { useAudioUnlock } from './components/useGameAudio';
 import './rooms.css';
 
 export const APP_VERSION = 'v0.8.0';
@@ -37,6 +38,9 @@ export default function RoomApp({ api, createClient, storage }: RoomAppProps) {
   const controlApi = useMemo(() => api ?? createHttpRoomControlApi(), [api]);
   const clientFactory = useMemo(() => createClient ?? (() => new RoomClient()), [createClient]);
   const store = useMemo(() => storage ?? defaultStorage(), [storage]);
+
+  // 菜单/大厅阶段的首个用户手势同样解锁音频，进入对局后立即可听。
+  useAudioUnlock();
 
   const [screen, setScreen] = useState<Screen>('menu');
   const [notice, setNotice] = useState<string | null>(null);
