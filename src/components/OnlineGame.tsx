@@ -15,6 +15,8 @@ import { StatusPanel } from './StatusPanel.js';
 import { ConnectionStatus } from './rooms/ConnectionStatus.js';
 import type { LegalMoveHint } from './useBoardFeedback.js';
 import { useOnlineBoardFeedback } from './useOnlineBoardFeedback.js';
+import { AudioControls } from './AudioControls.js';
+import { useOnlineGameAudio } from './useGameAudio.js';
 import { PhraseBubble } from './PhraseBubble.js';
 import { QuickPhrasePanel } from './QuickPhrasePanel.js';
 import type { QuickPhraseId } from '../network/quick-chat.js';
@@ -117,6 +119,7 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
   );
 
   const feedback = useOnlineBoardFeedback(rawGameState, game.lastAcceptedAction);
+  useOnlineGameAudio(rawGameState, game.lastAcceptedAction, game.settlement);
   const displayState = feedback.displayState;
 
   // 1.5 秒将军横幅提示
@@ -575,6 +578,7 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
             recentCompletedGames={[]}
           />
           <CapturedPieces gameState={displayState} />
+          <AudioControls className="room-panel audio-controls" />
         </aside>
       </div>
 

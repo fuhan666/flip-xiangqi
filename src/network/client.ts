@@ -70,6 +70,12 @@ export interface AcceptedGameAction {
   actorMemberId: string;
   action: MatchAction;
   source: 'local' | 'remote';
+  /**
+   * 仅客户端使用：true 表示该动作来自服务端权威 game.state 的直播确认/广播，
+   * false 表示本地乐观推测（服务端尚未确认，可能被拒绝回滚）。
+   * 用于把「权威动作反馈」与「乐观展示」分离；不进入线协议。
+   */
+  confirmed: boolean;
 }
 
 export interface GameClientState {
@@ -528,6 +534,7 @@ export class RoomClient implements RoomConnection {
           actorMemberId: this.state.memberId!,
           action,
           source: 'local',
+          confirmed: false,
         },
         lastError: null,
         lastRejectedReason: null,
@@ -979,6 +986,7 @@ export class RoomClient implements RoomConnection {
                 actorMemberId: incoming.actorMemberId,
                 action: incoming.action,
                 source: 'local',
+                confirmed: true,
               }
             : null;
         } else {
@@ -992,6 +1000,7 @@ export class RoomClient implements RoomConnection {
                 actorMemberId: incoming.actorMemberId,
                 action: incoming.action,
                 source: 'remote',
+                confirmed: true,
               }
             : null;
         }

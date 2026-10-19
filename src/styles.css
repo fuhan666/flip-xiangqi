@@ -754,6 +754,68 @@ button:disabled {
   color: #f3ede0;
 }
 
+.audio-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.audio-controls h2 {
+  margin: 0;
+}
+
+.audio-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.audio-row button {
+  border: 0;
+  border-radius: 999px;
+  padding: 10px 18px;
+  min-height: 44px;
+  cursor: pointer;
+}
+
+.audio-volume-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 180px;
+  min-width: 180px;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  color: rgba(243, 237, 224, 0.72);
+}
+
+.audio-volume-field input[type='range'] {
+  flex: 1 1 auto;
+  min-width: 120px;
+  accent-color: #d7b277;
+}
+
+.audio-volume-value {
+  min-width: 44px;
+  text-align: right;
+  color: #f4dba7;
+  font-variant-numeric: tabular-nums;
+}
+
+.audio-hint {
+  margin: 0;
+  color: rgba(243, 237, 224, 0.62);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.audio-row button:focus-visible,
+.audio-volume-field input:focus-visible {
+  outline: 2px solid #f4dba7;
+  outline-offset: 2px;
+}
+
 .error {
   margin: 12px 0 0;
   color: #ffb4a4;

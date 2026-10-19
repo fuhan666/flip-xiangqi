@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { AudioControls } from '../AudioControls';
 
 interface SettingsScreenProps {
   defaultRoomPort: number;
@@ -7,7 +8,7 @@ interface SettingsScreenProps {
   onBack: () => void;
 }
 
-/** 设置：本任务仅提供联机端口说明与配置。 */
+/** 设置：联机端口配置与本机音效（音量 / 静音）。 */
 export function SettingsScreen({ defaultRoomPort, savedRoomPort, onSaveRoomPort, onBack }: SettingsScreenProps) {
   const [value, setValue] = useState(savedRoomPort === null ? '' : String(savedRoomPort));
   const [message, setMessage] = useState<string | null>(null);
@@ -32,7 +33,7 @@ export function SettingsScreen({ defaultRoomPort, savedRoomPort, onSaveRoomPort,
     <main className="app-shell room-shell">
       <header className="room-header">
         <h1>设置</h1>
-        <p>联机端口说明与配置。</p>
+        <p>联机端口说明与配置，以及本机音效。</p>
       </header>
 
       <section className="room-panel">
@@ -66,6 +67,8 @@ export function SettingsScreen({ defaultRoomPort, savedRoomPort, onSaveRoomPort,
           </p>
         ) : null}
       </section>
+
+      <AudioControls className="room-panel audio-controls" />
     </main>
   );
 }
