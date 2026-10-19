@@ -8,7 +8,7 @@
  * 开局门禁与一次性随机分先都由纯函数裁决，服务端只做调用方，
  * 客户端 UI 不承担任何校验职责。
  */
-import type { Role } from './protocol.js';
+import type { PlayerRole } from './protocol.js';
 
 /** 棋子颜色（红方先行）。 */
 export type PieceSide = 'red' | 'black';
@@ -60,7 +60,7 @@ export interface LobbyReady {
 
 export interface PlayerSeat {
   memberId: string;
-  role: Role;
+  role: PlayerRole;
   name: string;
   side: PieceSide;
 }
@@ -94,17 +94,19 @@ export type LobbyRejectCode =
   | 'STALE_VERSION'
   | 'NOT_READY'
   | 'MEMBER_MISSING'
-  | 'ALREADY_STARTED';
+  | 'ALREADY_STARTED'
+  /** 旁观者只读：一切大厅命令与对局动作通道均拒绝旁观者消息。 */
+  | 'SPECTATOR_READONLY';
 
 export type LobbyCommand =
-  | { type: 'update-settings'; actor: Role; sidePreference: SidePreference; timeControlId: TimeControlId }
-  | { type: 'set-locked'; actor: Role; locked: boolean }
-  | { type: 'set-ready'; actor: Role; ready: boolean; settingsVersion: number }
-  | { type: 'member-joined'; role: Role }
-  | { type: 'member-left'; role: Role }
+  | { type: 'update-settings'; actor: PlayerRole; sidePreference: SidePreference; timeControlId: TimeControlId }
+  | { type: 'set-locked'; actor: PlayerRole; locked: boolean }
+  | { type: 'set-ready'; actor: PlayerRole; ready: boolean; settingsVersion: number }
+  | { type: 'member-joined'; role: PlayerRole }
+  | { type: 'member-left'; role: PlayerRole }
   | {
       type: 'start';
-      actor: Role;
+      actor: PlayerRole;
       roomId: string;
       host: { memberId: string; name: string };
       guest: { memberId: string; name: string };
@@ -401,7 +403,7 @@ export function describeSideDisplay(side: SideDisplay): string {
 }
 
 /** 分先单选卡片文案：始终指房主执红/执黑，客人文案按自身身份换算。 */
-export function sideOptionViews(viewerRole: Role): SideOptionView[] {
+export function sideOptionViews(viewerRole: PlayerRole): SideOptionView[] {
   const hostView: SideOptionView[] = [
     { id: 'host-red', label: '执红先行', description: '你执红，先手翻牌' },
     { id: 'host-black', label: '执黑后行', description: '你执黑' },

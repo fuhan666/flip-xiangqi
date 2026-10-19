@@ -284,7 +284,7 @@ describe('authorization and capacity', () => {
     expect(await client.closed).toBe(4002);
   });
 
-  it('rejects a second guest with ROOM_FULL while the seat is taken', async () => {
+  it('routes a second guest into spectator mode while the player seat is taken', async () => {
     const room = await startRoom();
     const host = await openClient(room.actualPort);
     await hello(host, { role: 'host', name: '房主', token: room.hostToken });
@@ -296,9 +296,12 @@ describe('authorization and capacity', () => {
 
     const second = await openClient(room.actualPort);
     await hello(second, { role: 'guest', name: '客人' });
-    const error = await second.waitForType('error');
-    expect(error.payload.code).toBe('ROOM_FULL');
-    expect(await second.closed).toBe(4003);
+    const welcome = await second.waitForType('welcome');
+    expect(welcome.payload.role).toBe('spectator');
+    expect(welcome.payload.resumeToken).toBeDefined();
+    // 不占执色席位，也不被连接层拒绝。
+    expect(room.getMembers().filter((m) => m.role === 'guest')).toHaveLength(1);
+    expect(second.closeCode()).toBeNull();
   });
 
   it('times out the handshake when no hello arrives', async () => {
@@ -645,10 +648,13 @@ describe('lobby synchronization and start gate', () => {
     const afterFreeze = await pair.host.waitForType('lobby.rejected', (message) => message.payload.code === 'ALREADY_STARTED');
     expect(afterFreeze.payload.code).toBe('ALREADY_STARTED');
 
-    // 新成员替换也被拒绝，保持已冻结身份。
+    // 冻结后身份不可替换：后来者以旁观身份进入，不改动任何已冻结参数。
     const replacement = await openClient(pair.room.actualPort);
     await hello(replacement, { role: 'guest', name: '客人' });
-    expect(await replacement.closed).toBe(4003);
+    const spectatorWelcome = await replacement.waitForType('welcome');
+    expect(spectatorWelcome.payload.role).toBe('spectator');
+    expect(pair.room.getLobby().startParameters).toEqual(frozen);
+    expect(draws).toBe(1);
   });
 
   it('resolves fixed side preferences without any draw', async () => {
@@ -775,11 +781,14 @@ describe('heartbeat and reconnection', () => {
 
     const stranger = await openClient(pair.room.actualPort);
     await hello(stranger, { role: 'guest', name: '陌生人' });
-    expect(await stranger.closed).toBe(4003);
+    // 陌生人拿不到客人席位：自动以旁观身份进入，不打断原客人恢复。
+    const strangerWelcome = await stranger.waitForType('welcome');
+    expect(strangerWelcome.payload.role).toBe('spectator');
 
     const reconnectedGuest = await openClient(pair.room.actualPort);
     await hello(reconnectedGuest, { role: 'guest', name: '客人', resumeToken });
     const reconnectedWelcome = await reconnectedGuest.waitForType('welcome');
+    expect(reconnectedWelcome.payload.role).toBe('guest');
     expect(reconnectedWelcome.payload.memberId).toBe(pair.guestId);
     expect(reconnectedWelcome.payload.lobby.phase).toBe('started');
   });

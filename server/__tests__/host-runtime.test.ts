@@ -216,3 +216,61 @@ describe('room lifecycle through the control api', () => {
     expect(await markerOnControl.json()).toMatchObject({ ok: false, roomPage: false });
   });
 });
+
+describe('public room summary', () => {
+  function joinAs(port: number, roomId: string, role: 'guest' | 'spectator'): Promise<{ socket: WebSocket; welcome: ServerMessage }> {
+    return new Promise((resolve, reject) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      socket.on('error', reject);
+      socket.on('open', () => {
+        socket.send(encodeMessage(buildClientHello({ role, name: role === 'guest' ? '客人' : '旁观', roomId })));
+      });
+      socket.on('message', (data) => {
+        const parsed = parseServerMessage(data.toString());
+        if (parsed.ok && parsed.message.type === 'welcome') {
+          resolve({ socket, welcome: parsed.message });
+        }
+      });
+      setTimeout(() => reject(new Error('join timed out')), 3000);
+    });
+  }
+
+  it('serves a credential-free summary with counts, phase and CORS on the room page', async () => {
+    const { base } = await startRuntime();
+    const created = await postJson(base, '/api/room/create', {});
+    expect(created.ok).toBe(true);
+    const roomBase = `http://127.0.0.1:${created.port}`;
+
+    const guest = await joinAs(created.port, created.roomId, 'guest');
+    const spectator = await joinAs(created.port, created.roomId, 'spectator');
+
+    const response = await fetch(`${roomBase}/api/guest`);
+    expect(response.headers.get('access-control-allow-origin')).toBe('*');
+    const summary = (await response.json()) as Record<string, any>;
+    expect(summary).toMatchObject({
+      ok: true,
+      roomPage: true,
+      roomId: created.roomId,
+      phase: 'lobby',
+      playerCount: 1,
+      spectatorCount: 1,
+    });
+    // 摘要不含任何凭据字段。
+    expect(summary.hostToken).toBeUndefined();
+    expect(summary.resumeToken).toBeUndefined();
+
+    spectator.socket.terminate();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const afterDrop = (await (await fetch(`${roomBase}/api/guest`)).json()) as Record<string, any>;
+    // 掉线旁观者不计入在线旁观数，且不伪造 0 以外的数字。
+    expect(afterDrop.spectatorCount).toBe(0);
+
+    guest.socket.terminate();
+  });
+
+  it('keeps the console-side marker endpoint unchanged and credential-free', async () => {
+    const { base } = await startRuntime();
+    const marker = await getJson(base, '/api/guest');
+    expect(marker).toEqual({ ok: false, roomPage: false });
+  });
+});

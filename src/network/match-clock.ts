@@ -6,7 +6,7 @@
  * - 终局结算与双方用时统计。
  */
 import type { Camp } from '../game/types.js';
-import type { Role } from './protocol.js';
+import type { PlayerRole } from './protocol.js';
 
 export const DISCONNECT_GRACE_MS = 90_000;
 
@@ -37,7 +37,7 @@ export interface PlayerClockState {
 export interface DisconnectGraceState {
   hostDeadlineMs: number | null;
   guestDeadlineMs: number | null;
-  firstDroppedRole: Role | null;
+  firstDroppedRole: PlayerRole | null;
 }
 
 export interface MatchClockSnapshot {
@@ -91,7 +91,7 @@ export class MatchClock {
 
   private hostGraceDeadlineMs: number | null = null;
   private guestGraceDeadlineMs: number | null = null;
-  private firstDroppedRole: Role | null = null;
+  private firstDroppedRole: PlayerRole | null = null;
 
   private settlement: MatchSettlement | null = null;
 
@@ -284,7 +284,7 @@ export class MatchClock {
     return { ok: true };
   }
 
-  public onDrop(role: Role, now: number = this.nowFn()): { settlement: MatchSettlement | null; paused: boolean } {
+  public onDrop(role: PlayerRole, now: number = this.nowFn()): { settlement: MatchSettlement | null; paused: boolean } {
     const advanceResult = this.advance(now);
     if (advanceResult.timeoutResult) {
       return { settlement: advanceResult.timeoutResult, paused: false };
@@ -311,7 +311,7 @@ export class MatchClock {
     return { settlement: null, paused: true };
   }
 
-  public onReconnect(role: Role, now: number = this.nowFn()): { settlement: MatchSettlement | null; resumed: boolean } {
+  public onReconnect(role: PlayerRole, now: number = this.nowFn()): { settlement: MatchSettlement | null; resumed: boolean } {
     const advanceResult = this.advance(now);
     if (advanceResult.timeoutResult) {
       return { settlement: advanceResult.timeoutResult, resumed: false };
@@ -336,7 +336,7 @@ export class MatchClock {
     return { settlement: null, resumed: false };
   }
 
-  private finalizeByRoleTimeout(loserRole: Role, now: number): MatchSettlement {
+  private finalizeByRoleTimeout(loserRole: PlayerRole, now: number): MatchSettlement {
     const loserSide = loserRole === 'host' ? this.hostSide : this.guestSide;
     const winnerSide = loserSide === 'red' ? 'black' : 'red';
     return this.finalize(winnerSide, 'disconnect-timeout', now);

@@ -757,3 +757,115 @@ describe('room lobby', () => {
     expect(screen.getByTestId('member-side-guest')).toHaveTextContent('待开局确定');
   });
 });
+
+describe('spectator mode', () => {
+  it('explains that a full room auto-spectates and offers a dedicated spectate entry', () => {
+    const { createClient } = connectionFactory();
+    render(
+      <JoinRoomScreen
+        createClient={createClient}
+        guestPage={false}
+        initialAddress=""
+        onExit={() => undefined}
+        storage={memoryStorage()}
+      />,
+    );
+
+    expect(screen.getByTestId('join-spectate-hint')).toHaveTextContent('自动以旁观身份进入');
+    expect(screen.getByTestId('join-spectate')).toHaveTextContent('旁观观战');
+  });
+
+  it('connects with the spectator role from the dedicated entry', () => {
+    const { connections, createClient } = connectionFactory();
+    render(
+      <JoinRoomScreen
+        createClient={createClient}
+        guestPage={false}
+        initialAddress="192.168.1.5:8080"
+        onExit={() => undefined}
+        storage={memoryStorage()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('join-spectate'));
+    expect(connections[0].connectCalls[0]).toMatchObject({
+      address: { host: '192.168.1.5', port: 8080 },
+      options: { role: 'spectator' },
+    });
+  });
+
+  it('renders a read-only lobby for spectators with separated member and spectator lists', () => {
+    const { connections, createClient } = connectionFactory();
+    render(
+      <JoinRoomScreen
+        createClient={createClient}
+        guestPage={false}
+        initialAddress="192.168.1.5:8080"
+        onExit={() => undefined}
+        storage={memoryStorage()}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('join-spectate'));
+    act(() => {
+      connections[0].emit({
+        status: 'connected',
+        memberId: 'spec-1',
+        roomId: 'room1234',
+        role: 'spectator',
+        members: [HOST_MEMBER, GUEST_MEMBER, { id: 'spec-1', role: 'spectator', name: '旁观1', connected: true }],
+        lobby: createLobbyState(),
+      });
+    });
+
+    // 旁观者不参与准备与开局，也看不到准备入口。
+    expect(screen.getByTestId('spectator-waiting-note')).toHaveTextContent('旁观中');
+    expect(screen.queryByTestId('lobby-ready-toggle')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('lobby-start')).not.toBeInTheDocument();
+    expect(screen.getByTestId('settings-readonly-note')).toHaveTextContent('旁观模式');
+
+    // 两位玩家与旁观名单分离展示，在线人数可见。
+    expect(screen.getByTestId('member-host')).toBeInTheDocument();
+    expect(screen.getByTestId('member-guest')).toBeInTheDocument();
+    expect(screen.getByTestId('spectator-list')).toBeInTheDocument();
+    expect(screen.getByTestId('spectator-count')).toHaveTextContent('旁观 1 人在线');
+    expect(screen.getAllByTestId('spectator-item')).toHaveLength(1);
+  });
+
+  it('summarizes recent rooms from the public endpoint and never fabricates counts', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: unknown) => ({
+        text: async () =>
+          String(url).includes('192.168.1.5')
+            ? JSON.stringify({ ok: true, roomPage: true, roomId: 'r1', phase: 'started', playerCount: 2, spectatorCount: 1 })
+            : 'not-json',
+      })),
+    );
+    try {
+      const storage = memoryStorage({
+        'flip-xiangqi.recent-rooms': JSON.stringify([
+          { address: '192.168.1.5:8080', savedAt: 1 },
+          { address: '10.0.0.9:8080', savedAt: 2 },
+        ]),
+      });
+      const { createClient } = connectionFactory();
+      render(
+        <JoinRoomScreen
+          createClient={createClient}
+          guestPage={false}
+          initialAddress=""
+          onExit={() => undefined}
+          storage={storage}
+        />,
+      );
+
+      const summaries = await screen.findAllByTestId('recent-room-summary');
+      await waitFor(() => expect(summaries[0]).toHaveTextContent('对局中 · 玩家 2/2 · 旁观 1 人'));
+      // 不可达的房间明确标注人数未知，不伪造 0。
+      expect(summaries[1]).toHaveTextContent('人数未知 · 房间暂不可达');
+      expect(summaries[1]).not.toHaveTextContent('0 人');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});

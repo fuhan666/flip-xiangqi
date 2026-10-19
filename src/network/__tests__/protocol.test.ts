@@ -491,3 +491,51 @@ describe('heartbeat and session resumption envelopes', () => {
   });
 });
 
+
+describe('spectator identity', () => {
+  it('accepts the spectator role in hello, welcome and member snapshots', () => {
+    const hello = parseClientMessage(encodeMessage(buildClientHello({ role: 'spectator', name: '旁观', roomId: 'room-7' })));
+    expect(hello.ok).toBe(true);
+    if (hello.ok && hello.message.type === 'hello') {
+      expect(hello.message.payload.role).toBe('spectator');
+    }
+
+    const welcome = parseServerMessage(
+      JSON.stringify({
+        version: PROTOCOL_VERSION,
+        type: 'welcome',
+        roomId: 'room-7',
+        payload: {
+          roomId: 'room-7',
+          memberId: 'spec-1',
+          role: 'spectator',
+          name: '旁观1',
+          members: [{ id: 'spec-1', role: 'spectator', name: '旁观1', connected: true }],
+          lobby: createLobbyState(),
+        },
+      }),
+    );
+    expect(welcome.ok).toBe(true);
+    if (welcome.ok && welcome.message.type === 'welcome') {
+      expect(welcome.message.payload.role).toBe('spectator');
+      expect(welcome.message.payload.members[0].role).toBe('spectator');
+    }
+  });
+
+  it('rejects unknown roles but keeps the spectator lobby rejection code valid', () => {
+    const badRole = parseClientMessage(
+      JSON.stringify({ version: PROTOCOL_VERSION, type: 'hello', roomId: null, payload: { role: 'admin', name: 'x' } }),
+    );
+    expect(badRole.ok).toBe(false);
+
+    const rejection = parseServerMessage(
+      JSON.stringify({
+        version: PROTOCOL_VERSION,
+        type: 'lobby.rejected',
+        roomId: 'room-7',
+        payload: { code: 'SPECTATOR_READONLY', message: '旁观者不可执行大厅操作' },
+      }),
+    );
+    expect(rejection.ok).toBe(true);
+  });
+});

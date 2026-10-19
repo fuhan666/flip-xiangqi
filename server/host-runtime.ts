@@ -252,6 +252,24 @@ export class HostRuntime {
     };
   }
 
+  /**
+   * 房间公开摘要（无凭据）：房间号、阶段、执色玩家数与在线旁观数。
+   * 玩家数按被占用的执色席位统计；旁观数只计当前在线成员。
+   */
+  private buildRoomSummary(): Record<string, unknown> | null {
+    const room = this.room && !this.room.server.isClosed ? this.room : null;
+    if (!room) {
+      return null;
+    }
+    const members = room.server.getMembers();
+    return {
+      roomId: room.roomId,
+      phase: room.server.getLobbyPhase(),
+      playerCount: members.filter((member) => member.role !== 'spectator').length,
+      spectatorCount: members.filter((member) => member.role === 'spectator' && member.connected).length,
+    };
+  }
+
   private async handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const pathname = new URL(request.url ?? '/', 'http://control.local').pathname;
 
@@ -329,8 +347,20 @@ export class HostRuntime {
   private async handleRoomPageRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const pathname = new URL(request.url ?? '/', 'http://room.local').pathname;
     if (pathname === '/api/guest') {
-      // 房间页面标记：公开且不含任何凭据，供页面识别「我正打开房主分享的地址」。
-      this.sendJson(response, 200, { ok: true, roomPage: true });
+      // 房间页面标记 + 无凭据人数摘要：公开只读 GET，仅供页面识别与最近房间展示。
+      // 跨源读取只在该端点开放 CORS；控制接口保持本机隔离，不做任何控制面放行。
+      const corsHeaders = {
+        'access-control-allow-origin': '*',
+        'access-control-allow-methods': 'GET, OPTIONS',
+        'access-control-allow-headers': 'accept',
+      };
+      if (request.method === 'OPTIONS') {
+        response.writeHead(204, corsHeaders);
+        response.end();
+        return;
+      }
+      const summary = this.buildRoomSummary();
+      this.sendJson(response, 200, { ok: true, roomPage: true, ...(summary ?? {}) }, corsHeaders);
       return;
     }
     if (pathname === '/api/room/status' && request.method === 'GET') {
@@ -348,11 +378,12 @@ export class HostRuntime {
     });
   }
 
-  private sendJson(response: ServerResponse, status: number, body: ApiResponse): void {
+  private sendJson(response: ServerResponse, status: number, body: ApiResponse, extraHeaders?: Record<string, string>): void {
     const text = JSON.stringify(body);
     response.writeHead(status, {
       'content-type': 'application/json; charset=utf-8',
       'cache-control': 'no-store',
+      ...(extraHeaders ?? {}),
     });
     response.end(text);
   }

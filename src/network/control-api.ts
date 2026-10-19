@@ -29,6 +29,62 @@ export interface RoomStatus {
 
 export type ApiResult<T> = { ok: true; value: T } | { ok: false; code: string; message: string };
 
+/** 「最近房间」只读摘要：来自房间页面公开的 /api/guest，不含任何凭据。 */
+export interface RoomSummary {
+  roomId: string;
+  phase: 'lobby' | 'started';
+  playerCount: number;
+  spectatorCount: number;
+}
+
+export type RoomSummaryResult = { ok: true; value: RoomSummary } | { ok: false };
+
+/** 读取房间公开摘要（跨源只读 GET）；不可达或字段缺失时 ok:false，绝不伪造人数。 */
+export async function fetchRoomSummary(address: string, timeoutMs = 2_500): Promise<RoomSummaryResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`http://${address}/api/guest`, { signal: controller.signal });
+    const text = await response.text();
+    let payload: Record<string, unknown> | null = null;
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        payload = parsed as Record<string, unknown>;
+      }
+    } catch {
+      payload = null;
+    }
+    if (
+      !payload ||
+      payload.ok !== true ||
+      typeof payload.roomId !== 'string' ||
+      (payload.phase !== 'lobby' && payload.phase !== 'started') ||
+      typeof payload.playerCount !== 'number' ||
+      typeof payload.spectatorCount !== 'number' ||
+      !Number.isInteger(payload.playerCount) ||
+      !Number.isInteger(payload.spectatorCount) ||
+      payload.playerCount < 0 ||
+      payload.spectatorCount < 0
+    ) {
+      return { ok: false };
+    }
+    return {
+      ok: true,
+      value: {
+        roomId: payload.roomId,
+        phase: payload.phase,
+        playerCount: payload.playerCount,
+        spectatorCount: payload.spectatorCount,
+      },
+    };
+  } catch {
+    return { ok: false };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export interface RoomControlApi {
   /** 宿主不可用（无控制接口）时返回 null。 */
   status(): Promise<RoomStatus | null>;
