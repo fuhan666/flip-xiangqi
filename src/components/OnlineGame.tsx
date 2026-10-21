@@ -20,7 +20,7 @@ import { AudioControls } from './AudioControls.js';
 import { useOnlineGameAudio } from './useGameAudio.js';
 import { PhraseBubble } from './PhraseBubble.js';
 import { QuickPhrasePanel } from './QuickPhrasePanel.js';
-import { OnlineRecordPanel } from './OnlineRecordPanel.js';
+import { OnlineRecordLibrary, OnlineRecordPanel } from './OnlineRecordPanel.js';
 import type { QuickPhraseId } from '../network/quick-chat.js';
 
 interface GameResultSummary {
@@ -81,7 +81,6 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
   const [, setGraceTick] = useState(0);
   const [showResignConfirm, setShowResignConfirm] = useState(false);
   const [currentTime, setCurrentTime] = useState(() => Date.now());
-  const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -605,35 +604,13 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
             <h2>旁观者</h2>
             <SpectatorList members={connection.members} selfId={connection.memberId} />
           </section>
-          {connection.records.length > 0 ? (
-            <section className="room-panel online-record-panel" data-testid="online-record-list">
-              <h2>本房终局棋谱</h2>
-              <p className="room-hint">服务器保留 30 分钟；过期或服务器重启后不可再取回。</p>
-              <ul className="record-actions">
-                {connection.records.map((item) => (
-                  <li key={item.matchId}>
-                    <button
-                      className="panel-action-secondary"
-                      data-testid={`online-record-entry-${item.matchId}`}
-                      onClick={() => setSelectedRecordId(item.matchId)}
-                      type="button"
-                    >
-                      {new Date(item.endedAt).toLocaleTimeString()} 结束的对局
-                    </button>
-                  </li>
-                ))}
-              </ul>
-              {selectedRecordId ? (
-                <OnlineRecordPanel
-                  client={client}
-                  matchId={selectedRecordId}
-                  perspective={mySide}
-                  recordError={connection.recordError}
-                  recordResult={connection.recordResult}
-                />
-              ) : null}
-            </section>
-          ) : null}
+          <OnlineRecordLibrary
+            client={client}
+            perspective={mySide}
+            recordError={connection.recordError}
+            recordResult={connection.recordResult}
+            records={connection.records}
+          />
           <MoveHistory recentAction={displayState.recentAction} />
           <StatusPanel
             currentGameSummary={buildGameResultSummary(displayState)}
