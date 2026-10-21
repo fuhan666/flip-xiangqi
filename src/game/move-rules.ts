@@ -46,12 +46,13 @@ function validateBasicMove(state: RuleState, piece: Piece, to: Position): MoveVa
   }
 
   const target = getPieceAt(state, to);
-  if (target?.camp === piece.camp) {
-    return { ok: false, reason: '不能吃己方棋子' };
-  }
-
+  // 先判断暗子占位：暗子的阵营属于服务端内部信息，不能通过拒绝文案区分。
   if (target && !target.revealed) {
     return { ok: false, reason: '暗子不能被直接吃掉' };
+  }
+
+  if (target?.camp === piece.camp) {
+    return { ok: false, reason: '不能吃己方棋子' };
   }
 
   const dx = to.x - piece.position.x;

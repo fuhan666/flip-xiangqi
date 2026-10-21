@@ -2,7 +2,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RoomClient, type WebSocketLike } from '../client';
 import { buildStartParameters, createLobbyState } from '../lobby';
-import { createMatch, snapshotMatch } from '../match';
+import { createMatch } from '../match';
+import { publicSnapshotOf } from './helpers/public-fixtures';
 import { buildServerMessage } from '../protocol';
 import { computeReconnectDelay } from '../heartbeat';
 
@@ -41,17 +42,30 @@ function fixture() {
     roomId: 'room', host: { memberId: 'host', name: '红方' }, guest: { memberId: 'guest', name: '黑方' },
     settings: { sidePreference: 'host-red', timeControlId: 'standard', locked: true, settingsVersion: 1 }, hostSide: 'red',
   });
-  const snap = snapshotMatch(createMatch({ matchId: 'match', seed: 42, startParameters }));
+  const snap = publicSnapshotOf(createMatch({ matchId: 'match', seed: 42, startParameters }));
   client.connect({ host: '127.0.0.1', port: 12345 }, { role: 'host', name: '红方', token: 'test' });
   const socket = sockets[0];
   socket.readyState = 1; socket.onopen?.({});
   socket.deliver({ type: 'welcome', roomId: 'room', payload: {
     roomId: 'room', memberId: 'host', role: 'host', name: '红方', members: [], lobby: createLobbyState(), game: snap,
   } });
-  const state = (revision = snap.revision) => ({ type: 'game.state' as const, roomId: 'room', payload: { ...snap, state: snap.gameState, revision } });
-  const clock = (revision: number, sampleSeq: number) => ({ type: 'game.clock' as const, roomId: 'room', payload: {
-    matchId: snap.matchId, revision, sampleSeq, clock: { ...snap.clock!, sampleSeq },
-  } });
+  const state = (revision = snap.revision) => ({
+    type: 'game.state' as const,
+    roomId: 'room',
+    payload: {
+      matchId: snap.matchId,
+      stepNumber: snap.stepNumber,
+      revision,
+      state: snap.gameState,
+      startParameters: snap.startParameters,
+      ...(snap.clock ? { clock: snap.clock } : {}),
+    },
+  });
+  const clock = (revision: number, sampleSeq: number) => ({
+    type: 'game.clock' as const,
+    roomId: 'room',
+    payload: { matchId: snap.matchId, revision, sampleSeq, clock: { ...snap.clock!, sampleSeq } },
+  });
   const pong = () => {
     const ping = socket.sent.filter(m => m.type === 'ping').at(-1);
     if (ping) socket.deliver({ type: 'pong', roomId: 'room', payload: { seq: ping.payload.seq } });
@@ -84,7 +98,7 @@ describe('bounded weak-network recovery', () => {
     const sync = f.socket.sent.at(-1)!;
     f.socket.deliver({ ...f.state(), requestId: sync.requestId });
     expect(f.client.getState().game!.pendingAction).toBeNull();
-    expect(f.client.getState().game!.displayState).toEqual(f.snap.gameState);
+    expect(f.client.getState().game!.gameState).toEqual(f.snap.gameState);
     expect(f.client.getState().game!.lastAcceptedAction).toBeNull();
   });
 
@@ -135,12 +149,12 @@ describe('bounded weak-network recovery', () => {
 
   it('protocol 6 clocks with the same transition sequence still advance by server time', () => {
     const f = fixture();
-    const packet = f.clock(f.snap.revision, f.snap.clock.sampleSeq);
+    const packet = f.clock(f.snap.revision, f.snap.clock!.sampleSeq);
     packet.payload.clock.serverTime += 1000;
     packet.payload.clock.red.baseTimeRemainingMs! -= 1000;
     f.socket.deliver(packet);
     expect(f.client.getState().game!.clock!.red.baseTimeRemainingMs).toBe(packet.payload.clock.red.baseTimeRemainingMs);
-    f.socket.deliver(f.clock(f.snap.revision, f.snap.clock.sampleSeq));
+    f.socket.deliver(f.clock(f.snap.revision, f.snap.clock!.sampleSeq));
     f.socket.deliver(f.state());
     expect(f.client.getState().game!.clock!.serverTime).toBe(packet.payload.clock.serverTime);
   });
@@ -151,7 +165,7 @@ describe('bounded weak-network recovery', () => {
     f.socket.deliver({ type: 'game.rejected', roomId: 'room', requestId: 'old', payload: {
       matchId: 'match', stepNumber: 0, state: { ...f.snap.gameState, currentTurn: 'black' }, reason: 'stale',
     } });
-    expect(f.client.getState().game!.displayState.currentTurn).toBe('red');
+    expect(f.client.getState().game!.gameState.currentTurn).toBe('red');
   });
 
   it('recovers a lost terminal broadcast even when no further board or clock updates arrive', () => {

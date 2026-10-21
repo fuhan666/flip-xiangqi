@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { Camp, GameState, PieceType, Position } from '../game/types.js';
+import type { Camp, GameViewState, PieceView, PieceType, Position } from '../game/types.js';
 import type { AcceptedGameAction } from '../network/client.js';
 import {
   CAPTURE_GHOST_LIFETIME_MS,
@@ -14,7 +14,7 @@ import {
 } from './useBoardFeedback.js';
 
 export interface OnlineBoardFeedback {
-  displayState: GameState;
+  displayState: GameViewState;
   flip: FlipFeedback | null;
   trace: TraceFeedback | null;
   captureGhost: CaptureGhostFeedback | null;
@@ -23,7 +23,7 @@ export interface OnlineBoardFeedback {
 
 interface OnlineFeedbackEvent {
   seq: number;
-  preState: GameState | null;
+  preState: GameViewState | null;
   flip: FlipFeedback | null;
   trace: TraceFeedback | null;
   captureGhost: CaptureGhostFeedback | null;
@@ -50,12 +50,16 @@ function positionKey(position: Position): string {
   return `${position.x}-${position.y}`;
 }
 
-function createUnrevealedPreState(state: GameState, position: Position): GameState {
+/**
+ * 翻牌动画的「翻前帧」：只保留未知暗子（位置 + 不透明标识），
+ * 不把已知阵营/棋种藏在 DOM、CSS 或动画状态里。
+ */
+function createUnrevealedPreState(state: GameViewState, position: Position): GameViewState {
   return {
     ...state,
-    pieces: state.pieces.map((piece) => {
+    pieces: state.pieces.map((piece): PieceView => {
       if (piece.position && piece.position.x === position.x && piece.position.y === position.y) {
-        return { ...piece, revealed: false };
+        return { id: piece.id, position: { ...piece.position }, revealed: false };
       }
       return piece;
     }),
@@ -70,7 +74,7 @@ function createUnrevealedPreState(state: GameState, position: Position): GameSta
  * - 遵循 prefers-reduced-motion。
  */
 export function useOnlineBoardFeedback(
-  gameState: GameState,
+  gameState: GameViewState,
   lastAcceptedAction: AcceptedGameAction | null,
 ): OnlineBoardFeedback {
   const [event, setEvent] = useState<OnlineFeedbackEvent>(IDLE_EVENT);
@@ -98,8 +102,9 @@ export function useOnlineBoardFeedback(
   }, [reducedMotion]);
 
   useEffect(() => {
-    // 1. 无动作（开局初始化/全量恢复/拒绝回滚）-> 重置事件，清理动画，允许重试重新播放
-    if (!lastAcceptedAction) {
+    // 1. 无动作或尚未获得权威确认（开局初始化/全量恢复/拒绝回滚）
+    //    -> 重置事件，清理动画：未确认的动作绝不提前揭示棋子身份。
+    if (!lastAcceptedAction || !lastAcceptedAction.confirmed) {
       setEvent(IDLE_EVENT);
       lastAnimatedEventIdRef.current = null;
       return;
@@ -200,7 +205,7 @@ export function useOnlineBoardFeedback(
   const revealPending = event.flip !== null && event.flip.phase === 'back' && event.preState !== null;
 
   return {
-    displayState: revealPending ? (event.preState as GameState) : gameState,
+    displayState: revealPending && event.preState ? event.preState : gameState,
     flip: event.flip,
     trace: event.trace,
     captureGhost: event.captureGhost,

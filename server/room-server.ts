@@ -30,6 +30,7 @@ import {
 } from '../src/network/protocol.js';
 import type { LobbyState } from '../src/network/lobby.js';
 import type { MatchSnapshot } from '../src/network/match.js';
+import type { PublicMatchSnapshot } from '../src/network/public-game.js';
 import { asConnectionId, generateId, type ConnectionId } from './room-identity.js';
 import { defaultLogger, type Logger } from './log.js';
 import { RoomSession, type SessionConnection } from './room-session.js';
@@ -211,6 +212,11 @@ export class RoomServer {
   /** 当前权威对局快照（委托共享会话，无对局时为 null）。 */
   getMatch(): MatchSnapshot | null {
     return this.session.getMatch();
+  }
+
+  /** 与下发给客户端的形状一致的公开对局快照。 */
+  getPublicMatch(): PublicMatchSnapshot | null {
+    return this.session.getPublicMatch();
   }
 
   isHostConnected(): boolean {

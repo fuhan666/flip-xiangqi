@@ -1,5 +1,5 @@
-import { BOARD_HEIGHT, BOARD_WIDTH, PIECE_SYMBOLS, getPieceAt } from '../game';
-import type { Camp, GameState, Piece, Position } from '../game';
+import { BOARD_HEIGHT, BOARD_WIDTH, PIECE_SYMBOLS, getPieceViewAt } from '../game';
+import type { Camp, GameViewState, PieceView, Position } from '../game';
 import { displayToLogical, logicalToDisplay } from './board-perspective';
 import type { Perspective } from './board-perspective';
 import { BoardArtwork } from './BoardArtwork';
@@ -14,7 +14,7 @@ import type {
 } from './useBoardFeedback';
 
 export interface BoardProps {
-  gameState: GameState;
+  gameState: GameViewState;
   selectedPosition: Position | null;
   onCellClick: (position: Position) => void;
   captureGhost?: CaptureGhostFeedback | null;
@@ -59,7 +59,7 @@ interface RecentActionMarkers {
   targetMarker: RecentAction;
 }
 
-function currentTurnLabel(gameState: GameState): string {
+function currentTurnLabel(gameState: GameViewState): string {
   if (gameState.winner) {
     return '终局已定';
   }
@@ -71,7 +71,7 @@ function positionKey(position: Position): string {
   return `${position.x}-${position.y}`;
 }
 
-function getCellState(piece: Piece | undefined): CellState {
+function getCellState(piece: PieceView | undefined): CellState {
   if (!piece) {
     return 'empty';
   }
@@ -79,7 +79,7 @@ function getCellState(piece: Piece | undefined): CellState {
   return piece.revealed ? 'revealed' : 'hidden';
 }
 
-function getTurnState(piece: Piece | undefined, currentTurn: Camp): TurnState {
+function getTurnState(piece: PieceView | undefined, currentTurn: Camp): TurnState {
   if (!piece || !piece.revealed) {
     return 'neutral';
   }
@@ -87,7 +87,7 @@ function getTurnState(piece: Piece | undefined, currentTurn: Camp): TurnState {
   return piece.camp === currentTurn ? 'active' : 'opponent';
 }
 
-function getRecentActionMarkers(gameState: GameState): RecentActionMarkers {
+function getRecentActionMarkers(gameState: GameViewState): RecentActionMarkers {
   const recentAction = gameState.recentAction;
 
   if (!recentAction) {
@@ -115,7 +115,7 @@ function getRecentActionMarkers(gameState: GameState): RecentActionMarkers {
   };
 }
 
-function findLastMove(gameState: GameState): LastMoveMarker | null {
+function findLastMove(gameState: GameViewState): LastMoveMarker | null {
   for (let index = gameState.actionHistory.length - 1; index >= 0; index -= 1) {
     const entry = gameState.actionHistory[index];
     if (entry.action.type === 'move') {
@@ -132,7 +132,7 @@ function intersectionPoint(position: Position, perspective: Perspective = 'red')
 }
 
 function buildBoardCells(
-  gameState: GameState,
+  gameState: GameViewState,
   selectedPosition: Position | null,
   legalMoves: ReadonlyMap<string, LegalMoveHint> | undefined,
   flip: FlipFeedback | null | undefined,
@@ -145,7 +145,7 @@ function buildBoardCells(
     for (let dx = 0; dx < BOARD_WIDTH; dx += 1) {
       const position = displayToLogical({ x: dx, y: dy }, perspective);
       const key = positionKey(position);
-      const piece = getPieceAt(gameState, position);
+      const piece = getPieceViewAt(gameState.pieces, position);
       const cellState = getCellState(piece);
       let recentAction: RecentAction = 'none';
 
@@ -163,8 +163,12 @@ function buildBoardCells(
         isSelected: position.x === selectedPosition?.x && position.y === selectedPosition?.y,
         key,
         legalMove: legalMoves?.get(key) ?? 'none',
-        pieceCamp: piece?.revealed ? piece.camp : null,
-        pieceLabel: piece ? (piece.revealed ? PIECE_SYMBOLS[piece.camp][piece.type] : '暗') : '',
+        pieceCamp: piece?.revealed && piece.camp ? piece.camp : null,
+        pieceLabel: piece
+          ? piece.revealed && piece.camp && piece.type
+            ? PIECE_SYMBOLS[piece.camp][piece.type]
+            : '暗'
+          : '',
         position,
         recentAction,
         testId: `cell-${position.x}-${position.y}`,

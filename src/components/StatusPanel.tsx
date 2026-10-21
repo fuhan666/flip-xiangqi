@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { PIECE_SYMBOLS } from '../game';
-import type { Camp, GameHistoryConsequence, GameHistoryEntry, HistoryPieceSnapshot, Position, GameState } from '../game';
+import type { Camp, GameHistoryConsequence, GameHistoryEntry, HistoryPieceSnapshot, Position, GameViewState } from '../game';
 
 interface GameResultSummary {
   archiveLabel: string;
@@ -12,7 +12,7 @@ interface GameResultSummary {
 interface StatusPanelProps {
   recordControls?: ReactNode;
   currentGameSummary: GameResultSummary | null;
-  gameState: GameState;
+  gameState: GameViewState;
   interactionMessage: string | null;
   recentCompletedGames: GameResultSummary[];
 }
@@ -50,7 +50,7 @@ function findConsequence<TType extends GameHistoryConsequence['type']>(
   > | undefined) ?? null;
 }
 
-function buildLiveFeedback(gameState: GameState): LiveFeedbackSummary {
+function buildLiveFeedback(gameState: GameViewState): LiveFeedbackSummary {
   const recentAction = gameState.recentAction;
 
   if (!recentAction) {

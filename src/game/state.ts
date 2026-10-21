@@ -8,6 +8,7 @@ import type {
   GameStateSnapshot,
   HistoryPieceSnapshot,
   Piece,
+  PieceView,
   Position,
   RuleState,
   UndoEntry,
@@ -168,6 +169,11 @@ export function positionsEqual(left: Position, right: Position): boolean {
 
 export function getPieceAt(state: RuleState, position: Position): Piece | undefined {
   return state.pieces.find((piece) => !piece.captured && piece.position && positionsEqual(piece.position, position));
+}
+
+/** 展示视图下的同位置棋子查找（公开棋子与本地完整棋子通用）。 */
+export function getPieceViewAt(pieces: readonly PieceView[], position: Position): PieceView | undefined {
+  return pieces.find((piece) => !piece.captured && piece.position && positionsEqual(piece.position, position));
 }
 
 export function findKing(state: RuleState, camp: Camp): Piece | undefined {

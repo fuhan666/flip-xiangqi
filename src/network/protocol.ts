@@ -16,21 +16,23 @@ import {
   type TimeControlId,
 } from './lobby.js';
 import {
-  parseGameStateSnapshot,
-  parseOpeningSnapshot,
   parseMatchAction,
   parseMatchClockSnapshot,
   parseMatchSettlement,
-  parseMatchSnapshot,
   type MatchAction,
   type MatchClockSnapshot,
   type MatchSettlement,
-  type MatchSnapshot,
 } from './match.js';
-import type { GameStateSnapshot } from '../game/index.js';
+import {
+  parsePublicGameState,
+  parsePublicMatchSnapshot,
+  type PublicGameState,
+  type PublicMatchSnapshot,
+} from './public-game.js';
 
 // 线格式使用的领域类型从协议入口统一再导出，调用方无需两个导入源。
 export type { LobbyRejectCode, LobbyState, SidePreference, StartParameters, TimeControlId } from './lobby.js';
+export type { PublicGameState, PublicMatchSnapshot, PublicPiece } from './public-game.js';
 export type { EndgameReason, MatchAction, MatchClockSnapshot, MatchEvent, MatchSettlement, MatchSnapshot } from './match.js';
 export type { NegotiationEvent, NegotiationEventType, NegotiationType, PendingNegotiation } from './negotiation.js';
 export type {
@@ -69,8 +71,12 @@ import {
 } from './quick-chat.js';
 import { parseMatchEvents, type MatchEvent } from './match.js';
 
-/** v6：增加只读旁观身份（spectator）与旁观者同步/恢复。 */
-export const PROTOCOL_VERSION = 7;
+/**
+ * v8：棋局信封只承载公开投影。
+ * 客户端不再收到 seed、完整开局帧或未翻棋子的阵营/棋种，
+ * 所有发包路径（welcome / game.state / game.rejected）共用同一形状。
+ */
+export const PROTOCOL_VERSION = 8;
 
 /** WebSocket 握手路径（房间服务同时在该路径上提供客人页面）。 */
 export const WS_PATH = '/ws';
@@ -232,7 +238,7 @@ export type ServerMessage =
         members: MemberSnapshot[];
         lobby: LobbyState;
         resumeToken?: string;
-        game?: MatchSnapshot;
+        game?: PublicMatchSnapshot;
       };
     })
   | (Envelope & { type: 'members'; roomId: string; payload: { members: MemberSnapshot[] } })
@@ -259,13 +265,9 @@ export type ServerMessage =
       roomId: string;
       payload: {
         matchId: string;
-        seed: number;
         stepNumber: number;
-        revision?: number;
-        initial: GameStateSnapshot;
-        state: GameStateSnapshot;
-        actorMemberId?: string;
-        action?: MatchAction;
+        revision: number;
+        state: PublicGameState;
         startParameters?: StartParameters;
         clock?: MatchClockSnapshot;
         settlement?: MatchSettlement | null;
@@ -274,6 +276,8 @@ export type ServerMessage =
         phraseCooldownUntil?: Record<string, number>;
         negotiationEvent?: NegotiationEvent | null;
         matchEvents?: MatchEvent[];
+        actorMemberId?: string;
+        action?: MatchAction;
       };
     })
   | (Envelope & {
@@ -283,7 +287,7 @@ export type ServerMessage =
         matchId: string;
         stepNumber: number;
         reason: string;
-        state: GameStateSnapshot;
+        state: PublicGameState;
       };
     })
   | (Envelope & {
@@ -729,7 +733,7 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     if (!members || !lobby) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'welcome-members' };
     }
-    const game = payload.game !== undefined ? parseMatchSnapshot(payload.game) : undefined;
+    const game = payload.game !== undefined ? parsePublicMatchSnapshot(payload.game) : undefined;
     if (payload.game !== undefined && !game) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'welcome-game' };
     }
@@ -864,29 +868,20 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-match-id' };
     }
     if (
-      typeof payload.seed !== 'number' ||
-      !Number.isInteger(payload.seed) ||
-      payload.seed < 0 ||
-      payload.seed > 0xffffffff
-    ) {
-      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-seed' };
-    }
-    if (
       typeof payload.stepNumber !== 'number' ||
       !Number.isSafeInteger(payload.stepNumber) ||
       payload.stepNumber < 0
     ) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-step-number' };
     }
-    const revision =
-      typeof payload.revision === 'number' && Number.isSafeInteger(payload.revision) && payload.revision >= 0
-        ? payload.revision
-        : 0;
-    const initial = parseOpeningSnapshot(payload.initial);
-    if (!initial) {
-      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-initial' };
+    if (
+      typeof payload.revision !== 'number' ||
+      !Number.isSafeInteger(payload.revision) ||
+      payload.revision < 0
+    ) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-revision' };
     }
-    const state = parseGameStateSnapshot(payload.state);
+    const state = parsePublicGameState(payload.state);
     if (!state) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-state' };
     }
@@ -932,10 +927,8 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
         roomId: message.roomId,
         payload: {
           matchId: payload.matchId,
-          seed: payload.seed,
           stepNumber: payload.stepNumber,
-          revision,
-          initial,
+          revision: payload.revision,
           state,
           ...(actorMemberId ? { actorMemberId } : {}),
           ...(action ? { action } : {}),
@@ -971,7 +964,7 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     if (typeof payload.reason !== 'string') {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-rejected-reason' };
     }
-    const state = parseGameStateSnapshot(payload.state);
+    const state = parsePublicGameState(payload.state);
     if (!state) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-rejected-state' };
     }

@@ -357,25 +357,15 @@ describe('heartbeat and session resumption envelopes', () => {
       expect(parsedSync.message.payload.matchId).toBe('match-1');
     }
 
-    // game.state
+    // game.state：只承载公开局面（无 seed / 完整开局帧）
     const serverState = buildServerMessage({
       type: 'game.state',
       roomId: 'room-1',
       requestId: 'req-1',
       payload: {
         matchId: 'match-1',
-        seed: 12345,
         stepNumber: 1,
-        initial: {
-          currentTurn: 'red',
-          winner: null,
-          checkedCamp: null,
-          lastError: null,
-          statusMessage: '红方先行',
-          pieces: [],
-          actionHistory: [],
-          recentAction: null,
-        },
+        revision: 3,
         state: {
           currentTurn: 'black',
           winner: null,
@@ -385,6 +375,7 @@ describe('heartbeat and session resumption envelopes', () => {
           pieces: [],
           actionHistory: [],
           recentAction: null,
+          legalMoves: [],
         },
         actorMemberId: 'host-1',
         action: { type: 'flip', position: { x: 4, y: 2 } },
@@ -395,17 +386,40 @@ describe('heartbeat and session resumption envelopes', () => {
     if (parsedState.ok && parsedState.message.type === 'game.state') {
       expect(parsedState.message.payload.matchId).toBe('match-1');
       expect(parsedState.message.payload.stepNumber).toBe(1);
+      expect(parsedState.message.payload.revision).toBe(3);
       expect(parsedState.message.payload.actorMemberId).toBe('host-1');
     }
 
-    // game.state 缺少开局帧时直接拒绝，不从 seed/当前盘面重建。
-    const missingInitial = JSON.parse(serverState) as { payload: Record<string, unknown> };
-    delete missingInitial.payload.initial;
-    expect(parseServerMessage(JSON.stringify(missingInitial))).toMatchObject({
+    // revision 必填：不再按旧格式推算。
+    const missingRevision = JSON.parse(serverState) as { payload: Record<string, unknown> };
+    delete missingRevision.payload.revision;
+    expect(parseServerMessage(JSON.stringify(missingRevision))).toMatchObject({
       ok: false,
       code: 'INVALID_MESSAGE',
-      detail: 'game-state-initial',
+      detail: 'game-state-revision',
     });
+
+    // 暗子不得携带阵营/棋种（保密字段一旦出现即视为非法消息）。
+    const leakedHiddenPiece = JSON.parse(serverState) as { payload: { state: Record<string, unknown> } };
+    leakedHiddenPiece.payload.state.pieces = [
+      { id: 'p1', position: { x: 0, y: 0 }, revealed: false, camp: 'red', type: 'rook', captured: false },
+    ];
+    expect(parseServerMessage(JSON.stringify(leakedHiddenPiece))).toMatchObject({
+      ok: false,
+      code: 'INVALID_MESSAGE',
+      detail: 'game-state-state',
+    });
+
+    // 旧协议的 seed/initial 字段不再被接受为棋局数据来源。
+    const legacySnapshot = JSON.parse(serverState) as { payload: Record<string, unknown> };
+    legacySnapshot.payload.seed = 12345;
+    legacySnapshot.payload.initial = { pieces: [] };
+    const parsedLegacy = parseServerMessage(JSON.stringify(legacySnapshot));
+    expect(parsedLegacy.ok).toBe(true);
+    if (parsedLegacy.ok && parsedLegacy.message.type === 'game.state') {
+      expect(parsedLegacy.message.payload).not.toHaveProperty('seed');
+      expect(parsedLegacy.message.payload).not.toHaveProperty('initial');
+    }
 
     // game.rejected
     const serverRejected = buildServerMessage({
@@ -425,6 +439,7 @@ describe('heartbeat and session resumption envelopes', () => {
           pieces: [],
           actionHistory: [],
           recentAction: null,
+          legalMoves: [],
         },
       },
     });
@@ -480,19 +495,8 @@ describe('heartbeat and session resumption envelopes', () => {
       roomId: 'room-1',
       payload: {
         matchId: 'match-1',
-        seed: 1234,
         stepNumber: 3,
         revision: 5,
-        initial: {
-          currentTurn: 'red',
-          winner: null,
-          checkedCamp: null,
-          lastError: null,
-          statusMessage: '红方先行',
-          pieces: [],
-          actionHistory: [],
-          recentAction: null,
-        },
         state: {
           currentTurn: 'red',
           winner: 'black',
@@ -502,6 +506,7 @@ describe('heartbeat and session resumption envelopes', () => {
           pieces: [],
           actionHistory: [],
           recentAction: null,
+          legalMoves: [],
         },
         clock: clockSnap,
         settlement: {

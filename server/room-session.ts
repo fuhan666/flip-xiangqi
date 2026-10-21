@@ -37,8 +37,12 @@ import {
   type NegotiationEventType,
   type PendingNegotiation,
 } from '../src/network/negotiation.js';
-import { createEmptyGameState } from '../src/game/index.js';
-import type { GameStateSnapshot } from '../src/game/index.js';
+import {
+  createEmptyPublicGameState,
+  type PublicGameState,
+  type PublicMatchSnapshot,
+} from '../src/network/public-game.js';
+import { projectGameState, projectMatchSnapshot } from './public-view.js';
 import {
   buildServerChatPhrase,
   buildServerChatPhraseRejected,
@@ -285,7 +289,7 @@ export class RoomSession {
             members: this.getMembers(),
             lobby: this.getLobby(),
             ...(resumeToken ? { resumeToken } : {}),
-            ...(this.match ? { game: snapshotMatch(this.match, this.now()) } : {}),
+            ...(this.match ? { game: projectMatchSnapshot(this.match, this.now()) } : {}),
           },
         }),
       );
@@ -422,9 +426,17 @@ export class RoomSession {
     return snapshotLobbyState(this.lobby);
   }
 
-  /** 当前权威对局快照（无对局时为 null）。 */
+  /**
+   * 当前权威对局快照（无对局时为 null）。
+   * 仅供服务端内部与测试观测，含完整棋局，禁止直接封包下发。
+   */
   getMatch(): MatchSnapshot | null {
     return this.match ? snapshotMatch(this.match) : null;
+  }
+
+  /** 当前公开对局快照（与下发给客户端的形状一致，供测试与只读观测使用）。 */
+  getPublicMatch(): PublicMatchSnapshot | null {
+    return this.match ? projectMatchSnapshot(this.match, this.now()) : null;
   }
 
   isHostConnected(): boolean {
@@ -496,13 +508,16 @@ export class RoomSession {
     };
   }
 
-  /** 投递给本会话获准的当前连接（握手完成且未被替换）。 */
+  /**
+   * 投递给本会话获准的当前连接：必须已完成握手、已落在本房间成员席位上，
+   * 且席位当前绑定的就是这条连接（未握手、其他房间与已被替换的旧连接都收不到）。
+   */
   private broadcast(text: string, exclude?: ConnectionId): void {
     for (const record of this.connections.values()) {
       if (exclude && record.connection.connectionId === exclude) {
         continue;
       }
-      if (!record.member || record.member.connectionId !== record.connection.connectionId) {
+      if (!record.helloDone || !record.member || record.member.connectionId !== record.connection.connectionId) {
         continue;
       }
       record.connection.send(text);
@@ -655,13 +670,14 @@ export class RoomSession {
       return;
     }
 
-    const snap = snapshotMatch(this.match, this.now());
+    // 时钟广播只需要公开时钟，不为此构造整份对局快照。
+    const clock = this.match.clock.getSnapshot(this.now());
     const text = buildServerMessage(
       buildServerGameClock(this.roomId, {
         matchId: this.match.matchId,
         revision: this.match.revision,
-        sampleSeq: snap.clock.sampleSeq,
-        clock: snap.clock,
+        sampleSeq: clock.sampleSeq,
+        clock,
       }),
     );
     this.broadcast(text);
@@ -750,6 +766,8 @@ export class RoomSession {
           seed,
           startParameters: result.state.startParameters!,
           nowFn: this.now,
+          // 公开棋子 ID 使用与本局布局种子无关的安全随机源。
+          publicIdFactory: () => this.randomToken(),
         });
         this.logger('game.started', { room: this.roomId, matchId, seed });
         this.startClockBroadcast();
@@ -1133,7 +1151,7 @@ export class RoomSession {
         message.payload.matchId,
         0,
         '对局尚未开始',
-        this.match ? snapshotMatch(this.match, this.now()).gameState : createEmptyGameState(),
+        this.match ? projectGameState(this.match) : createEmptyPublicGameState(),
         message.requestId,
       );
       return;
@@ -1146,7 +1164,7 @@ export class RoomSession {
         this.match.matchId,
         this.match.stepNumber,
         '对手已离线，暂无法操作',
-        snapshotMatch(this.match, this.now()).gameState,
+        projectGameState(this.match),
         message.requestId,
       );
       return;
@@ -1159,30 +1177,10 @@ export class RoomSession {
         requestId: message.requestId,
         stepNumber: cached.stepNumber,
       });
-      const snap = snapshotMatch(this.match, this.now());
-      connection.send(
-        buildServerMessage({
-          type: 'game.state',
-          roomId: this.roomId,
-          requestId: message.requestId,
-          payload: {
-            matchId: snap.matchId,
-            seed: snap.seed,
-            stepNumber: snap.stepNumber,
-            revision: snap.revision,
-            initial: snap.initial,
-            state: snap.gameState,
-            startParameters: snap.startParameters,
-            clock: snap.clock,
-            ...(snap.settlement ? { settlement: snap.settlement } : {}),
-            pendingNegotiation: snap.pendingNegotiation,
-            drawCooldownUntil: snap.drawCooldownUntil,
-            phraseCooldownUntil: snap.phraseCooldownUntil,
-            negotiationEvent: snap.negotiationEvent,
-            matchEvents: snap.matchEvents,
-          },
-        }),
-      );
+      const text = this.buildGameStateMessage({ requestId: message.requestId });
+      if (text) {
+        connection.send(text);
+      }
       return;
     }
 
@@ -1192,7 +1190,7 @@ export class RoomSession {
         this.match.matchId,
         this.match.stepNumber,
         '对局标识不匹配',
-        snapshotMatch(this.match, this.now()).gameState,
+        projectGameState(this.match),
         message.requestId,
       );
       return;
@@ -1204,7 +1202,7 @@ export class RoomSession {
         this.match.matchId,
         this.match.stepNumber,
         '操作步数已过期，请以最新棋盘为准',
-        snapshotMatch(this.match, this.now()).gameState,
+        projectGameState(this.match),
         message.requestId,
       );
       return;
@@ -1216,7 +1214,7 @@ export class RoomSession {
         this.match.matchId,
         this.match.stepNumber,
         '协商正在进行中，棋盘操作已锁定',
-        snapshotMatch(this.match, this.now()).gameState,
+        projectGameState(this.match),
         message.requestId,
       );
       return;
@@ -1232,7 +1230,7 @@ export class RoomSession {
         this.match.matchId,
         this.match.stepNumber,
         '非己方回合，请等待对方行动',
-        snapshotMatch(this.match, this.now()).gameState,
+        projectGameState(this.match),
         message.requestId,
       );
       return;
@@ -1251,7 +1249,7 @@ export class RoomSession {
         this.match.matchId,
         this.match.stepNumber,
         result.reason,
-        snapshotMatch(this.match, now).gameState,
+        projectGameState(this.match),
         message.requestId,
       );
       return;
@@ -1307,7 +1305,7 @@ export class RoomSession {
         message.payload.matchId,
         0,
         '对局尚未开始',
-        this.match ? snapshotMatch(this.match, this.now()).gameState : createEmptyGameState(),
+        this.match ? projectGameState(this.match) : createEmptyPublicGameState(),
         message.requestId,
       );
       return;
@@ -1319,7 +1317,7 @@ export class RoomSession {
         this.match.matchId,
         this.match.stepNumber,
         '对手已离线，暂无法操作',
-        snapshotMatch(this.match, this.now()).gameState,
+        projectGameState(this.match),
         message.requestId,
       );
       return;
@@ -1331,7 +1329,7 @@ export class RoomSession {
         this.match.matchId,
         this.match.stepNumber,
         '对局已经结束，请重新开局',
-        snapshotMatch(this.match, this.now()).gameState,
+        projectGameState(this.match),
         message.requestId,
       );
       return;
@@ -1343,7 +1341,7 @@ export class RoomSession {
         this.match.matchId,
         this.match.stepNumber,
         '对局标识不匹配',
-        snapshotMatch(this.match, this.now()).gameState,
+        projectGameState(this.match),
         message.requestId,
       );
       return;
@@ -1355,7 +1353,7 @@ export class RoomSession {
         this.match.matchId,
         this.match.stepNumber,
         '操作版本已过期，请以最新棋盘为准',
-        snapshotMatch(this.match, this.now()).gameState,
+        projectGameState(this.match),
         message.requestId,
       );
       return;
@@ -1374,7 +1372,7 @@ export class RoomSession {
         this.match.matchId,
         this.match.stepNumber,
         '已有协商正在进行中，请等待其结束',
-        snapshotMatch(this.match, now).gameState,
+        projectGameState(this.match),
         message.requestId,
       );
       return;
@@ -1387,7 +1385,7 @@ export class RoomSession {
           this.match.matchId,
           this.match.stepNumber,
           '开局暂无走子记录，无法申请悔棋',
-          snapshotMatch(this.match, now).gameState,
+          projectGameState(this.match),
           message.requestId,
         );
         return;
@@ -1401,7 +1399,7 @@ export class RoomSession {
           this.match.matchId,
           this.match.stepNumber,
           `求和申请冷却中，请在 ${remaining} 秒后再试`,
-          snapshotMatch(this.match, now).gameState,
+          projectGameState(this.match),
           message.requestId,
         );
         return;
@@ -1460,7 +1458,7 @@ export class RoomSession {
         this.match.matchId,
         this.match.stepNumber,
         '非指定应答方，无法操作',
-        snapshotMatch(this.match, this.now()).gameState,
+        projectGameState(this.match),
         message.requestId,
       );
       return;
@@ -1574,7 +1572,7 @@ export class RoomSession {
         message.payload.matchId ?? '',
         0,
         '对局尚未开始',
-        createEmptyGameState(),
+        createEmptyPublicGameState(),
         message.requestId,
       );
       return;
@@ -1585,60 +1583,45 @@ export class RoomSession {
         message.payload.matchId,
         this.match.stepNumber,
         '对局标识不匹配',
-        snapshotMatch(this.match, this.now()).gameState,
+        projectGameState(this.match),
         message.requestId,
       );
       return;
     }
-    const snap = snapshotMatch(this.match, this.now());
-    connection.send(
-      buildServerMessage({
-        type: 'game.state',
-        roomId: this.roomId,
-        ...(message.requestId ? { requestId: message.requestId } : {}),
-        payload: {
-          matchId: snap.matchId,
-          seed: snap.seed,
-          stepNumber: snap.stepNumber,
-          revision: snap.revision,
-          initial: snap.initial,
-          state: snap.gameState,
-          startParameters: snap.startParameters,
-          clock: snap.clock,
-          ...(snap.settlement ? { settlement: snap.settlement } : {}),
-          pendingNegotiation: snap.pendingNegotiation,
-          drawCooldownUntil: snap.drawCooldownUntil,
-          phraseCooldownUntil: snap.phraseCooldownUntil,
-          negotiationEvent: snap.negotiationEvent,
-          matchEvents: snap.matchEvents,
-        },
-      }),
+    const text = this.buildGameStateMessage(
+      message.requestId ? { requestId: message.requestId } : undefined,
     );
+    if (text) {
+      connection.send(text);
+    }
   }
 
-  private broadcastGameState(options?: {
+  /**
+   * 全量公开棋局消息：welcome 之后的每次广播、单播同步与重复请求应答都由此构建，
+   * 保证所有发包路径共用同一份公开投影。
+   */
+  private buildGameStateMessage(options?: {
     requestId?: string;
     actorMemberId?: string;
     action?: MatchAction;
-  }): void {
+  }): string | null {
     if (!this.match) {
-      return;
+      return null;
     }
-    const snap = snapshotMatch(this.match, this.now());
-    const text = buildServerMessage({
+    const snap = projectMatchSnapshot(this.match, this.now());
+    return buildServerMessage({
       type: 'game.state',
       roomId: this.roomId,
       ...(options?.requestId ? { requestId: options.requestId } : {}),
       payload: {
         matchId: snap.matchId,
-        seed: snap.seed,
         stepNumber: snap.stepNumber,
         revision: snap.revision,
-        initial: snap.initial,
         state: snap.gameState,
         startParameters: snap.startParameters,
-        clock: snap.clock,
-        ...(snap.settlement ? { settlement: snap.settlement } : {}),
+        ...(snap.clock ? { clock: snap.clock } : {}),
+        // 可空字段始终显式给出：省略会被客户端当成「无更新」而保留旧值。
+        settlement: snap.settlement,
         pendingNegotiation: snap.pendingNegotiation,
         drawCooldownUntil: snap.drawCooldownUntil,
         phraseCooldownUntil: snap.phraseCooldownUntil,
@@ -1648,7 +1631,17 @@ export class RoomSession {
         ...(options?.action ? { action: options.action } : {}),
       },
     });
-    this.broadcast(text);
+  }
+
+  private broadcastGameState(options?: {
+    requestId?: string;
+    actorMemberId?: string;
+    action?: MatchAction;
+  }): void {
+    const text = this.buildGameStateMessage(options);
+    if (text) {
+      this.broadcast(text);
+    }
   }
 
   private handleChatPhrase(
@@ -1903,13 +1896,12 @@ export class RoomSession {
       message.type === 'game.resign'
         ? message.payload.matchId
         : '';
-    const snap = this.match ? snapshotMatch(this.match, this.now()) : null;
     this.sendGameRejection(
       connection,
       matchId,
-      snap?.stepNumber ?? 0,
+      this.match?.stepNumber ?? 0,
       '旁观者不可操作对局',
-      snap ? snap.gameState : createEmptyGameState(),
+      this.match ? projectGameState(this.match) : createEmptyPublicGameState(),
       message.requestId,
     );
   }
@@ -1919,7 +1911,7 @@ export class RoomSession {
     matchId: string,
     stepNumber: number,
     reason: string,
-    state: GameStateSnapshot,
+    state: PublicGameState,
     requestId?: string,
   ): void {
     connection.send(

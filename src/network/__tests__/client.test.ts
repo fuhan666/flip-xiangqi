@@ -4,7 +4,8 @@ import { WebSocketServer, WebSocket as NodeWebSocket } from 'ws';
 import type { AddressInfo } from 'node:net';
 import { RoomClient, type WebSocketLike } from '../client';
 import { applyLobbyCommand, buildStartParameters, createLobbyState, type LobbyState } from '../lobby';
-import { createMatch, snapshotMatch } from '../match';
+import { createMatch } from '../match';
+import { publicGameStatePayload, publicSnapshotOf } from './helpers/public-fixtures';
 import { buildServerMessage, closeCodeForError, PROTOCOL_VERSION } from '../protocol';
 
 interface TestServer {
@@ -648,7 +649,7 @@ describe('RoomClient', () => {
         hostSide: 'red',
       });
       const match = createMatch({ matchId: 'm1', seed: 42, startParameters });
-      const snap0 = snapshotMatch(match);
+      const snap0 = publicSnapshotOf(match);
 
       const server = await startServer((socket) => {
         serverSocket = socket;
@@ -699,22 +700,17 @@ describe('RoomClient', () => {
       const afterAction = client.getState().game!;
       expect(afterAction.pendingAction).not.toBeNull();
       expect(afterAction.pendingAction?.stepNumber).toBe(0);
-      expect(afterAction.lastAcceptedAction?.source).toBe('local');
+      // v8：客户端不再本地乐观推演，确认前不产生动画/音效事件
+      expect(afterAction.lastAcceptedAction).toBeNull();
+      expect(afterAction.gameState).toEqual(initialGame.gameState);
       const pendingReqId = afterAction.pendingAction!.requestId;
 
-      // 2. 服务端重发第 0 步快照（重复广播）-> 不得撤销在途 pendingAction，不得覆盖 displayState
+      // 2. 服务端重发第 0 步快照（重复广播）-> 不得撤销在途 pendingAction，也不改变公开局面
       serverSocket!.send(
         buildServerMessage({
           type: 'game.state',
           roomId: 'room-1',
-          payload: {
-            matchId: snap0.matchId,
-            seed: snap0.seed,
-            stepNumber: 0,
-            initial: snap0.initial,
-            state: snap0.gameState,
-            startParameters: snap0.startParameters,
-          },
+          payload: publicGameStatePayload(snap0),
         }),
       );
       await new Promise((r) => setTimeout(r, 50));
@@ -737,7 +733,7 @@ describe('RoomClient', () => {
       await new Promise((r) => setTimeout(r, 50));
       expect(client.getState().game?.pendingAction?.requestId).toBe(pendingReqId);
 
-      // 4. 服务端发送匹配 pendingReqId 的真实拒绝 -> 回滚 displayState 至 confirmedState，设置 notice
+      // 4. 服务端发送匹配 pendingReqId 的真实拒绝 -> 清空 pendingAction 并设置 notice（棋盘始终是确认局面）
       serverSocket!.send(
         buildServerMessage({
           type: 'game.rejected',
@@ -754,8 +750,7 @@ describe('RoomClient', () => {
       await waitUntil(() => client.getState().game?.pendingAction === null);
       const rejectedGame = client.getState().game!;
       expect(rejectedGame.statusNotice).toBe('你的操作未被采纳，请重新操作');
-      expect(rejectedGame.displayState.pieces).toEqual(snap0.gameState.pieces);
-      expect(rejectedGame.displayState.currentTurn).toBe(snap0.gameState.currentTurn);
+      expect(rejectedGame.gameState).toEqual(snap0.gameState);
       expect(rejectedGame.lastAcceptedAction).toBeNull();
 
       // 5. 同一步重试翻牌 (0, 6) -> 再次产生新 pendingAction 并可正常发送
@@ -769,16 +764,12 @@ describe('RoomClient', () => {
         buildServerMessage({
           type: 'game.state',
           roomId: 'room-1',
-          payload: {
-            matchId: snap0.matchId,
-            seed: snap0.seed,
+          payload: publicGameStatePayload(snap0, {
             stepNumber: 3,
-            initial: snap0.initial,
-            state: snap0.gameState,
-            startParameters: snap0.startParameters,
+            revision: snap0.revision + 3,
             actorMemberId: 'guest-1',
             action: { type: 'flip', position: { x: 0, y: 3 } },
-          },
+          }),
         }),
       );
       await waitUntil(() => client.getState().game?.stepNumber === 3);
@@ -798,7 +789,7 @@ describe('RoomClient', () => {
         hostSide: 'red',
       });
       const match = createMatch({ matchId: 'm-1', seed: 42, startParameters });
-      const snap0 = snapshotMatch(match, 1000);
+      const snap0 = publicSnapshotOf(match, 1000);
 
       const server = await startServer((socket) => {
         serverSocket = socket;
@@ -956,7 +947,7 @@ describe('RoomClient spectator mode', () => {
       hostSide: 'red',
     });
     const match = createMatch({ matchId: 'm-1', seed: 42, startParameters });
-    const snap0 = snapshotMatch(match, 1000);
+    const snap0 = publicSnapshotOf(match, 1000);
 
     let serverSocket: NodeWebSocket | null = null;
     const received: Array<Record<string, any>> = [];
@@ -990,7 +981,7 @@ describe('RoomClient spectator mode', () => {
     await waitUntil(() => client.getState().game !== null);
     expect(serverSocket).not.toBeNull();
 
-    const displayBefore = client.getState().game!.displayState;
+    const stateBefore = client.getState().game!.gameState;
     const actionResult = client.sendGameAction({ type: 'flip', position: { x: 0, y: 3 } });
     expect(actionResult.ok).toBe(false);
     expect(actionResult.reason).toContain('旁观');
@@ -1008,7 +999,7 @@ describe('RoomClient spectator mode', () => {
 
     // 无任何消息发出（只有 hello），也无乐观局面。
     expect(received.map((m) => m.type)).toEqual(['hello']);
-    expect(client.getState().game!.displayState).toBe(displayBefore);
+    expect(client.getState().game!.gameState).toBe(stateBefore);
     expect(client.getState().game!.pendingAction).toBeNull();
     expect(client.getState().pendingCommand).toBeNull();
 

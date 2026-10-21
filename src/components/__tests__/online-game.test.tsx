@@ -3,8 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { OnlineGame } from '../OnlineGame.js';
 import type { ConnectionState, GameClientState, RoomConnection } from '../../network/client.js';
 import { buildStartParameters, createLobbyState } from '../../network/lobby.js';
-import { applyMatchAction, createMatch, finalizeMatch, snapshotMatch, undoMatchAction } from '../../network/match.js';
-import { parseRecord } from '../../records/record';
+import { applyMatchAction, createMatch, finalizeMatch, undoMatchAction } from '../../network/match.js';
+import { projectMatchSnapshot } from '../../../server/public-view.js';
 import { IDLE_CONNECTION_STATE } from '../rooms/connection-state.js';
 
 describe('OnlineGame component', () => {
@@ -25,19 +25,16 @@ describe('OnlineGame component', () => {
       hostSide: hostRed ? 'red' : 'black',
     });
     const match = createMatch({ matchId: 'm1', seed: 12345, startParameters });
-    return { startParameters, match, snapshot: snapshotMatch(match) };
+    return { startParameters, match, snapshot: projectMatchSnapshot(match) };
   }
 
   function buildTestGame(startParameters: any, snapshot: any, overrides: Partial<GameClientState> = {}): GameClientState {
     return {
       matchId: 'm1',
-      seed: 12345,
       stepNumber: 0,
       revision: 0,
       startParameters,
-      initial: snapshot.initial,
-      confirmedState: snapshot.gameState,
-      displayState: snapshot.gameState,
+      gameState: snapshot.gameState,
       clock: snapshot.clock,
       settlement: null,
       clockOffsetMs: 0,
@@ -53,7 +50,7 @@ describe('OnlineGame component', () => {
     };
   }
 
-  it.each(['resignation', 'draw-agreement', 'match-timeout', 'step-timeout', 'disconnect-timeout'] as const)('exports identical confirmed records for both sides after undo and %s; replay sends nothing', async (reason) => {
+  it.each(['resignation', 'draw-agreement', 'match-timeout', 'step-timeout', 'disconnect-timeout'] as const)('settles %s without exposing a full online record (stage boundary) and sends nothing on the result dialog', (reason) => {
     const { startParameters, match } = createTestMatch(true);
     const first = match.gameState.pieces.find((p) => !p.revealed)!.position!;
     const accepted = applyMatchAction(match, startParameters.redMemberId, { type: 'flip', position: first });
@@ -64,34 +61,17 @@ describe('OnlineGame component', () => {
     const undone = undoMatchAction(speculative.match);
     if (!undone.ok) throw new Error('undo rejected');
     const ended = finalizeMatch(undone.match, reason === 'draw-agreement' ? null : 'red', reason);
-    const snapshot = snapshotMatch(ended);
+    const snapshot = projectMatchSnapshot(ended);
     const lobby = createLobbyState(); lobby.phase = 'started'; lobby.startParameters = startParameters;
     const connection: ConnectionState = { ...IDLE_CONNECTION_STATE, status:'connected', roomId:'room-1', memberId:'host-1', role:'host', lobby,
-      game: buildTestGame(startParameters, snapshot, { confirmedState: snapshot.gameState, displayState: speculative.match.gameState, settlement: snapshot.settlement }) };
+      game: buildTestGame(startParameters, snapshot, { settlement: snapshot.settlement }) };
     const mockClient = { sendGameAction: vi.fn(), sendLobbyReturn: vi.fn(), requestGameSync: vi.fn() } as unknown as RoomConnection;
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
-    const { rerender } = render(<OnlineGame client={mockClient} connection={connection} onExit={vi.fn()} />);
-    fireEvent.click(screen.getByRole('button', { name:'导出棋谱' }));
-    await act(async () => fireEvent.click(screen.getByRole('button', { name:'复制 JSON' })));
-    const firstJSON = writeText.mock.calls[0][0] as string;
-    const record = parseRecord(firstJSON);
-    expect(record.moves).toHaveLength(1);
-    expect(record.result.reason).toBe(reason);
-    expect(firstJSON).not.toContain('host-1');
-    expect(firstJSON).not.toContain('room-1');
-    rerender(<OnlineGame client={mockClient} connection={{ ...connection, memberId:'guest-1', role:'guest' }} onExit={vi.fn()} />);
-    await act(async () => fireEvent.click(screen.getByRole('button', { name:'复制 JSON' })));
-    expect(writeText.mock.calls[1][0]).toBe(firstJSON);
-    fireEvent.click(screen.getByRole('button', { name:'开始复盘' }));
-    expect(screen.queryByTestId('game-result-modal')).not.toBeInTheDocument();
-    const viewer = screen.getByTestId('replay-viewer');
-    expect(viewer.querySelector('.board')).toHaveAttribute('data-perspective','black');
-    fireEvent.keyDown(window, { key:'End' });
-    fireEvent.click(viewer.querySelector('[data-testid="cell-4-9"]')!);
-    fireEvent.keyDown(window, { key:'ArrowLeft' });
-    fireEvent.keyDown(window, { key:'Escape' });
+    render(<OnlineGame client={mockClient} connection={connection} onExit={vi.fn()} />);
     expect(screen.getByTestId('game-result-modal')).toBeInTheDocument();
+    // 阶段边界：联机客户端不持有完整开局，因此不提供导出/复盘入口。
+    expect(screen.getByTestId('online-record-unavailable')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '导出棋谱' })).not.toBeInTheDocument();
+    expect(screen.queryByTestId('replay-viewer')).not.toBeInTheDocument();
     expect(mockClient.sendGameAction).not.toHaveBeenCalled();
     expect(mockClient.sendLobbyReturn).not.toHaveBeenCalled();
     expect(mockClient.requestGameSync).not.toHaveBeenCalled();
@@ -391,13 +371,10 @@ describe('OnlineGame component', () => {
       lobby,
       game: {
         matchId: 'm1',
-        seed: 12345,
         stepNumber: 1,
         revision: 10,
         startParameters,
-        initial: snapshot.initial,
-        confirmedState: { ...snapshot.gameState, checkedCamp: 'black' },
-        displayState: { ...snapshot.gameState, checkedCamp: 'black' },
+        gameState: { ...snapshot.gameState, checkedCamp: 'black' },
         clock: {
           ...snapshot.clock!,
           paused: true,
@@ -461,13 +438,10 @@ describe('OnlineGame component', () => {
       lobby,
       game: {
         matchId: 'm1',
-        seed: 12345,
         stepNumber: 5,
         revision: 50,
         startParameters,
-        initial: snapshot.initial,
-        confirmedState: snapshot.gameState,
-        displayState: snapshot.gameState,
+        gameState: snapshot.gameState,
         clock: snapshot.clock,
         settlement: {
           winner: 'red',
@@ -531,19 +505,16 @@ describe('OnlineGame spectator view', () => {
       hostSide: 'red',
     });
     const match = createMatch({ matchId: 'm1', seed: 12345, startParameters });
-    const snapshot = snapshotMatch(match);
+    const snapshot = projectMatchSnapshot(match);
     const lobby = createLobbyState();
     lobby.phase = 'started';
     lobby.startParameters = startParameters;
     const game: GameClientState = {
       matchId: 'm1',
-      seed: 12345,
-      stepNumber: 2,
+        stepNumber: 2,
       revision: 7,
       startParameters,
-      initial: snapshot.initial,
-      confirmedState: snapshot.gameState,
-      displayState: snapshot.gameState,
+      gameState: snapshot.gameState,
       clock: snapshot.clock,
       settlement: null,
       clockOffsetMs: 0,

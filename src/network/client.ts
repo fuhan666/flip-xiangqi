@@ -48,6 +48,7 @@ import {
   type MemberSnapshot,
   type NegotiationEvent,
   type PendingNegotiation,
+  type PublicGameState,
   type QuickPhraseEvent,
   type Role,
   type RoomClosedReason,
@@ -57,7 +58,6 @@ import {
   type TimeControlId,
 } from './protocol.js';
 import type { LobbyState } from './lobby.js';
-import { applyAction, restoreState, snapshotState, type GameStateSnapshot } from '../game/index.js';
 
 export type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'error';
 
@@ -71,23 +71,22 @@ export interface AcceptedGameAction {
   action: MatchAction;
   source: 'local' | 'remote';
   /**
-   * 仅客户端使用：true 表示该动作来自服务端权威 game.state 的直播确认/广播，
-   * false 表示本地乐观推测（服务端尚未确认，可能被拒绝回滚）。
-   * 用于把「权威动作反馈」与「乐观展示」分离；不进入线协议。
+   * 仅客户端使用：只有服务端权威 game.state 的确认/广播才会产生该事件（始终为 true）。
+   * 客户端不再做本地乐观推演；该标记用于区分「权威动作反馈」与其它状态更新，不进入线协议。
    */
   confirmed: boolean;
 }
 
 export interface GameClientState {
   matchId: string;
-  seed: number;
   stepNumber: number;
   revision: number;
   startParameters: StartParameters;
-  /** 本局真实开局帧（服务端下发），导出棋谱与复盘使用；重连或换局不串用上一局。 */
-  initial: GameStateSnapshot;
-  confirmedState: GameStateSnapshot;
-  displayState: GameStateSnapshot;
+  /**
+   * 服务端确认的最后一份公开局面：客户端只做展示，不在本地推演或还原隐藏信息。
+   * 提交动作后棋盘保持该局面，直到权威确认或拒绝到达。
+   */
+  gameState: PublicGameState;
   clock: MatchClockSnapshot | null;
   settlement: MatchSettlement | null;
   clockOffsetMs: number;
@@ -490,7 +489,7 @@ export class RoomClient implements RoomConnection {
       return { ok: false, reason: '对局未开始' };
     }
 
-    if (game.displayState.winner !== null) {
+    if (game.gameState.winner !== null) {
       return { ok: false, reason: '对局已经结束，请重新开局' };
     }
 
@@ -513,25 +512,12 @@ export class RoomClient implements RoomConnection {
       return { ok: false, reason: '非对局成员' };
     }
 
-    if (game.displayState.currentTurn !== mySide) {
+    if (game.gameState.currentTurn !== mySide) {
       return { ok: false, reason: '当前非己方回合' };
     }
 
-    const stateObj = restoreState(game.displayState, []);
-    const nextGameState = applyAction(stateObj, action);
-    if (nextGameState.lastError) {
-      this.setState({
-        ...this.state,
-        game: {
-          ...game,
-          lastError: nextGameState.lastError,
-          statusNotice: nextGameState.lastError,
-        },
-      });
-      return { ok: false, reason: nextGameState.lastError };
-    }
-
-    const nextStateSnapshot = snapshotState(nextGameState);
+    // 合法性、翻牌结果与胜负一律由服务器裁决：客户端只做公开门禁并提交，
+    // 不调用规则推演，也不在本地改写棋盘。
     const requestId = generateRequestId();
     const stepNumber = game.stepNumber;
 
@@ -555,20 +541,12 @@ export class RoomClient implements RoomConnection {
       ...this.state,
       game: {
         ...game,
-        displayState: nextStateSnapshot,
         pendingAction: {
           requestId,
           stepNumber,
           action,
         },
-        lastAcceptedAction: {
-          eventId: `${game.matchId}:${stepNumber}:${requestId}`,
-          stepNumber,
-          actorMemberId: this.state.memberId!,
-          action,
-          source: 'local',
-          confirmed: false,
-        },
+        lastAcceptedAction: null,
         lastError: null,
         lastRejectedReason: null,
         statusNotice: null,
@@ -591,7 +569,7 @@ export class RoomClient implements RoomConnection {
     if (!game) {
       return { ok: false, reason: '对局未开始' };
     }
-    if (game.settlement !== null || game.displayState.winner !== null) {
+    if (game.settlement !== null || game.gameState.winner !== null) {
       return { ok: false, reason: '对局已结束' };
     }
     if (game.pendingNegotiation !== null) {
@@ -682,7 +660,7 @@ export class RoomClient implements RoomConnection {
     if (!game) {
       return { ok: false, reason: '对局未开始' };
     }
-    if (game.settlement !== null || game.displayState.winner !== null) {
+    if (game.settlement !== null || game.gameState.winner !== null) {
       return { ok: false, reason: '对局已结束' };
     }
 
@@ -742,7 +720,7 @@ export class RoomClient implements RoomConnection {
     if (!game) {
       return { ok: false, reason: '对局未开始' };
     }
-    if (game.settlement !== null || game.displayState.winner !== null) {
+    if (game.settlement !== null || game.gameState.winner !== null) {
       return { ok: false, reason: '对局已结束' };
     }
     if (!isQuickPhraseId(phraseId)) {
@@ -835,13 +813,10 @@ export class RoomClient implements RoomConnection {
       if (incomingGame) {
         gameClientState = {
           matchId: incomingGame.matchId,
-          seed: incomingGame.seed,
           stepNumber: incomingGame.stepNumber,
-          revision: incomingGame.revision ?? 0,
+          revision: incomingGame.revision,
           startParameters: incomingGame.startParameters,
-          initial: incomingGame.initial,
-          confirmedState: incomingGame.gameState,
-          displayState: incomingGame.gameState,
+          gameState: incomingGame.gameState,
           clock: incomingGame.clock ?? null,
           settlement: incomingGame.settlement ?? null,
           clockOffsetMs: this.clockOffsetMs,
@@ -992,7 +967,8 @@ export class RoomClient implements RoomConnection {
       const incoming = message.payload;
       const currentGame = this.state.game;
       if (this.retiredMatchIds.has(incoming.matchId) || (currentGame && currentGame.matchId !== incoming.matchId)) return;
-      const incomingRevision = incoming.revision ?? incoming.stepNumber * 10;
+      // 协议 v8 起 revision 必填：不再按旧格式（步号推算）兼容。
+      const incomingRevision = incoming.revision;
       const isExplicitSync = Boolean(message.requestId && message.requestId === this.pendingSyncRequestId);
       if (isExplicitSync) {
         this.pendingSyncRequestId = null;
@@ -1020,7 +996,7 @@ export class RoomClient implements RoomConnection {
         incomingRevision === currentGame.revision && isStaleClockSample(incoming.clock, currentGame.clock)
         ? currentGame.clock : incoming.clock;
 
-      // 同一步且相同 revision 的重复广播：更新已确认快照，但不得清除当前在途推测或回退乐观呈现
+      // 同一步且相同 revision 的重复广播：刷新公开局面，但不清除当前在途请求（等待同一份确认）
       if (
         currentGame &&
         currentGame.matchId === incoming.matchId &&
@@ -1032,7 +1008,7 @@ export class RoomClient implements RoomConnection {
             ...this.state,
             game: {
               ...currentGame,
-              confirmedState: incoming.state,
+              gameState: incoming.state,
               clock: incomingClock ?? currentGame.clock,
               settlement: incoming.settlement !== undefined ? incoming.settlement : currentGame.settlement,
               revision: incomingRevision,
@@ -1071,7 +1047,7 @@ export class RoomClient implements RoomConnection {
           pendingAction = null;
           lastAcceptedAction = incoming.actorMemberId && incoming.action
             ? {
-                eventId: `${incoming.matchId}:${incoming.stepNumber - 1}:${message.requestId ?? 'confirmed'}`,
+                eventId: `${incoming.matchId}:${incomingRevision}:${message.requestId ?? 'confirmed'}`,
                 stepNumber: incoming.stepNumber - 1,
                 actorMemberId: incoming.actorMemberId,
                 action: incoming.action,
@@ -1085,7 +1061,7 @@ export class RoomClient implements RoomConnection {
           }
           lastAcceptedAction = incoming.actorMemberId && incoming.action
             ? {
-                eventId: `${incoming.matchId}:${incoming.stepNumber - 1}:${incoming.actorMemberId}:${message.requestId ?? 'remote'}`,
+                eventId: `${incoming.matchId}:${incomingRevision}:${incoming.actorMemberId}:${message.requestId ?? 'broadcast'}`,
                 stepNumber: incoming.stepNumber - 1,
                 actorMemberId: incoming.actorMemberId,
                 action: incoming.action,
@@ -1100,13 +1076,10 @@ export class RoomClient implements RoomConnection {
         ...this.state,
         game: {
           matchId: incoming.matchId,
-          seed: incoming.seed,
           stepNumber: incoming.stepNumber,
           revision: incomingRevision,
           startParameters,
-          initial: incoming.initial,
-          confirmedState: incoming.state,
-          displayState: incoming.state,
+          gameState: incoming.state,
           clock: incomingClock ?? currentGame?.clock ?? null,
           settlement: incoming.settlement !== undefined ? incoming.settlement : (currentGame?.settlement ?? null),
           clockOffsetMs: this.clockOffsetMs,
@@ -1163,7 +1136,6 @@ export class RoomClient implements RoomConnection {
             ...this.state,
             game: {
               ...currentGame,
-              displayState: currentGame.confirmedState,
               pendingAction: null,
               lastRejectedReason: incoming.reason,
               statusNotice: '你的操作未被采纳，请重新操作',
@@ -1179,8 +1151,7 @@ export class RoomClient implements RoomConnection {
         game: {
           ...currentGame,
           stepNumber: incoming.stepNumber,
-          confirmedState: incoming.state,
-          displayState: incoming.state,
+          gameState: incoming.state,
           pendingAction: null,
           lastError: incoming.reason,
           lastRejectedReason: incoming.reason,
@@ -1367,7 +1338,6 @@ export class RoomClient implements RoomConnection {
         game: this.state.game
           ? {
               ...this.state.game,
-              displayState: this.state.game.confirmedState,
               pendingAction: null,
               lastAcceptedAction: null,
             }
@@ -1387,7 +1357,6 @@ export class RoomClient implements RoomConnection {
       game: this.state.game
         ? {
             ...this.state.game,
-            displayState: this.state.game.confirmedState,
             pendingAction: null,
             lastAcceptedAction: null,
           }

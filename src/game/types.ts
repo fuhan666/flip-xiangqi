@@ -23,6 +23,47 @@ export interface Piece {
   captured: boolean;
 }
 
+/**
+ * 展示用棋子视图：暗子只暴露位置与不透明标识，
+ * camp/type/captured 仅在 revealed 为 true（已明子）时提供。
+ * 本地完整 `Piece` 与联机公开棋子都可直接作为该视图渲染。
+ */
+export interface PieceView {
+  id: string;
+  position: Position | null;
+  revealed: boolean;
+  camp?: Camp;
+  type?: PieceType;
+  captured?: boolean;
+}
+
+export type LegalMoveTargetKind = 'empty' | 'capture';
+
+export interface LegalMoveTarget {
+  position: Position;
+  kind: LegalMoveTargetKind;
+}
+
+/** 服务端为该行棋方明子给出的落点提示；仅用于展示，提交仍由服务端裁决。 */
+export interface LegalMoveGroup {
+  pieceId: string;
+  from: Position;
+  targets: LegalMoveTarget[];
+}
+
+/** 棋盘/状态面板所需的只读局面视图：不包含撤销栈、种子或开局帧。 */
+export interface GameViewState {
+  pieces: PieceView[];
+  currentTurn: Camp;
+  winner: Camp | null;
+  checkedCamp: Camp | null;
+  lastError: string | null;
+  statusMessage: string;
+  actionHistory: GameHistoryEntry[];
+  recentAction: GameHistoryEntry | null;
+  legalMoves?: LegalMoveGroup[];
+}
+
 export interface HistoryPieceSnapshot {
   id: string;
   camp: Camp;
