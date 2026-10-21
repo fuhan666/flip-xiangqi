@@ -1135,5 +1135,19 @@ describe('heartbeat and reconnection', () => {
     );
     expect(lobbyReset.payload.lobby.ready.host).toBe(true);
     expect(lobbyReset.payload.lobby.ready.guest).toBe(false);
+
+    // 客人重新加入后双方再次就绪开局：真正生成新一局（新 matchId、回到第 0 步）。
+    const returningGuest = await openClient(pair.room.actualPort);
+    await hello(returningGuest, { role: 'guest', name: '客人' });
+    await returningGuest.waitForType('welcome');
+    returningGuest.send(encodeMessage(buildClientLobbyReady(pair.room.roomId, true, 1)));
+    await pair.host.waitForType('lobby.state', (m) => m.payload.lobby.ready.guest === true);
+
+    pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
+    const nextGame = await pair.host.waitForType('game.state', (m) => m.payload.matchId !== matchId);
+    expect(nextGame.payload.matchId).not.toBe(matchId);
+    expect(nextGame.payload.stepNumber).toBe(0);
+    expect(nextGame.payload.settlement).toBeUndefined();
+    expect(pair.room.getMatch()!.matchId).toBe(nextGame.payload.matchId);
   });
 });
