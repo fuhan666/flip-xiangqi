@@ -1,13 +1,15 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
 import {
   applyAction,
+  cloneStateSnapshot,
   createInitialGameState,
   getPieceAt,
   listLegalMoves,
   restartGame,
+  snapshotState,
   undoLastAction,
 } from './game';
-import type { GameHistoryConsequence, GameHistoryEndgameReason, GameState, Position } from './game';
+import type { GameHistoryConsequence, GameHistoryEndgameReason, GameState, GameStateSnapshot, Position } from './game';
 import { Board } from './components/Board';
 import { CapturedPieces } from './components/CapturedPieces';
 import { MoveHistory, actionSummary, campLabel } from './components/MoveHistory';
@@ -31,6 +33,8 @@ interface GameResultSummary {
 
 interface AppProps {
   initialState?: GameState;
+  /** 明确的开局上下文（空历史开局帧）；注入进行中棋局时必须提供。 */
+  opening?: GameStateSnapshot;
 }
 
 function isEndgameConsequence(
@@ -85,10 +89,21 @@ function hasRevealedOpponentNonKingPieces(gameState: GameState): boolean {
   );
 }
 
-export default function App({ initialState }: AppProps) {
+/** 开局上下文只认显式传入或全新的空历史棋局；进行中棋局不得用当前盘面猜测开局。 */
+function resolveOpening(seedState: GameState, opening?: GameStateSnapshot): GameStateSnapshot {
+  if (opening) {
+    return cloneStateSnapshot(opening);
+  }
+  if (seedState.actionHistory.length > 0) {
+    throw new Error('进行中棋局必须显式提供开局 initial，不能用当前盘面猜测开局');
+  }
+  return snapshotState(seedState);
+}
+
+export default function App({ initialState, opening }: AppProps) {
   const seedState = useMemo(() => initialState ?? createInitialGameState(), [initialState]);
   const [gameState, setGameState] = useState<GameState>(seedState);
-  const [opening, setOpening] = useState(() => seedState.undoStack[0] ?? seedState);
+  const [openingSnapshot, setOpeningSnapshot] = useState<GameStateSnapshot>(() => resolveOpening(seedState, opening));
   const gameStart = useRef(Date.now());
   const gameEnd = useRef<number | null>(seedState.winner ? Date.now() : null);
   const [replay, setReplay] = useState<GameRecord | null>(null);
@@ -98,10 +113,10 @@ export default function App({ initialState }: AppProps) {
     if (!next.winner) gameEnd.current = null;
     setGameState(next);
   };
-  const record = useMemo(() => gameState.winner ? createRecord(opening, gameState,
+  const record = useMemo(() => gameState.winner ? createRecord(openingSnapshot, gameState,
     { mode: 'local', seats: { red: '本地红方', black: '本地黑方' } },
     { winner: gameState.winner, reason: gameState.recentAction?.consequences.find((c) => c.type === 'endgame')?.reason ?? 'checkmate',
-      durationSeconds: Math.max(0, ((gameEnd.current ?? Date.now()) - gameStart.current) / 1000), timeBasis: 'elapsed' }) : null, [gameState, opening]);
+      durationSeconds: Math.max(0, ((gameEnd.current ?? Date.now()) - gameStart.current) / 1000), timeBasis: 'elapsed' }) : null, [gameState, openingSnapshot]);
   const [recentCompletedGames, setRecentCompletedGames] = useState<GameResultSummary[]>([]);
   const [selectedPosition, setSelectedPosition] = useState<Position | null>(null);
   const [interactionMessage, setInteractionMessage] = useState<string | null>(null);
@@ -202,7 +217,7 @@ export default function App({ initialState }: AppProps) {
     const next = restartGame();
     gameStart.current = Date.now();
     gameEnd.current = null;
-    setOpening(next);
+    setOpeningSnapshot(snapshotState(next));
     setGameState(next);
   };
 

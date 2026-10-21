@@ -101,6 +101,35 @@ export interface GameStateSnapshot {
   actionHistory: GameHistoryEntry[];
   recentAction: GameHistoryEntry | null;
 }
+
+/** 规则计算所需的最小局面视图：只含棋子与行棋方，不携带历史、撤销或开局数据。 */
+export interface RuleState {
+  pieces: Piece[];
+  currentTurn: Camp;
+}
+
+/** 撤销点中单枚棋子的前置值（仅记录本步改变的棋子）。 */
+export interface UndoPieceState {
+  id: string;
+  revealed: boolean;
+  captured: boolean;
+  position: Position | null;
+}
+
+/**
+ * 紧凑撤销记录：只保存本步改变棋子的旧值与被覆盖的标量状态。
+ * 有效动作历史仅保留一份权威副本，撤销点不再嵌套完整快照。
+ */
+export interface UndoEntry {
+  historyLength: number;
+  pieces: UndoPieceState[];
+  currentTurn: Camp;
+  winner: Camp | null;
+  checkedCamp: Camp | null;
+  lastError: string | null;
+  statusMessage: string;
+}
+
 export interface GameState {
   pieces: Piece[];
   currentTurn: Camp;
@@ -110,7 +139,7 @@ export interface GameState {
   statusMessage: string;
   actionHistory: GameHistoryEntry[];
   recentAction: GameHistoryEntry | null;
-  undoStack: GameStateSnapshot[];
+  undoStack: UndoEntry[];
 }
 
 export interface FlipAction {

@@ -69,6 +69,10 @@ describe('protocol envelope', () => {
     const raw = JSON.stringify({ version: PROTOCOL_VERSION + 1, type: 'hello', roomId: null, payload: { role: 'guest', name: '客人' } });
     expect(parseClientMessage(raw)).toMatchObject({ ok: false, code: 'VERSION_MISMATCH' });
     expect(parseServerMessage(raw)).toMatchObject({ ok: false, code: 'VERSION_MISMATCH' });
+    // v7 起 game.state 必须携带开局帧 initial，旧版 v6 客户端/服务端直接拒绝，不保留兼容分支。
+    const legacy = JSON.stringify({ version: PROTOCOL_VERSION - 1, type: 'hello', roomId: null, payload: { role: 'guest', name: '客人' } });
+    expect(parseClientMessage(legacy)).toMatchObject({ ok: false, code: 'VERSION_MISMATCH' });
+    expect(parseServerMessage(legacy)).toMatchObject({ ok: false, code: 'VERSION_MISMATCH' });
   });
 
   it('rejects unknown message types and malformed hello payloads', () => {
@@ -362,6 +366,16 @@ describe('heartbeat and session resumption envelopes', () => {
         matchId: 'match-1',
         seed: 12345,
         stepNumber: 1,
+        initial: {
+          currentTurn: 'red',
+          winner: null,
+          checkedCamp: null,
+          lastError: null,
+          statusMessage: '红方先行',
+          pieces: [],
+          actionHistory: [],
+          recentAction: null,
+        },
         state: {
           currentTurn: 'black',
           winner: null,
@@ -383,6 +397,15 @@ describe('heartbeat and session resumption envelopes', () => {
       expect(parsedState.message.payload.stepNumber).toBe(1);
       expect(parsedState.message.payload.actorMemberId).toBe('host-1');
     }
+
+    // game.state 缺少开局帧时直接拒绝，不从 seed/当前盘面重建。
+    const missingInitial = JSON.parse(serverState) as { payload: Record<string, unknown> };
+    delete missingInitial.payload.initial;
+    expect(parseServerMessage(JSON.stringify(missingInitial))).toMatchObject({
+      ok: false,
+      code: 'INVALID_MESSAGE',
+      detail: 'game-state-initial',
+    });
 
     // game.rejected
     const serverRejected = buildServerMessage({
@@ -460,6 +483,16 @@ describe('heartbeat and session resumption envelopes', () => {
         seed: 1234,
         stepNumber: 3,
         revision: 5,
+        initial: {
+          currentTurn: 'red',
+          winner: null,
+          checkedCamp: null,
+          lastError: null,
+          statusMessage: '红方先行',
+          pieces: [],
+          actionHistory: [],
+          recentAction: null,
+        },
         state: {
           currentTurn: 'red',
           winner: 'black',

@@ -84,6 +84,8 @@ export interface GameClientState {
   stepNumber: number;
   revision: number;
   startParameters: StartParameters;
+  /** 本局真实开局帧（服务端下发），导出棋谱与复盘使用；重连或换局不串用上一局。 */
+  initial: GameStateSnapshot;
   confirmedState: GameStateSnapshot;
   displayState: GameStateSnapshot;
   clock: MatchClockSnapshot | null;
@@ -837,6 +839,7 @@ export class RoomClient implements RoomConnection {
           stepNumber: incomingGame.stepNumber,
           revision: incomingGame.revision ?? 0,
           startParameters: incomingGame.startParameters,
+          initial: incomingGame.initial,
           confirmedState: incomingGame.gameState,
           displayState: incomingGame.gameState,
           clock: incomingGame.clock ?? null,
@@ -1101,6 +1104,7 @@ export class RoomClient implements RoomConnection {
           stepNumber: incoming.stepNumber,
           revision: incomingRevision,
           startParameters,
+          initial: incoming.initial,
           confirmedState: incoming.state,
           displayState: incoming.state,
           clock: incomingClock ?? currentGame?.clock ?? null,

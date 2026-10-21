@@ -1,6 +1,6 @@
 import { BOARD_HEIGHT, BOARD_WIDTH } from './constants.js';
-import { cloneState, findKing, getPieceAt, otherCamp } from './state.js';
-import type { Camp, GameState, MoveValidationResult, Piece, Position } from './types.js';
+import { clonePieces, findKing, getPieceAt, otherCamp } from './state.js';
+import type { Camp, MoveValidationResult, Piece, Position, RuleState } from './types.js';
 
 function isInsideBoard(position: Position): boolean {
   return position.x >= 0 && position.x < BOARD_WIDTH && position.y >= 0 && position.y < BOARD_HEIGHT;
@@ -15,7 +15,7 @@ function hasCrossedRiver(camp: Camp, position: Position): boolean {
   return camp === 'red' ? position.y <= 4 : position.y >= 5;
 }
 
-function pathClear(state: GameState, from: Position, to: Position): { clear: boolean; blockers: Piece[] } {
+function pathClear(state: RuleState, from: Position, to: Position): { clear: boolean; blockers: Piece[] } {
   const blockers: Piece[] = [];
   const deltaX = Math.sign(to.x - from.x);
   const deltaY = Math.sign(to.y - from.y);
@@ -32,7 +32,7 @@ function pathClear(state: GameState, from: Position, to: Position): { clear: boo
   return { clear: blockers.length === 0, blockers };
 }
 
-function validateBasicMove(state: GameState, piece: Piece, to: Position): MoveValidationResult {
+function validateBasicMove(state: RuleState, piece: Piece, to: Position): MoveValidationResult {
   if (!piece.position) {
     return { ok: false, reason: '棋子不在棋盘上' };
   }
@@ -129,7 +129,7 @@ function validateBasicMove(state: GameState, piece: Piece, to: Position): MoveVa
   }
 }
 
-function canAttackSquare(state: GameState, attacker: Piece, target: Position): boolean {
+function canAttackSquare(state: RuleState, attacker: Piece, target: Position): boolean {
   if (!attacker.position || attacker.captured || !attacker.revealed) {
     return false;
   }
@@ -157,7 +157,7 @@ function canAttackSquare(state: GameState, attacker: Piece, target: Position): b
   return result.ok;
 }
 
-export function isInCheck(state: GameState, camp: Camp): boolean {
+export function isInCheck(state: RuleState, camp: Camp): boolean {
   const king = findKing(state, camp);
   if (!king?.position) {
     return false;
@@ -166,7 +166,7 @@ export function isInCheck(state: GameState, camp: Camp): boolean {
   return state.pieces.some((piece) => piece.camp === otherCamp(camp) && canAttackSquare(state, piece, king.position!));
 }
 
-export function violatesFacingKings(state: GameState): boolean {
+export function violatesFacingKings(state: RuleState): boolean {
   const redKing = findKing(state, 'red');
   const blackKing = findKing(state, 'black');
   if (!redKing?.position || !blackKing?.position || redKing.position.x !== blackKing.position.x) {
@@ -175,10 +175,11 @@ export function violatesFacingKings(state: GameState): boolean {
   return pathClear(state, redKing.position, blackKing.position).clear;
 }
 
-function simulateMove(state: GameState, piece: Piece, to: Position): GameState {
-  const next = cloneState(state);
-  const movingPiece = next.pieces.find((candidate) => candidate.id === piece.id)!;
-  const target = next.pieces.find(
+/** 规则模拟：只复制局面所需的棋子与坐标，不读取或复制历史、撤销与开局数据。 */
+function simulateMove(state: RuleState, piece: Piece, to: Position): RuleState {
+  const pieces = clonePieces(state.pieces);
+  const movingPiece = pieces.find((candidate) => candidate.id === piece.id)!;
+  const target = pieces.find(
     (candidate) => !candidate.captured && candidate.position && candidate.position.x === to.x && candidate.position.y === to.y,
   );
 
@@ -188,10 +189,17 @@ function simulateMove(state: GameState, piece: Piece, to: Position): GameState {
   }
 
   movingPiece.position = { ...to };
-  return next;
+  return { pieces, currentTurn: state.currentTurn };
 }
 
-export function validateMove(state: GameState, piece: Piece, to: Position): MoveValidationResult {
+function simulateFlip(state: RuleState, pieceId: string): RuleState {
+  const pieces = clonePieces(state.pieces);
+  const target = pieces.find((candidate) => candidate.id === pieceId)!;
+  target.revealed = true;
+  return { pieces, currentTurn: state.currentTurn };
+}
+
+export function validateMove(state: RuleState, piece: Piece, to: Position): MoveValidationResult {
   if (piece.captured || !piece.position) {
     return { ok: false, reason: '棋子已不在场上' };
   }
@@ -218,7 +226,7 @@ export function validateMove(state: GameState, piece: Piece, to: Position): Move
   return { ok: true };
 }
 
-export function listLegalMoves(state: GameState, pieceId: string): Position[] {
+export function listLegalMoves(state: RuleState, pieceId: string): Position[] {
   const piece = state.pieces.find((candidate) => candidate.id === pieceId);
   if (!piece?.position) {
     return [];
@@ -236,18 +244,17 @@ export function listLegalMoves(state: GameState, pieceId: string): Position[] {
   return legalMoves;
 }
 
-export function hasAnyLegalAction(state: GameState, camp: Camp): boolean {
+export function hasAnyLegalAction(state: RuleState, camp: Camp): boolean {
+  const view: RuleState = { pieces: state.pieces, currentTurn: camp };
   for (const piece of state.pieces) {
-    if (piece.camp === camp && piece.revealed && !piece.captured && listLegalMoves({ ...state, currentTurn: camp }, piece.id).length > 0) {
+    if (piece.camp === camp && piece.revealed && !piece.captured && listLegalMoves(view, piece.id).length > 0) {
       return true;
     }
   }
 
   for (const piece of state.pieces) {
     if (piece.position && !piece.revealed && !piece.captured) {
-      const simulated = cloneState(state);
-      const target = simulated.pieces.find((candidate) => candidate.id === piece.id)!;
-      target.revealed = true;
+      const simulated = simulateFlip(state, piece.id);
       if (!violatesFacingKings(simulated) && !isInCheck(simulated, camp)) {
         return true;
       }

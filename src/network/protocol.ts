@@ -17,6 +17,7 @@ import {
 } from './lobby.js';
 import {
   parseGameStateSnapshot,
+  parseOpeningSnapshot,
   parseMatchAction,
   parseMatchClockSnapshot,
   parseMatchSettlement,
@@ -69,7 +70,7 @@ import {
 import { parseMatchEvents, type MatchEvent } from './match.js';
 
 /** v6：增加只读旁观身份（spectator）与旁观者同步/恢复。 */
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 /** WebSocket 握手路径（房间服务同时在该路径上提供客人页面）。 */
 export const WS_PATH = '/ws';
@@ -261,6 +262,7 @@ export type ServerMessage =
         seed: number;
         stepNumber: number;
         revision?: number;
+        initial: GameStateSnapshot;
         state: GameStateSnapshot;
         actorMemberId?: string;
         action?: MatchAction;
@@ -880,6 +882,10 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
       typeof payload.revision === 'number' && Number.isSafeInteger(payload.revision) && payload.revision >= 0
         ? payload.revision
         : 0;
+    const initial = parseOpeningSnapshot(payload.initial);
+    if (!initial) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-initial' };
+    }
     const state = parseGameStateSnapshot(payload.state);
     if (!state) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-state-state' };
@@ -929,6 +935,7 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
           seed: payload.seed,
           stepNumber: payload.stepNumber,
           revision,
+          initial,
           state,
           ...(actorMemberId ? { actorMemberId } : {}),
           ...(action ? { action } : {}),

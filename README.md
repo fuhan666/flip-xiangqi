@@ -133,6 +133,7 @@ npm run test:e2e   # 等价于 npx playwright test
 ## 文档
 
 - [Changelog](CHANGELOG.md)
+- [长局历史存储与动作耗时](docs/performance/history.md)
 - [局域网联机搭建指南](docs/lan-setup.md)
 - [v0.9.0 版本说明](docs/releases/v0.9.0.md)
 - [v0.8.0 版本说明](docs/releases/v0.8.0.md)

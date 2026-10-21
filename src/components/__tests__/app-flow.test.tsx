@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import App from '../../App';
-import { applyAction, createEmptyGameState } from '../../game';
+import { applyAction, createEmptyGameState, snapshotState } from '../../game';
 import type { GameHistoryEntry, GameState } from '../../game';
 import type { Piece } from '../../game/types';
 
@@ -71,7 +71,7 @@ function createFinishedGameState(overrides: Partial<GameState> = {}): GameState 
   });
 }
 
-function createUndoableFinishedGameState(): GameState {
+function createUndoableFinishedGameState(): { state: GameState; opening: ReturnType<typeof snapshotState> } {
   const startingState = createEmptyGameState({
     pieces: [
       piece({ id: 'red-king', camp: 'red', type: 'king', position: { x: 4, y: 9 } }),
@@ -80,11 +80,14 @@ function createUndoableFinishedGameState(): GameState {
     ],
   });
 
-  return applyAction(startingState, {
-    type: 'move',
-    from: { x: 4, y: 1 },
-    to: { x: 4, y: 0 },
-  });
+  return {
+    state: applyAction(startingState, {
+      type: 'move',
+      from: { x: 4, y: 1 },
+      to: { x: 4, y: 0 },
+    }),
+    opening: snapshotState(startingState),
+  };
 }
 
 describe('app flow', () => {
@@ -194,7 +197,7 @@ describe('app flow', () => {
   it('shows endgame, check, and illegal-action states without collapsing them into one line', () => {
     const initialState = createFinishedGameState();
 
-    const { container } = render(<App initialState={initialState} />);
+    const { container } = render(<App initialState={initialState} opening={createEmptyGameState()} />);
     const app = within(container);
 
     expect(app.getByText('当前回合')).toBeInTheDocument();
@@ -210,7 +213,7 @@ describe('app flow', () => {
 
   it('shows an endgame summary and archives it after starting the next match', async () => {
     const user = userEvent.setup();
-    const { container } = render(<App initialState={createFinishedGameState()} />);
+    const { container } = render(<App initialState={createFinishedGameState()} opening={createEmptyGameState()} />);
     const app = within(container);
 
     expect(app.getByRole('heading', { level: 3, name: '本局结果' })).toBeInTheDocument();
@@ -228,7 +231,8 @@ describe('app flow', () => {
 
   it('returns to an in-progress view when undoing from a finished game', async () => {
     const user = userEvent.setup();
-    const { container } = render(<App initialState={createUndoableFinishedGameState()} />);
+    const { state, opening } = createUndoableFinishedGameState();
+    const { container } = render(<App initialState={state} opening={opening} />);
     const app = within(container);
 
     expect(app.getByRole('heading', { level: 3, name: '本局结果' })).toBeInTheDocument();
