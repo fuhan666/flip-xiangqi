@@ -41,17 +41,16 @@ async function setup() {
   async function consistent(step: number) {
     await until(() => clients.every(c => c.getState().game!.stepNumber === step && c.getState().game!.pendingAction === null));
     clients.forEach(c => c.requestGameSync());
-    await until(() => clients.every(c => c.getState().game!.revision === server.getMatch()!.revision));
-    const authority = server.getMatch()!;
+    await until(() => clients.every(c => c.getState().game!.revision === server.getPublicMatch()!.revision));
+    const authority = server.getPublicMatch()!;
     for (const client of clients) {
       const actual = client.getState().game!;
-      expect(actual.displayState).toEqual(authority.gameState);
-      expect(actual.confirmedState).toEqual(authority.gameState);
+      expect(actual.gameState).toEqual(authority.gameState);
       expect(actual.matchEvents).toEqual(authority.matchEvents);
       expect(actual.pendingNegotiation).toEqual(authority.pendingNegotiation);
       expect(actual.settlement).toEqual(authority.settlement);
-      expect(actual.clock!.paused).toBe(authority.clock.paused);
-      expect(actual.clock!.turn).toBe(authority.clock.turn);
+      expect(actual.clock!.paused).toBe(authority.clock!.paused);
+      expect(actual.clock!.turn).toBe(authority.clock!.turn);
     }
   }
   return { server, faults, clients, host, guest, spectator, consistent, advance: (ms: number) => { now += ms; } };

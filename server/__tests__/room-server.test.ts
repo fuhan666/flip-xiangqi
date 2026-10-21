@@ -1064,7 +1064,7 @@ describe('heartbeat and reconnection', () => {
 
     // 步时超时：推进 31 秒
     simulatedTime += 31_000;
-    const timeoutState = await pair.host.waitForType('game.state', (m) => m.payload.settlement !== undefined);
+    const timeoutState = await pair.host.waitForType('game.state', (m) => m.payload.settlement != null);
     expect(timeoutState.payload.settlement.winner).toBe('black');
     expect(timeoutState.payload.settlement.reason).toBe('step-timeout');
   });
@@ -1091,7 +1091,7 @@ describe('heartbeat and reconnection', () => {
     // 90秒耗尽
     simulatedTime += 90_001;
     // 触发时钟检查（可通过定期 broadcast 或手动检查）
-    const endedState = await pair.host.waitForType('game.state', (m) => m.payload.settlement !== undefined);
+    const endedState = await pair.host.waitForType('game.state', (m) => m.payload.settlement != null);
     expect(endedState.payload.settlement.reason).toBe('disconnect-timeout');
     expect(endedState.payload.settlement.winner).toBe('red');
   });
@@ -1124,7 +1124,7 @@ describe('heartbeat and reconnection', () => {
 
     // 客人主动离开当前局，客人判负终局
     pair.guest.send(encodeMessage(buildClientLeave(pair.room.roomId)));
-    const endedState = await pair.host.waitForType('game.state', (m) => m.payload.settlement !== undefined);
+    const endedState = await pair.host.waitForType('game.state', (m) => m.payload.settlement != null);
     expect(endedState.payload.settlement.reason).toBe('disconnect-timeout');
 
     // 房主点击再来一局
@@ -1147,7 +1147,7 @@ describe('heartbeat and reconnection', () => {
     const nextGame = await pair.host.waitForType('game.state', (m) => m.payload.matchId !== matchId);
     expect(nextGame.payload.matchId).not.toBe(matchId);
     expect(nextGame.payload.stepNumber).toBe(0);
-    expect(nextGame.payload.settlement).toBeUndefined();
+    expect(nextGame.payload.settlement).toBeNull();
     expect(pair.room.getMatch()!.matchId).toBe(nextGame.payload.matchId);
   });
 });

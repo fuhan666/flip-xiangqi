@@ -1,14 +1,14 @@
 import { PIECE_SYMBOLS } from '../game';
-import type { Camp, GameState } from '../game';
+import type { Camp, GameViewState } from '../game';
 
 interface CapturedPiecesProps {
-  gameState: GameState;
+  gameState: GameViewState;
 }
 
-function renderCamp(gameState: GameState, camp: Camp): string {
+function renderCamp(gameState: GameViewState, camp: Camp): string {
   return gameState.pieces
-    .filter((piece) => piece.camp === camp && piece.captured)
-    .map((piece) => PIECE_SYMBOLS[piece.camp][piece.type])
+    .filter((piece) => piece.revealed && piece.captured && piece.camp === camp && piece.type)
+    .map((piece) => PIECE_SYMBOLS[piece.camp as Camp][piece.type!])
     .join(' ');
 }
 

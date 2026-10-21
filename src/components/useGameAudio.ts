@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import type { GameState } from '../game/types.js';
+import type { GameState, GameViewState } from '../game/types.js';
 import type { AcceptedGameAction } from '../network/client.js';
 import type { MatchSettlement } from '../network/protocol.js';
 import {
@@ -45,7 +45,7 @@ function actionSoundKey(action: AcceptedGameAction): string {
   return `${action.stepNumber}:${detail}`;
 }
 
-function entryEndsGame(entry: GameState['actionHistory'][number]): boolean {
+function entryEndsGame(entry: GameViewState['actionHistory'][number]): boolean {
   return entry.winner !== null || hasEndgameConsequence(entry);
 }
 
@@ -84,7 +84,7 @@ export function useLocalGameAudio(gameState: GameState, engine: AudioEngine = au
  * - 首次进入或恢复已结束对局保持安静。
  */
 export function useOnlineGameAudio(
-  gameState: GameState,
+  gameState: GameViewState,
   lastAcceptedAction: AcceptedGameAction | null,
   settlement: MatchSettlement | null,
   engine: AudioEngine = audioEngine,

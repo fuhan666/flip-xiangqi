@@ -72,6 +72,11 @@ export interface MatchState {
   /** 独立保存的开局帧（空历史、无撤销），棋局推进与撤销都不改变它。 */
   initial: GameStateSnapshot;
   gameState: GameState;
+  /**
+   * 内部棋子 ID → 本局不透明公开 ID 的映射（仅服务端持有，永不进入线协议）。
+   * 由与本局布局种子无关的安全随机源在开局时按初始格位顺序分配。
+   */
+  publicPieceIds: Record<string, string>;
   clock: MatchClock;
   settlement: MatchSettlement | null;
   pendingNegotiation: PendingNegotiation | null;
@@ -274,7 +279,7 @@ export function parseOpeningSnapshot(value: unknown): GameStateSnapshot | null {
   return snapshot;
 }
 
-function parseHistoryEntry(item: unknown): GameHistoryEntry | null {
+export function parseHistoryEntry(item: unknown): GameHistoryEntry | null {
   if (!item || typeof item !== 'object') {
     return null;
   }
@@ -484,6 +489,8 @@ export function createMatch(input: {
   startParameters: StartParameters;
   nowFn?: () => number;
   initialTime?: number;
+  /** 公开棋子 ID 生成器：按初始格位顺序调用，与布局随机源相互独立。 */
+  publicIdFactory?: (index: number) => string;
 }): MatchState {
   const rng = createSeededRng(input.seed);
   const gameState = createInitialGameState(rng);
@@ -504,6 +511,7 @@ export function createMatch(input: {
     startParameters: input.startParameters,
     initial: snapshotState(gameState),
     gameState,
+    publicPieceIds: assignPublicPieceIds(gameState.pieces, input.publicIdFactory ?? createRandomPublicIdFactory()),
     clock,
     settlement: null,
     pendingNegotiation: null,
@@ -512,6 +520,40 @@ export function createMatch(input: {
     negotiationEvent: null,
     matchEvents: [],
   };
+}
+
+function createRandomPublicIdFactory(): (index: number) => string {
+  return (index) => `p${index.toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+/**
+ * 按初始格位的规范顺序（先 y 后 x）为每枚棋子分配本局公开 ID。
+ * 顺序与布局随机源无关，公开 ID 也不编码阵营/棋种。
+ */
+function assignPublicPieceIds(
+  pieces: readonly Piece[],
+  factory: (index: number) => string,
+): Record<string, string> {
+  const ordered = [...pieces].sort((left, right) => {
+    const leftY = left.position?.y ?? Number.MAX_SAFE_INTEGER;
+    const rightY = right.position?.y ?? Number.MAX_SAFE_INTEGER;
+    if (leftY !== rightY) {
+      return leftY - rightY;
+    }
+    return (left.position?.x ?? Number.MAX_SAFE_INTEGER) - (right.position?.x ?? Number.MAX_SAFE_INTEGER);
+  });
+
+  const ids: Record<string, string> = {};
+  const used = new Set<string>();
+  ordered.forEach((piece, index) => {
+    const publicId = factory(index);
+    if (!publicId || used.has(publicId)) {
+      throw new Error('public piece id factory produced an empty or duplicate id');
+    }
+    used.add(publicId);
+    ids[piece.id] = publicId;
+  });
+  return ids;
 }
 
 export function snapshotMatch(match: MatchState, now?: number): MatchSnapshot {

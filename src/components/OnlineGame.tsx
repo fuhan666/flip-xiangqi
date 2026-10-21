@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import type { Camp, GameHistoryConsequence, GameHistoryEndgameReason, GameState, Position } from '../game/types.js';
-import { getPieceAt, listLegalMoves, restoreState } from '../game/index.js';
+import { useEffect, useMemo, useState } from 'react';
+import type { Camp, GameHistoryConsequence, GameHistoryEndgameReason, GameViewState, Position } from '../game/types.js';
+import { getPieceViewAt } from '../game/index.js';
 import type { ConnectionState, RoomConnection } from '../network/client.js';
 import { findTimeControl } from '../network/lobby.js';
 import type { MatchSettlement } from '../network/protocol.js';
@@ -21,10 +21,6 @@ import { useOnlineGameAudio } from './useGameAudio.js';
 import { PhraseBubble } from './PhraseBubble.js';
 import { QuickPhrasePanel } from './QuickPhrasePanel.js';
 import type { QuickPhraseId } from '../network/quick-chat.js';
-
-import { createRecord } from '../records/record';
-import type { GameRecord } from '../records/record';
-import { GameRecordControls, RecordReplay } from './GameRecordControls';
 
 interface GameResultSummary {
   archiveLabel: string;
@@ -49,7 +45,7 @@ function endgameReasonLabel(reason: GameHistoryEndgameReason | null): string {
   return '终局获胜';
 }
 
-function buildGameResultSummary(gameState: GameState): GameResultSummary | null {
+function buildGameResultSummary(gameState: GameViewState): GameResultSummary | null {
   if (!gameState.winner) {
     return null;
   }
@@ -72,8 +68,6 @@ export interface OnlineGameProps {
 }
 
 export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
-  const [replay, setReplay] = useState<GameRecord | null>(null);
-  const closeReplay = useCallback(() => setReplay(null), []);
   const game = connection.game;
   const lobby = connection.lobby;
   const viewerRole = connection.role;
@@ -126,13 +120,10 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
       : 'black';
   const opponentSide: Camp = mySide === 'red' ? 'black' : 'red';
 
-  const rawGameState: GameState = useMemo(
-    () => restoreState(game.displayState, []),
-    [game.displayState],
-  );
-
-  const feedback = useOnlineBoardFeedback(rawGameState, game.lastAcceptedAction);
-  useOnlineGameAudio(rawGameState, game.lastAcceptedAction, game.settlement);
+  // 客户端只消费服务端公开局面：不还原、不推演、不补造隐藏信息。
+  const confirmedState = game.gameState;
+  const feedback = useOnlineBoardFeedback(confirmedState, game.lastAcceptedAction);
+  useOnlineGameAudio(confirmedState, game.lastAcceptedAction, game.settlement);
   const displayState = feedback.displayState;
 
   // 1.5 秒将军横幅提示
@@ -188,37 +179,31 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
     return null;
   }, [game.settlement, displayState.winner, displayState.recentAction, game.clock]);
 
-  const record = useMemo(() => game.settlement ? createRecord(
-    game.initial, game.confirmedState,
-    { mode: 'online', seed: game.seed, seats: { red: startParameters.players.find((p) => p.side === 'red')?.role === 'host' ? '房主' : '客人', black: startParameters.players.find((p) => p.side === 'black')?.role === 'host' ? '房主' : '客人' } },
-    { winner: game.settlement.winner, reason: game.settlement.reason,
-      durationSeconds: game.settlement.redDurationSeconds + game.settlement.blackDurationSeconds, timeBasis: 'player-clocks' },
-  ) : null, [game.initial, game.seed, game.confirmedState, game.settlement, startParameters]);
-
   const isMyTurn = !isSpectator && displayState.winner === null && displayState.currentTurn === mySide;
   // 底部信息条归属（旁观视角固定红方在下）：只用于展示样式，不代表可操作。
   const bottomActive = displayState.winner === null && displayState.currentTurn === mySide;
   const isBusy = game.pendingAction !== null || connection.reconnecting;
 
+  // 落点提示直接使用服务端下发的公开 legalMoves；客户端不再本地推演规则。
   const legalMoves = useMemo(() => {
     const hints = new Map<string, LegalMoveHint>();
 
-    if (displayState.winner || !selectedPosition || !isMyTurn) {
+    if (confirmedState.winner || !selectedPosition || !isMyTurn) {
       return hints;
     }
 
-    const piece = getPieceAt(displayState, selectedPosition);
+    const piece = getPieceViewAt(confirmedState.pieces, selectedPosition);
     if (!piece || !piece.revealed || piece.captured || piece.camp !== mySide) {
       return hints;
     }
 
-    for (const target of listLegalMoves(displayState, piece.id)) {
-      const occupant = getPieceAt(displayState, target);
-      hints.set(`${target.x}-${target.y}`, occupant ? 'capture' : 'empty');
+    const group = confirmedState.legalMoves.find((candidate) => candidate.pieceId === piece.id);
+    for (const target of group?.targets ?? []) {
+      hints.set(`${target.position.x}-${target.position.y}`, target.kind);
     }
 
     return hints;
-  }, [displayState, selectedPosition, isMyTurn, mySide]);
+  }, [confirmedState, selectedPosition, isMyTurn, mySide]);
 
   const handleCellClick = (position: Position) => {
     // 旁观者只读：不产生任何选中态、乐观局面或网络消息。
@@ -248,7 +233,7 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
       return;
     }
 
-    const piece = getPieceAt(displayState, position);
+    const piece = getPieceViewAt(displayState.pieces, position);
 
     // 1. 点击暗子 -> 翻牌
     if (piece && !piece.revealed) {
@@ -678,9 +663,13 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
 
       <NegotiationToast event={game.negotiationEvent} />
 
-      {settlement && !replay ? (
+      {settlement ? (
         <GameResultDialog
-          recordControls={record ? <GameRecordControls record={record} onReplay={setReplay} /> : undefined}
+          recordControls={
+            <p className="room-hint" data-testid="online-record-unavailable">
+              联机对局棋谱将在后续版本提供；当前仅本地对局可导出与复盘。
+            </p>
+          }
           onLeave={onExit}
           onRematch={() => client.sendLobbyReturn('rematch')}
           onReturnLobby={() => client.sendLobbyReturn('return-lobby')}
@@ -688,7 +677,6 @@ export function OnlineGame({ client, connection, onExit }: OnlineGameProps) {
           viewerSide={isSpectator ? null : mySide}
         />
       ) : null}
-      <RecordReplay record={replay} perspective={mySide} onClose={closeReplay} />
     </div>
   );
 }
