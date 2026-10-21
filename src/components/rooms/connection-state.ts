@@ -16,4 +16,7 @@ export const IDLE_CONNECTION_STATE: ConnectionState = {
   rtt: null,
   reconnecting: false,
   justReconnected: false,
+  records: [],
+  recordResult: null,
+  recordError: null,
 };

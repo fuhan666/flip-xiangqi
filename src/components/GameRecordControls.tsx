@@ -1,15 +1,21 @@
 import { useRef, useState } from 'react';
 import type { Camp } from '../game';
 import { copyText } from './rooms/clipboard';
-import { downloadRecord, parseRecord, recordJSON, recordText } from '../records/record';
+import { downloadRecord } from '../records/download.js';
+import { parseRecord, recordJSON, recordText } from '../records/record';
 import type { GameRecord } from '../records/record';
 import { ReplayViewer } from './ReplayViewer';
 
-export function GameRecordControls({ record, onReplay }: { record: GameRecord; onReplay: (record: GameRecord) => void }) {
+/**
+ * `source` 用于联机终局：复制/下载必须使用服务器返回的原文，
+ * 不在客户端按当前局面重新生成；本地记录不传 `source`，沿用本地制谱。
+ */
+export function GameRecordControls({ record, onReplay, source }: { record: GameRecord; onReplay: (record: GameRecord) => void; source?: { text: string; json: string } }) {
   const [expanded, setExpanded] = useState(false);
   const [notice, setNotice] = useState('');
+  const content = (format: 'txt' | 'json') => source ? (format === 'txt' ? source.text : source.json) : (format === 'txt' ? recordText(record) : recordJSON(record));
   const copy = async (format: 'txt' | 'json') => {
-    const ok = await copyText(format === 'txt' ? recordText(record) : recordJSON(record));
+    const ok = await copyText(content(format));
     setNotice(ok ? '棋谱已复制' : '复制失败，请下载棋谱文件');
   };
   return <section className="record-controls" aria-label="棋谱操作">
@@ -17,8 +23,8 @@ export function GameRecordControls({ record, onReplay }: { record: GameRecord; o
     {expanded ? <div className="record-actions">
       <button type="button" onClick={() => void copy('txt')}>复制文本</button>
       <button type="button" onClick={() => void copy('json')}>复制 JSON</button>
-      <button type="button" onClick={() => downloadRecord(record, 'txt')}>下载 TXT</button>
-      <button type="button" onClick={() => downloadRecord(record, 'json')}>下载 JSON</button>
+      <button type="button" onClick={() => downloadRecord(record, 'txt', content('txt'))}>下载 TXT</button>
+      <button type="button" onClick={() => downloadRecord(record, 'json', content('json'))}>下载 JSON</button>
     </div> : null}
     {notice ? <p role="status">{notice}</p> : null}
   </section>;

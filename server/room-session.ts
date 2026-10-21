@@ -46,6 +46,9 @@ import {
   buildServerGameClock,
   buildServerGamePatch,
   buildServerGameReceipt,
+  buildServerGameRecord,
+  buildServerGameRecordUnavailable,
+  buildServerGameRecords,
   buildServerGameRejected,
   buildServerGameVersion,
   buildServerMessage,
@@ -61,6 +64,7 @@ import {
   type RoomClosedReason,
   type ServerErrorCode,
 } from '../src/network/protocol.js';
+import { FINISHED_RECORD_TTL_MS, FinishedRecordArchive, buildFinishedMatchRecord } from './finished-records.js';
 import { defaultLogger, type Logger } from './log.js';
 import {
   asMemberId,
@@ -125,6 +129,8 @@ export interface RoomSessionOptions {
   randomToken?: () => string;
   /** 会话自身关闭（房主离开、显式关房等）时通知宿主：由传输层补齐广播投递与监听资源释放。 */
   onClose?: (reason: RoomClosedReason) => void;
+  /** 终局棋谱保留时长（毫秒），默认 30 分钟；测试可注入受控值。 */
+  recordTtlMs?: number;
 }
 
 const DEFAULT_CLOCK_INTERVAL_MS = 1_000;
@@ -183,6 +189,8 @@ export class RoomSession {
   private readonly phraseCooldownUntil = new Map<string, number>();
   private readonly processedPhraseRequests = new Map<string, { event: QuickPhraseEvent }>();
   private readonly spectatorExpiryTimers = new Map<MemberId, NodeJS.Timeout>();
+  /** 本房已结算对局的临时棋谱：按 matchId 独立保存，过期或被关闭即不可用。 */
+  private readonly finishedRecords: FinishedRecordArchive;
 
   private lobby: LobbyState;
   private match: MatchState | null = null;
@@ -211,6 +219,10 @@ export class RoomSession {
     this.roomId = options.roomId ?? generateId();
     this.hostToken = options.hostToken ?? generateToken();
     this.lobby = createLobbyState();
+    this.finishedRecords = new FinishedRecordArchive({
+      nowFn: this.now,
+      ttlMs: options.recordTtlMs ?? FINISHED_RECORD_TTL_MS,
+    });
   }
 
   get isClosed(): boolean {
@@ -304,6 +316,7 @@ export class RoomSession {
             lobby: this.getLobby(),
             ...(resumeToken ? { resumeToken } : {}),
             ...(this.match ? { game: projectMatchSnapshot(this.match, this.now()) } : {}),
+            records: this.finishedRecords.summaries(),
           },
         }),
       );
@@ -343,6 +356,10 @@ export class RoomSession {
       }
       if (message.type === 'game.version') {
         this.handleGameVersion(connection, message);
+        return;
+      }
+      if (message.type === 'game.record.request') {
+        this.handleGameRecordRequest(connection, member, message);
         return;
       }
       this.rejectSpectatorAction(connection, message);
@@ -391,6 +408,11 @@ export class RoomSession {
 
     if (message.type === 'game.version') {
       this.handleGameVersion(connection, message);
+      return;
+    }
+
+    if (message.type === 'game.record.request') {
+      this.handleGameRecordRequest(connection, member, message);
       return;
     }
 
@@ -516,6 +538,7 @@ export class RoomSession {
     this.processedPhraseRequests.clear();
     this.guestResumeToken = null;
     this.match = null;
+    this.finishedRecords.dispose();
 
     this.onClose?.(reason);
     this.logger('room.closed', { room: this.roomId, reason });
@@ -1544,6 +1567,110 @@ export class RoomSession {
   }
 
   /**
+   * 结算即冻结：同一 matchId 只归档一次，过期与被关闭后不再可用。
+   * 归档失败时记录日志但不阻断对局发布；随后请求会得到明确的不可用原因。
+   */
+  private archiveFinishedMatch(): void {
+    const match = this.match;
+    if (!match || !match.settlement || this.finishedRecords.has(match.matchId)) {
+      return;
+    }
+    try {
+      const { json, text } = buildFinishedMatchRecord(match);
+      const entry = this.finishedRecords.archive({
+        roomId: this.roomId,
+        matchId: match.matchId,
+        memberIds: [match.startParameters.redMemberId, match.startParameters.blackMemberId],
+        endedAt: match.settlement.endedAt,
+        json,
+        text,
+      });
+      if (!entry) {
+        return;
+      }
+      this.logger('record.archived', {
+        room: this.roomId,
+        matchId: entry.matchId,
+        expiresAt: entry.expiresAt,
+      });
+      this.broadcast(
+        buildServerMessage(buildServerGameRecords(this.roomId, { records: this.finishedRecords.summaries() })),
+      );
+    } catch (error) {
+      this.logger('record.archive_failed', {
+        room: this.roomId,
+        matchId: match.matchId,
+        reason: error instanceof Error ? error.message : 'unknown',
+      });
+    }
+  }
+
+  /**
+   * 只读终局棋谱请求：先完成握手/当前连接/房间归属校验（分发层已做），
+   * 再按冻结参与者或本房获准旁观者授权，最后只查本会话档案。
+   */
+  private handleGameRecordRequest(
+    connection: SessionConnection,
+    member: RoomMemberRecord,
+    message: Extract<ClientMessage, { type: 'game.record.request' }>,
+  ): void {
+    if (message.roomId !== this.roomId) {
+      this.reject(connection, 'INVALID_MESSAGE', 'room-id-mismatch');
+      return;
+    }
+
+    const matchId = message.payload.matchId;
+    const entry = this.finishedRecords.get(matchId);
+    if (!entry) {
+      const inProgress = this.match?.matchId === matchId && this.match.settlement === null;
+      connection.send(
+        buildServerMessage(
+          buildServerGameRecordUnavailable(this.roomId, {
+            requestId: message.requestId,
+            matchId,
+            code: inProgress ? 'NOT_FINISHED' : 'UNAVAILABLE',
+            message: inProgress ? '对局尚未结束，暂不能获取棋谱' : '棋谱不存在或已过期',
+          }),
+        ),
+      );
+      return;
+    }
+
+    const isParticipant = entry.memberIds.includes(member.memberId);
+    if (!isParticipant && member.role !== 'spectator') {
+      connection.send(
+        buildServerMessage(
+          buildServerGameRecordUnavailable(this.roomId, {
+            requestId: message.requestId,
+            matchId,
+            code: 'FORBIDDEN',
+            message: '无权读取该房间的棋谱',
+          }),
+        ),
+      );
+      return;
+    }
+
+    this.logger('record.served', {
+      room: this.roomId,
+      matchId,
+      member: member.memberId,
+      role: member.role,
+    });
+    connection.send(
+      buildServerMessage(
+        buildServerGameRecord(this.roomId, {
+          requestId: message.requestId,
+          matchId,
+          expiresAt: entry.expiresAt,
+          json: entry.json,
+          text: entry.text,
+        }),
+      ),
+    );
+  }
+
+  /**
    * 已接受动作命中：同一 requestId 只在同一对局的同一成员下才算重复。
    * 旧局或另一成员的请求即使撞了 ID 也按新请求处理。
    */
@@ -1614,6 +1741,8 @@ export class RoomSession {
       this.published = null;
       return;
     }
+    // 先幂等归档再发布结算：客户端看到结算后立刻请求也能取到同一份冻结棋谱。
+    this.archiveFinishedMatch();
     const next = projectMatchSnapshot(this.match, this.now());
     const previous = this.published;
 
@@ -1818,6 +1947,8 @@ export class RoomSession {
       this.stopClockBroadcast();
       this.clearClockTimer();
       this.clearNegotiationTimer();
+      // 清当前局前确保档案已落地；已归档的旧记录不受再局影响。
+      this.archiveFinishedMatch();
       this.match = null;
       this.published = null;
       this.processedActions.clear();

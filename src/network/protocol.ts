@@ -74,14 +74,14 @@ import { parseMatchEvents, type MatchEvent } from './match.js';
 import { parsePublicGamePatch, type PublicGameDelta, type PublicGamePatch } from './public-patch.js';
 
 /**
- * v9：常规棋局变化只下发公开增量补丁。
+ * v10：终局后由服务端交付权威棋谱。
  *
- * - welcome / 显式同步仍是完整公开快照（game.state）；
- * - 常规走棋、协商、结算只发 game.patch；
- * - 5 秒巡检用 game.version 核对版本，不再请求完整棋局；
- * - game.rejected 只带权威版本与原因，不再夹带棋局快照。
+ * - 延续 v9 的公开增量补丁与 game.version 巡检；
+ * - 新增 game.record.request / game.record / game.record.unavailable / game.records：
+ *   只有已结算的对局会在限定时间内交出完整记录，且只回复已获准的本房连接；
+ * - 进行中的对局仍不暴露未翻身份与完整初始布局。
  */
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 10;
 
 /** WebSocket 握手路径（房间服务同时在该路径上提供客人页面）。 */
 export const WS_PATH = '/ws';
@@ -226,6 +226,12 @@ export type ClientMessage =
       payload: { matchId: string | null; revision: number | null };
     })
   | (Envelope & {
+      type: 'game.record.request';
+      requestId: string;
+      roomId: string;
+      payload: { matchId: string };
+    })
+  | (Envelope & {
       type: 'chat.phrase';
       requestId: string;
       roomId: string;
@@ -236,6 +242,16 @@ export interface LobbyRejection {
   code: LobbyRejectCode;
   message: string;
 }
+
+/** 本房已结算对局的临时档案摘要：只含标识与到期时间，不含任何布局。 */
+export interface FinishedRecordSummary {
+  matchId: string;
+  endedAt: number;
+  expiresAt: number;
+}
+
+/** 棋谱不可用原因：进行中 / 无档或已过期 / 无权读取。 */
+export type RecordUnavailableCode = 'NOT_FINISHED' | 'UNAVAILABLE' | 'FORBIDDEN';
 
 export type ServerMessage =
   | (Envelope & {
@@ -250,6 +266,8 @@ export type ServerMessage =
         lobby: LobbyState;
         resumeToken?: string;
         game?: PublicMatchSnapshot;
+        /** 本房未过期终局摘要；不含布局，仅供临时入口展示。 */
+        records?: FinishedRecordSummary[];
       };
     })
   | (Envelope & { type: 'members'; roomId: string; payload: { members: MemberSnapshot[] } })
@@ -310,6 +328,23 @@ export type ServerMessage =
       payload: { matchId: string | null; revision: number | null };
     })
   | (Envelope & {
+      type: 'game.record';
+      requestId: string;
+      roomId: string;
+      payload: { matchId: string; expiresAt: number; json: string; text: string };
+    })
+  | (Envelope & {
+      type: 'game.record.unavailable';
+      requestId: string;
+      roomId: string;
+      payload: { matchId: string | null; code: RecordUnavailableCode; message: string };
+    })
+  | (Envelope & {
+      type: 'game.records';
+      roomId: string;
+      payload: { records: FinishedRecordSummary[] };
+    })
+  | (Envelope & {
       type: 'game.receipt';
       roomId: string;
       payload: {
@@ -348,6 +383,26 @@ export type ParseResult<T> = { ok: true; message: T } | { ok: false; code: Serve
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseFinishedRecordSummaries(value: unknown): FinishedRecordSummary[] | null {
+  if (!Array.isArray(value) || value.length > 200) {
+    return null;
+  }
+  const records: FinishedRecordSummary[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) {
+      return null;
+    }
+    const { matchId, endedAt, expiresAt } = item;
+    if (typeof matchId !== 'string' || matchId.length === 0 ||
+      typeof endedAt !== 'number' || !Number.isSafeInteger(endedAt) || endedAt < 0 ||
+      typeof expiresAt !== 'number' || !Number.isSafeInteger(expiresAt) || expiresAt < 0) {
+      return null;
+    }
+    records.push({ matchId, endedAt, expiresAt });
+  }
+  return records;
 }
 
 function parseEnvelope(raw: string): ParseResult<Envelope> {
@@ -746,6 +801,29 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
     };
   }
 
+  if (message.type === 'game.record.request') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-record-room-id' };
+    }
+    if (typeof message.requestId !== 'string' || message.requestId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-record-request-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof payload.matchId !== 'string' || payload.matchId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-record-match-id' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.record.request',
+        requestId: message.requestId,
+        roomId: message.roomId,
+        payload: { matchId: payload.matchId },
+      },
+    };
+  }
+
   if (message.type === 'chat.phrase') {
     if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'chat-phrase-room-id' };
@@ -804,6 +882,10 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     if (payload.game !== undefined && !game) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'welcome-game' };
     }
+    const records = payload.records !== undefined ? parseFinishedRecordSummaries(payload.records) : undefined;
+    if (payload.records !== undefined && !records) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'welcome-records' };
+    }
     const defaultName = payload.role === 'host' ? '房主' : payload.role === 'guest' ? '客人' : '旁观';
     return {
       ok: true,
@@ -820,6 +902,7 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
           lobby,
           ...(typeof payload.resumeToken === 'string' ? { resumeToken: payload.resumeToken } : {}),
           ...(game ? { game } : {}),
+          ...(records ? { records } : {}),
         },
       },
     };
@@ -1057,6 +1140,106 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
         type: 'game.version',
         roomId: message.roomId,
         payload: { matchId: matchId as string | null, revision: revision as number | null },
+      },
+    };
+  }
+
+  if (message.type === 'game.record') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-record-room-id' };
+    }
+    if (typeof message.requestId !== 'string' || message.requestId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-record-request-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof payload.matchId !== 'string' || payload.matchId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-record-match-id' };
+    }
+    if (typeof payload.expiresAt !== 'number' || !Number.isSafeInteger(payload.expiresAt) || payload.expiresAt < 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-record-expires-at' };
+    }
+    if (typeof payload.json !== 'string' || typeof payload.text !== 'string') {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-record-body' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.record',
+        requestId: message.requestId,
+        roomId: message.roomId,
+        payload: {
+          matchId: payload.matchId,
+          expiresAt: payload.expiresAt,
+          json: payload.json,
+          text: payload.text,
+        },
+      },
+    };
+  }
+
+  if (message.type === 'game.record.unavailable') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-record-unavailable-room-id' };
+    }
+    if (typeof message.requestId !== 'string' || message.requestId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-record-unavailable-request-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    const matchId = payload.matchId;
+    if (matchId !== null && (typeof matchId !== 'string' || matchId.length === 0)) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-record-unavailable-match-id' };
+    }
+    if (payload.code !== 'NOT_FINISHED' && payload.code !== 'UNAVAILABLE' && payload.code !== 'FORBIDDEN') {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-record-unavailable-code' };
+    }
+    if (typeof payload.message !== 'string') {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-record-unavailable-message' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.record.unavailable',
+        requestId: message.requestId,
+        roomId: message.roomId,
+        payload: {
+          matchId: matchId as string | null,
+          code: payload.code,
+          message: payload.message,
+        },
+      },
+    };
+  }
+
+  if (message.type === 'game.records') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-records-room-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (!Array.isArray(payload.records) || payload.records.length > 200) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-records-list' };
+    }
+    const records: FinishedRecordSummary[] = [];
+    for (const item of payload.records) {
+      if (!isRecord(item)) {
+        return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-records-item' };
+      }
+      const { matchId, endedAt, expiresAt } = item;
+      if (typeof matchId !== 'string' || matchId.length === 0 ||
+        typeof endedAt !== 'number' || !Number.isSafeInteger(endedAt) || endedAt < 0 ||
+        typeof expiresAt !== 'number' || !Number.isSafeInteger(expiresAt) || expiresAt < 0) {
+        return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-records-item' };
+      }
+      records.push({ matchId, endedAt, expiresAt });
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.records',
+        roomId: message.roomId,
+        payload: { records },
       },
     };
   }
@@ -1463,6 +1646,62 @@ export function buildServerGameVersion(
     roomId,
     ...(payload.requestId ? { requestId: payload.requestId } : {}),
     payload: { matchId: payload.matchId, revision: payload.revision },
+  };
+}
+
+export function buildClientGameRecordRequest(
+  roomId: string,
+  input: { requestId: string; matchId: string },
+): ClientMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.record.request',
+    requestId: input.requestId,
+    roomId,
+    payload: { matchId: input.matchId },
+  };
+}
+
+export function buildServerGameRecord(
+  roomId: string,
+  payload: { requestId: string; matchId: string; expiresAt: number; json: string; text: string },
+): ServerMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.record',
+    requestId: payload.requestId,
+    roomId,
+    payload: {
+      matchId: payload.matchId,
+      expiresAt: payload.expiresAt,
+      json: payload.json,
+      text: payload.text,
+    },
+  };
+}
+
+export function buildServerGameRecordUnavailable(
+  roomId: string,
+  payload: { requestId: string; matchId: string | null; code: RecordUnavailableCode; message: string },
+): ServerMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.record.unavailable',
+    requestId: payload.requestId,
+    roomId,
+    payload: { matchId: payload.matchId, code: payload.code, message: payload.message },
+  };
+}
+
+export function buildServerGameRecords(
+  roomId: string,
+  payload: { records: FinishedRecordSummary[] },
+): ServerMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.records',
+    roomId,
+    payload: { records: payload.records },
   };
 }
 
