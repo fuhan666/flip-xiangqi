@@ -1,4 +1,4 @@
-import { cloneState, getPieceAt, otherCamp, positionsEqual, restoreState, snapshotState } from './state.js';
+import { clonePieces, cloneState, getPieceAt, otherCamp, positionsEqual } from './state.js';
 import { createInitialGameState } from './setup.js';
 import { hasAnyLegalAction, isInCheck, validateMove, violatesFacingKings } from './move-rules.js';
 import type {
@@ -13,6 +13,7 @@ import type {
   GameState,
   HistoryPieceSnapshot,
   Piece,
+  UndoEntry,
 } from './types.js';
 
 interface TurnResolution {
@@ -35,6 +36,27 @@ function withError(state: GameState, message: string): GameState {
   };
 }
 
+/** 撤销点只记录本步改变棋子的前置值与被覆盖的标量，不携带历史或另一条撤销栈。 */
+function makeUndoEntry(state: GameState, changedPieceIds: string[]): UndoEntry {
+  return {
+    historyLength: state.actionHistory.length,
+    pieces: changedPieceIds.map((id) => {
+      const piece = state.pieces.find((candidate) => candidate.id === id)!;
+      return {
+        id,
+        revealed: piece.revealed,
+        captured: piece.captured,
+        position: piece.position ? { ...piece.position } : null,
+      };
+    }),
+    currentTurn: state.currentTurn,
+    winner: state.winner,
+    checkedCamp: state.checkedCamp,
+    lastError: state.lastError,
+    statusMessage: state.statusMessage,
+  };
+}
+
 function snapshotPiece(piece: Piece): HistoryPieceSnapshot {
   return {
     id: piece.id,
@@ -50,7 +72,8 @@ function recordHistory(
   action: GameHistoryAction,
   consequences: GameHistoryConsequence[],
   resolution: TurnResolution,
-  timeContext?: ActionTimeContext | number | null,
+  timeContext: ActionTimeContext | number | null | undefined,
+  changedPieceIds: string[],
 ): GameState {
   const stepNumber = state.actionHistory.length + 1;
   const turnNumber = stepNumber;
@@ -90,9 +113,9 @@ function recordHistory(
     durationSeconds,
   };
 
-  resolution.state.actionHistory = [...resolution.state.actionHistory, entry];
+  resolution.state.actionHistory = [...state.actionHistory, entry];
   resolution.state.recentAction = entry;
-  resolution.state.undoStack = [...state.undoStack, snapshotState(state)];
+  resolution.state.undoStack = [...state.undoStack, makeUndoEntry(state, changedPieceIds)];
   return resolution.state;
 }
 
@@ -199,6 +222,7 @@ function applyFlip(
     consequences,
     resolution,
     timeContext,
+    [target.id],
   );
 }
 
@@ -265,6 +289,7 @@ function applyMove(
     consequences,
     resolution,
     timeContext,
+    target ? [piece.id, target.id] : [piece.id],
   );
 }
 
@@ -285,13 +310,32 @@ export function applyAction(
 }
 
 export function undoLastAction(state: GameState): GameState {
-  if (state.undoStack.length === 0) {
+  const undoEntry = state.undoStack[state.undoStack.length - 1];
+  if (!undoEntry) {
     return cloneState(state);
   }
 
-  const nextUndoStack = state.undoStack.slice(0, -1);
-  const previousState = state.undoStack[state.undoStack.length - 1];
-  return restoreState(previousState, nextUndoStack);
+  const pieces = clonePieces(state.pieces);
+  for (const saved of undoEntry.pieces) {
+    const piece = pieces.find((candidate) => candidate.id === saved.id)!;
+    piece.revealed = saved.revealed;
+    piece.captured = saved.captured;
+    piece.position = saved.position ? { ...saved.position } : null;
+  }
+
+  // 裁剪有效历史尾部，recentAction 从剩余历史恢复。
+  const actionHistory = state.actionHistory.slice(0, undoEntry.historyLength);
+  return {
+    pieces,
+    currentTurn: undoEntry.currentTurn,
+    winner: undoEntry.winner,
+    checkedCamp: undoEntry.checkedCamp,
+    lastError: undoEntry.lastError,
+    statusMessage: undoEntry.statusMessage,
+    actionHistory,
+    recentAction: actionHistory.length > 0 ? actionHistory[actionHistory.length - 1] : null,
+    undoStack: state.undoStack.slice(0, -1),
+  };
 }
 
 export function restartGame(rng?: () => number): GameState {

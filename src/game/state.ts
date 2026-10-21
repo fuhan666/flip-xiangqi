@@ -9,6 +9,8 @@ import type {
   HistoryPieceSnapshot,
   Piece,
   Position,
+  RuleState,
+  UndoEntry,
 } from './types.js';
 
 function clonePosition(position: Position | null): Position | null {
@@ -21,6 +23,12 @@ function clonePiece(piece: Piece): Piece {
     position: clonePosition(piece.position),
   };
 }
+
+/** 复制棋子数组（局面数据）；历史、撤销与开局快照不在此复制。 */
+export function clonePieces(pieces: Piece[]): Piece[] {
+  return pieces.map(clonePiece);
+}
+
 function cloneHistoryPieceSnapshot(piece: HistoryPieceSnapshot): HistoryPieceSnapshot {
   return {
     ...piece,
@@ -78,7 +86,7 @@ export function cloneStateSnapshot(snapshot: GameStateSnapshot): GameStateSnapsh
     checkedCamp: snapshot.checkedCamp,
     lastError: snapshot.lastError,
     statusMessage: snapshot.statusMessage,
-    pieces: snapshot.pieces.map(clonePiece),
+    pieces: clonePieces(snapshot.pieces),
     actionHistory: snapshot.actionHistory.map(cloneHistoryEntry),
     recentAction: snapshot.recentAction ? cloneHistoryEntry(snapshot.recentAction) : null,
   };
@@ -88,10 +96,14 @@ export function snapshotState(state: GameState): GameStateSnapshot {
   return cloneStateSnapshot(state);
 }
 
-export function restoreState(snapshot: GameStateSnapshot, undoStack: GameStateSnapshot[]): GameState {
+/**
+ * 从可传输/复盘快照恢复权威游戏状态。
+ * 撤销记录视为不可变数据：只复制数组本身，不复制单条记录。
+ */
+export function restoreState(snapshot: GameStateSnapshot, undoStack: UndoEntry[] = []): GameState {
   return {
     ...cloneStateSnapshot(snapshot),
-    undoStack: undoStack.map(cloneStateSnapshot),
+    undoStack: [...undoStack],
   };
 }
 
@@ -137,19 +149,28 @@ export function createBasePieces(): Piece[] {
   ];
 }
 
+/**
+ * 复制权威游戏状态的可变容器：棋子逐枚复制；
+ * 历史条目与撤销记录创建后不可变，按引用共享，不再整段深拷贝。
+ */
 export function cloneState(state: GameState): GameState {
-  return restoreState(snapshotState(state), state.undoStack);
+  return {
+    ...state,
+    pieces: clonePieces(state.pieces),
+    actionHistory: [...state.actionHistory],
+    undoStack: [...state.undoStack],
+  };
 }
 
 export function positionsEqual(left: Position, right: Position): boolean {
   return left.x === right.x && left.y === right.y;
 }
 
-export function getPieceAt(state: GameState, position: Position): Piece | undefined {
+export function getPieceAt(state: RuleState, position: Position): Piece | undefined {
   return state.pieces.find((piece) => !piece.captured && piece.position && positionsEqual(piece.position, position));
 }
 
-export function findKing(state: GameState, camp: Camp): Piece | undefined {
+export function findKing(state: RuleState, camp: Camp): Piece | undefined {
   return state.pieces.find((piece) => piece.type === 'king' && piece.camp === camp && !piece.captured);
 }
 

@@ -8,6 +8,7 @@ import {
   parseMatchSnapshot,
   parsePiece,
   snapshotMatch,
+  undoMatchAction,
 } from '../match.js';
 import { buildStartParameters } from '../lobby.js';
 import { getPieceAt } from '../../game/index.js';
@@ -174,11 +175,13 @@ describe('match engine and deterministic RNG', () => {
       hostSide: 'red',
     });
 
+    const validInitial = { ...validSnapshot, actionHistory: [] };
     const matchSnap = {
       matchId: 'm1',
       seed: 42,
       stepNumber: 0,
       startParameters,
+      initial: validInitial,
       gameState: validSnapshot,
     };
 
@@ -192,10 +195,71 @@ describe('match engine and deterministic RNG', () => {
     expect(parseGameStateSnapshot({ ...validSnapshot, currentTurn: 'invalid' })).toBeNull();
 
     expect(parseMatchSnapshot(matchSnap)).not.toBeNull();
+    // initial 必填且只能是开局帧：缺失、已推进或有胜者都拒绝，不提供从 seed 重建的兜底。
+    expect(parseMatchSnapshot({ ...matchSnap, initial: undefined })).toBeNull();
+    expect(parseMatchSnapshot({ ...matchSnap, initial: validSnapshot })).toBeNull();
+    expect(parseMatchSnapshot({ ...matchSnap, initial: { ...validInitial, winner: 'red' } })).toBeNull();
     expect(parseMatchSnapshot({ ...matchSnap, seed: -1 })).toBeNull();
     expect(parseMatchSnapshot({ ...matchSnap, seed: 0x100000000 })).toBeNull();
     expect(parseMatchSnapshot({ ...matchSnap, stepNumber: -1 })).toBeNull();
     expect(parseMatchSnapshot({ ...matchSnap, stepNumber: 1.5 })).toBeNull();
     expect(parseMatchSnapshot({ ...matchSnap, stepNumber: Number.MAX_SAFE_INTEGER + 1 })).toBeNull();
+  });
+
+  it('keeps the opening frame across actions and consecutive undos and restores clock checkpoints in step', () => {
+    let now = 1_000_000;
+    const startParameters = buildStartParameters({
+      roomId: 'room-undo',
+      host: { memberId: 'host-1', name: '房主' },
+      guest: { memberId: 'guest-1', name: '客人' },
+      settings: { sidePreference: 'host-red', timeControlId: 'standard', locked: true, settingsVersion: 1 },
+      hostSide: 'red',
+    });
+    const match = createMatch({ matchId: 'm-undo', seed: 5, startParameters, nowFn: () => now, initialTime: now });
+    const opening = snapshotMatch(match, now).initial;
+    const openingJSON = JSON.stringify(opening);
+    expect(opening.actionHistory).toHaveLength(0);
+
+    now += 3000;
+    const firstHidden = match.gameState.pieces.find((p) => !p.revealed && p.position)!;
+    const first = applyMatchAction(match, startParameters.redMemberId, { type: 'flip', position: firstHidden.position! }, now);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    now += 2000;
+    const secondHidden = first.match.gameState.pieces.find((p) => !p.revealed && p.position)!;
+    const second = applyMatchAction(first.match, startParameters.blackMemberId, { type: 'flip', position: secondHidden.position! }, now);
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+
+    expect(second.match.gameState.actionHistory).toHaveLength(2);
+    expect(second.match.clock.getSnapshot(now).turn).toBe(second.match.gameState.currentTurn);
+    expect(JSON.stringify(second.match.initial)).toBe(openingJSON);
+
+    const undo1 = undoMatchAction(second.match, now);
+    expect(undo1.ok).toBe(true);
+    if (!undo1.ok) return;
+    expect(undo1.match.gameState.currentTurn).toBe('black');
+    expect(undo1.match.gameState.actionHistory).toHaveLength(1);
+    expect(undo1.match.clock.getSnapshot(now).turn).toBe('black');
+    expect(JSON.stringify(undo1.match.initial)).toBe(openingJSON);
+
+    const undo2 = undoMatchAction(undo1.match, now);
+    expect(undo2.ok).toBe(true);
+    if (!undo2.ok) return;
+    // 回到开局：棋盘、回合、历史与时钟行动方一致；已耗思考时间保留（不返还），符合既有计费语义。
+    expect(undo2.match.gameState.currentTurn).toBe('red');
+    expect(undo2.match.gameState.actionHistory).toHaveLength(0);
+    expect(undo2.match.gameState.recentAction).toBeNull();
+    expect(undo2.match.stepNumber).toBe(0);
+    expect(undo2.match.revision).toBe(4);
+    const clock = undo2.match.clock.getSnapshot(now);
+    expect(clock.turn).toBe('red');
+    // 检查点在“已扣本步思考时间、未切换回合”时保存：撤销回第 1 步前保留红方 3s 计费，
+    // 黑方尚未开始该步，因此仍为满时；这是既有计费语义，本阶段不改成返还时间。
+    expect(clock.red.baseTimeRemainingMs).toBe(1_200_000 - 3000);
+    expect(clock.black.baseTimeRemainingMs).toBe(1_200_000);
+    expect(undo2.match.clock.getCurrentStepDurationMs()).toBe(3000);
+    expect(JSON.stringify(undo2.match.initial)).toBe(openingJSON);
   });
 });

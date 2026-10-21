@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { createRecord, parseRecord, recordJSON, recordText, replayFrame } from '../record';
 import { snapshotState } from '../../game';
+import { applyMatchAction, createMatch, snapshotMatch } from '../../network/match';
+import { buildStartParameters } from '../../network/lobby';
 import { playedGame } from './fixture';
 
 function fixture() {
@@ -58,5 +60,45 @@ describe('game record projection and validation', () => {
     damage(record);
     record.final.actionHistory = record.moves;
     expect(() => parseRecord(recordJSON(record))).toThrow();
+  });
+
+  it('exports local and LAN games in the same schema with the full opening and valid main line', () => {
+    let now = 1_000_000;
+    const startParameters = buildStartParameters({
+      roomId: 'record-room',
+      host: { memberId: 'host-1', name: '房主' },
+      guest: { memberId: 'guest-1', name: '客人' },
+      settings: { sidePreference: 'host-red', timeControlId: 'standard', locked: true, settingsVersion: 1 },
+      hostSide: 'red',
+    });
+    let match = createMatch({ matchId: 'm-record', seed: 42, startParameters, nowFn: () => now, initialTime: now });
+    const opening = snapshotMatch(match, now).initial;
+
+    for (let step = 0; step < 4; step += 1) {
+      const actor = match.gameState.currentTurn === 'red' ? startParameters.redMemberId : startParameters.blackMemberId;
+      const hidden = match.gameState.pieces.find((p) => !p.revealed && p.position)!;
+      now += 1000;
+      const result = applyMatchAction(match, actor, { type: 'flip', position: hidden.position! }, now);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      match = result.match;
+    }
+    expect(match.gameState.actionHistory).toHaveLength(4);
+    expect(match.gameState.undoStack).toHaveLength(4);
+
+    const online = createRecord(opening, snapshotState(match.gameState), { mode: 'online', seed: 42, seats: { red: '房主', black: '客人' } }, { winner: null, reason: 'draw-agreement', durationSeconds: 4, timeBasis: 'player-clocks' });
+    const local = createRecord(opening, snapshotState(match.gameState), { mode: 'local', seats: { red: '本地红方', black: '本地黑方' } }, { winner: null, reason: 'draw-agreement', durationSeconds: 4, timeBasis: 'elapsed' });
+
+    for (const source of [online, local]) {
+      const loaded = parseRecord(recordJSON(source));
+      expect(loaded.schemaVersion).toBe(1);
+      expect(loaded.initial).toEqual(opening);
+      expect(loaded.initial.actionHistory).toHaveLength(0);
+      expect(loaded.moves).toHaveLength(4);
+      expect(snapshotState(replayFrame(loaded, 0))).toEqual(opening);
+      expect(snapshotState(replayFrame(loaded, 4))).toEqual(snapshotState(match.gameState));
+    }
+    expect(online.moves).toEqual(local.moves);
+    expect(online.final.pieces).toEqual(local.final.pieces);
   });
 });

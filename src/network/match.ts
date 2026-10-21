@@ -2,9 +2,9 @@
  * 权威对局模型与动作仲裁：
  * - 共享确定性种子随机源（uint32 LCG）；
  * - 权威开局初始化、步数递增、行棋方校验与规则校验；
- * - 可传输的对局快照（去除 undoStack）。
+ * - 可传输的对局快照（去除 undoStack），并独立携带开局帧 initial。
  */
-import { applyAction, createInitialGameState, snapshotState, undoLastAction } from '../game/index.js';
+import { applyAction, cloneStateSnapshot, createInitialGameState, snapshotState, undoLastAction } from '../game/index.js';
 import type { GameAction, GameHistoryEntry, GameState, GameStateSnapshot, Piece, PieceType, Position } from '../game/index.js';
 import { parseStartParameters, type StartParameters } from './lobby.js';
 import {
@@ -69,6 +69,8 @@ export interface MatchState {
   stepNumber: number;
   revision: number;
   startParameters: StartParameters;
+  /** 独立保存的开局帧（空历史、无撤销），棋局推进与撤销都不改变它。 */
+  initial: GameStateSnapshot;
   gameState: GameState;
   clock: MatchClock;
   settlement: MatchSettlement | null;
@@ -85,6 +87,7 @@ export interface MatchSnapshot {
   stepNumber: number;
   revision: number;
   startParameters: StartParameters;
+  initial: GameStateSnapshot;
   gameState: GameStateSnapshot;
   clock: MatchClockSnapshot;
   settlement: MatchSettlement | null;
@@ -256,6 +259,21 @@ export function parseGameStateSnapshot(value: unknown): GameStateSnapshot | null
   };
 }
 
+/**
+ * 开局帧：合法快照且仅含开局内容（空历史、无最近动作、未分胜负）。
+ * initial 必填且只接受开局帧，不提供从 seed/undo/当前盘面重建的路径。
+ */
+export function parseOpeningSnapshot(value: unknown): GameStateSnapshot | null {
+  const snapshot = parseGameStateSnapshot(value);
+  if (!snapshot) {
+    return null;
+  }
+  if (snapshot.actionHistory.length !== 0 || snapshot.recentAction !== null || snapshot.winner !== null) {
+    return null;
+  }
+  return snapshot;
+}
+
 function parseHistoryEntry(item: unknown): GameHistoryEntry | null {
   if (!item || typeof item !== 'object') {
     return null;
@@ -413,6 +431,11 @@ export function parseMatchSnapshot(value: unknown): MatchSnapshot | null {
     return null;
   }
 
+  const initial = parseOpeningSnapshot(raw.initial);
+  if (!initial) {
+    return null;
+  }
+
   let clock: MatchClockSnapshot | null = null;
   if (raw.clock) {
     clock = parseMatchClockSnapshot(raw.clock);
@@ -443,6 +466,7 @@ export function parseMatchSnapshot(value: unknown): MatchSnapshot | null {
     stepNumber: raw.stepNumber,
     revision,
     startParameters,
+    initial,
     gameState,
     clock,
     settlement,
@@ -478,6 +502,7 @@ export function createMatch(input: {
     stepNumber: 0,
     revision: 0,
     startParameters: input.startParameters,
+    initial: snapshotState(gameState),
     gameState,
     clock,
     settlement: null,
@@ -496,6 +521,7 @@ export function snapshotMatch(match: MatchState, now?: number): MatchSnapshot {
     stepNumber: match.stepNumber,
     revision: match.revision,
     startParameters: match.startParameters,
+    initial: cloneStateSnapshot(match.initial),
     gameState: snapshotState(match.gameState),
     clock: match.clock.getSnapshot(now),
     settlement: match.settlement ?? match.clock.getSettlement(),
