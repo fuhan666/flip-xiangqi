@@ -5,8 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server/start.ts --dev",
+    "dev:online": "npm run build && tsx server/online-start.ts",
     "build": "tsc -b && vite build && tsc -p tsconfig.server.json && tsc -p tsconfig.tests.json",
     "start": "node dist-server/server/start.js",
+    "start:online": "node dist-server/server/online-start.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",

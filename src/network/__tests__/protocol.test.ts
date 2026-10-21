@@ -9,6 +9,7 @@ import {
   buildClientLobbyReady,
   buildClientLobbyReturn,
   buildClientLobbySettings,
+  buildClientOnlineHello,
   buildPing,
   buildPong,
   buildServerGameClock,
@@ -594,5 +595,50 @@ describe('spectator identity', () => {
       }),
     );
     expect(rejection.ok).toBe(true);
+  });
+
+  it('parses the online handshake without any identity fields', () => {
+    const hello = parseClientMessage(encodeMessage(buildClientOnlineHello('room-online')));
+    expect(hello.ok).toBe(true);
+    if (hello.ok && hello.message.type === 'online.hello') {
+      expect(hello.message.roomId).toBe('room-online');
+      expect(hello.message.payload).toEqual({});
+    }
+
+    // 任何自报身份/角色/密钥字段都按非法报文拒绝。
+    for (const payload of [
+      { role: 'host' },
+      { name: 'x' },
+      { token: 'secret' },
+      { resumeToken: 'secret' },
+      { identityId: 'someone' },
+      { memberId: 'someone' },
+    ]) {
+      const forged = parseClientMessage(
+        JSON.stringify({ version: PROTOCOL_VERSION, type: 'online.hello', roomId: 'room-online', payload }),
+      );
+      expect(forged.ok).toBe(false);
+      if (!forged.ok) {
+        expect(forged.detail).toBe('online-hello-payload');
+      }
+    }
+
+    const withoutRoom = parseClientMessage(
+      JSON.stringify({ version: PROTOCOL_VERSION, type: 'online.hello', roomId: null, payload: {} }),
+    );
+    expect(withoutRoom.ok).toBe(false);
+    if (!withoutRoom.ok) {
+      expect(withoutRoom.detail).toBe('online-hello-room-id');
+    }
+  });
+
+  it('rejects a protocol version other than the current one on the online handshake', () => {
+    const stale = parseClientMessage(
+      JSON.stringify({ version: PROTOCOL_VERSION - 1, type: 'online.hello', roomId: 'room-online', payload: {} }),
+    );
+    expect(stale.ok).toBe(false);
+    if (!stale.ok) {
+      expect(stale.code).toBe('VERSION_MISMATCH');
+    }
   });
 });

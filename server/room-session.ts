@@ -72,8 +72,10 @@ import {
   generateId,
   generateToken,
   type ConnectionId,
+  type IdentityId,
   type IdentityResolver,
   type MemberId,
+  type RoomIdentity,
   type RoomMemberRecord,
 } from './room-identity.js';
 
@@ -103,7 +105,21 @@ interface SessionConnectionRecord {
   helloDone: boolean;
   /** 本连接当前承载的席位；主动离开后置空，被替换时保留以便拒绝迟到消息。 */
   member: RoomMemberRecord | null;
+  /** 在线模式：传输层已按匿名凭据解析出的可信身份；LAN 模式为 null。 */
+  identity: RoomIdentity | null;
 }
+
+/** 传输层准入上下文：在线连接必须携带已校验的可信身份。 */
+export interface ConnectionAdmission {
+  identity: RoomIdentity;
+}
+
+/**
+ * 房间接入模式：
+ * - lan：局域网单房间，沿用 hostToken / guest resumeToken 与等待阶段掉线关房；
+ * - online：单入口多房间，身份由服务器匿名凭据解析，掉线保留席位供本人恢复。
+ */
+export type RoomMode = 'lan' | 'online';
 
 export interface RoomSessionOptions {
   /** 房间号；缺省由服务端生成。 */
@@ -131,6 +147,10 @@ export interface RoomSessionOptions {
   onClose?: (reason: RoomClosedReason) => void;
   /** 终局棋谱保留时长（毫秒），默认 30 分钟；测试可注入受控值。 */
   recordTtlMs?: number;
+  /** 接入模式，默认 lan（局域网单房间）。 */
+  mode?: RoomMode;
+  /** 在线模式下建房者的可信身份：只有该身份可取得房主席位。 */
+  ownerIdentityId?: IdentityId;
 }
 
 const DEFAULT_CLOCK_INTERVAL_MS = 1_000;
@@ -174,6 +194,8 @@ export class RoomSession {
   private readonly clockIntervalMs: number;
   private readonly spectatorResumeWindowMs: number;
   private readonly onClose: ((reason: RoomClosedReason) => void) | undefined;
+  private readonly mode: RoomMode;
+  private readonly ownerIdentityId: IdentityId | null;
 
   /** 连接登记：connectionId → 连接记录（含握手状态与承载席位）。 */
   private readonly connections = new Map<ConnectionId, SessionConnectionRecord>();
@@ -216,6 +238,8 @@ export class RoomSession {
     this.clockIntervalMs = options.clockIntervalMs ?? DEFAULT_CLOCK_INTERVAL_MS;
     this.spectatorResumeWindowMs = options.spectatorResumeWindowMs ?? DEFAULT_SPECTATOR_RESUME_WINDOW_MS;
     this.onClose = options.onClose;
+    this.mode = options.mode ?? 'lan';
+    this.ownerIdentityId = options.ownerIdentityId ?? null;
     this.roomId = options.roomId ?? generateId();
     this.hostToken = options.hostToken ?? generateToken();
     this.lobby = createLobbyState();
@@ -229,8 +253,12 @@ export class RoomSession {
     return this.closed;
   }
 
-  /** 接入一条传输层连接：仅登记连接，握手由首条 hello 完成。 */
-  attach(connection: SessionConnection): void {
+  /**
+   * 接入一条传输层连接：仅登记连接，握手由首条 hello / online.hello 完成。
+   * 在线模式下传输层必须先按服务器凭据解析出身份并在此登记；缺失则整条连接
+   * 只能收到 unauthorized，无法落座。
+   */
+  attach(connection: SessionConnection, admission?: ConnectionAdmission): void {
     if (this.closed) {
       connection.close(closeCodeForError('ROOM_CLOSED'), 'room-closed');
       return;
@@ -239,6 +267,7 @@ export class RoomSession {
       connection,
       helloDone: false,
       member: null,
+      identity: admission?.identity ?? null,
     });
   }
 
@@ -273,16 +302,35 @@ export class RoomSession {
     }
     const connection = record.connection;
 
-    if (message.type === 'hello') {
+    if (message.type === 'hello' || message.type === 'online.hello') {
       if (record.member) {
         this.reject(connection, 'INVALID_MESSAGE', 'duplicate-hello');
+        return;
+      }
+      // 两种入口不互通：在线房间拒绝 LAN 自报角色的握手，LAN 房间也不接纳无自报角色
+      // 的在线握手，避免任何入口以另一种入口的凭据模型落座。
+      if (this.mode === 'online' && message.type === 'hello') {
+        this.reject(connection, 'INVALID_MESSAGE', 'lan-hello-not-allowed');
+        return;
+      }
+      if (this.mode === 'lan' && message.type === 'online.hello') {
+        this.reject(connection, 'INVALID_MESSAGE', 'online-hello-not-allowed');
         return;
       }
       if (message.roomId !== null && message.roomId !== this.roomId) {
         this.reject(connection, 'INVALID_MESSAGE', 'room-id-mismatch');
         return;
       }
-      const member = this.admitMember(connection, message.payload);
+      let member: RoomMemberRecord | null;
+      if (message.type === 'hello') {
+        member = this.admitMember(connection, message.payload);
+      } else {
+        if (!record.identity) {
+          this.reject(connection, 'UNAUTHORIZED', 'online-identity-missing');
+          return;
+        }
+        member = this.admitOnlineMember(connection, record.identity);
+      }
       if (!member) {
         return;
       }
@@ -296,12 +344,15 @@ export class RoomSession {
       }
 
       // 恢复凭据按真实身份发放：客人用全局 guest token，旁观者用本人独立 token。
+      // 在线房间不使用 LAN 恢复凭据：身份由同源匿名凭据承载，welcome 不携带任何密钥。
       const resumeToken =
-        member.role === 'guest'
-          ? this.guestResumeToken ?? undefined
-          : member.role === 'spectator'
-            ? member.resumeToken
-            : undefined;
+        this.mode !== 'lan'
+          ? undefined
+          : member.role === 'guest'
+            ? this.guestResumeToken ?? undefined
+            : member.role === 'spectator'
+              ? member.resumeToken
+              : undefined;
 
       connection.send(
         buildServerMessage({
@@ -906,6 +957,15 @@ export class RoomSession {
         return;
       }
       this.logger('ws.host_dropped', { room: this.roomId, member: member.memberId });
+      if (this.mode === 'online') {
+        // 在线房间不以一次连接断开结束：保留房间与建房者席位，刷新/重连由本人凭据恢复。
+        member.connected = false;
+        member.connectionId = null;
+        member.leaveReason = 'dropped';
+        this.applyLobby({ type: 'member-left', role: 'host' });
+        this.broadcastMembers();
+        return;
+      }
       // 大厅阶段房主掉线直接关房：会话关闭 → 传输层释放监听资源。
       this.close('host-disconnected');
       return;
@@ -963,6 +1023,11 @@ export class RoomSession {
 
     if (member.role === 'guest') {
       this.guestResumeToken = null;
+      // 在线房间：主动离开即释放客人席位，其他匿名玩家可以补位；
+      // LAN 房间保留原来的「离开卡片」行为。
+      if (this.mode === 'online') {
+        this.guest = null;
+      }
     }
 
     member.connected = false;
@@ -1155,6 +1220,113 @@ export class RoomSession {
       }),
     );
     oldRecord.connection.close(closeCodeForError('UNAUTHORIZED'), 'socket-superseded');
+  }
+
+  /**
+   * 在线席位准入：只依据传输层登记的可信身份。
+   * - 建房者身份取得房主席位；
+   * - 已在该房的同一身份恢复原席位（成员/角色不变，仅替换连接）；
+   * - 新身份在大厅阶段且客人席位空缺时成为客人，否则成为只读旁观者。
+   * 任何客户端自报的角色/成员/恢复凭据都不参与这里的分支。
+   */
+  private admitOnlineMember(connection: SessionConnection, identity: RoomIdentity): RoomMemberRecord | null {
+    const connectionId = connection.connectionId;
+
+    if (this.ownerIdentityId !== null && identity.identityId === this.ownerIdentityId) {
+      if (!this.host) {
+        this.host = {
+          memberId: asMemberId(this.randomId()),
+          identity,
+          role: 'host',
+          name: '房主',
+          connectionId,
+          connected: true,
+          leaveReason: null,
+        };
+        return this.host;
+      }
+      return this.rebindMember(this.host, connectionId);
+    }
+
+    const existing = this.findMemberByIdentity(identity.identityId);
+    if (existing) {
+      return this.rebindMember(existing, connectionId);
+    }
+
+    if (!this.guest && this.lobby.phase !== 'started') {
+      const member: RoomMemberRecord = {
+        memberId: asMemberId(this.randomId()),
+        identity,
+        role: 'guest',
+        name: '客人',
+        connectionId,
+        connected: true,
+        leaveReason: null,
+      };
+      this.guest = member;
+      return member;
+    }
+
+    return this.admitOnlineSpectator(connection, identity);
+  }
+
+  private findMemberByIdentity(identityId: IdentityId): RoomMemberRecord | null {
+    if (this.host && this.host.identity.identityId === identityId) {
+      return this.host;
+    }
+    if (this.guest && this.guest.identity.identityId === identityId) {
+      return this.guest;
+    }
+    return this.spectators.find((member) => member.identity.identityId === identityId) ?? null;
+  }
+
+  /**
+   * 在线重连：保持原成员席位与角色，只替换连接；对局中恢复按既有 MatchClock 裁决，
+   * 不重置局时、不重发历史动作。
+   */
+  private rebindMember(member: RoomMemberRecord, connectionId: ConnectionId): RoomMemberRecord {
+    this.supersedeConnection(member, connectionId);
+    member.connectionId = connectionId;
+    member.connected = true;
+    member.leaveReason = null;
+
+    if (member.role === 'spectator') {
+      this.clearSpectatorExpiry(member.memberId);
+      return member;
+    }
+
+    this.applyLobby({ type: 'member-joined', role: member.role });
+
+    if (this.match && this.lobby.phase === 'started') {
+      const reconnect = this.match.clock.onReconnect(member.role, this.now());
+      this.match.revision += 1;
+      if (reconnect.settlement) {
+        this.match = finalizeMatch(this.match, reconnect.settlement.winner, reconnect.settlement.reason, this.now());
+        this.stopClockBroadcast();
+        this.clearClockTimer();
+      } else {
+        this.scheduleClockDeadline();
+      }
+      this.publishGame();
+    }
+
+    return member;
+  }
+
+  /** 在线旁观：同一身份再次进入恢复原旁观席位，否则新建；不占执色席位、不参与就绪。 */
+  private admitOnlineSpectator(connection: SessionConnection, identity: RoomIdentity): RoomMemberRecord {
+    this.spectatorNameSeq += 1;
+    const member: RoomMemberRecord = {
+      memberId: asMemberId(this.randomId()),
+      identity,
+      role: 'spectator',
+      name: `旁观${this.spectatorNameSeq}`,
+      connectionId: connection.connectionId,
+      connected: true,
+      leaveReason: null,
+    };
+    this.spectators.push(member);
+    return member;
   }
 
   private clearSpectatorExpiry(memberId: MemberId): void {

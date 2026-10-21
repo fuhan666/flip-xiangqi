@@ -77,8 +77,13 @@ import { parsePublicGamePatch, type PublicGameDelta, type PublicGamePatch } from
  * v10：终局后由服务端交付权威棋谱。
  *
  * - 延续 v9 的公开增量补丁与 game.version 巡检；
+ * - welcome / 显式同步仍是完整公开快照（game.state）；
+ * - 常规走棋、协商、结算只发 game.patch；
+ * - 5 秒巡检用 game.version 核对版本，不再请求完整棋局；
+ * - game.rejected 只带权威版本与原因，不再夹带棋局快照；
  * - 新增 game.record.request / game.record / game.record.unavailable / game.records：
  *   只有已结算的对局会在限定时间内交出完整记录，且只回复已获准的本房连接；
+ * - 在线入口用 online.hello 握手：身份由同源匿名凭据解析，载荷不携带角色/密钥；
  * - 进行中的对局仍不暴露未翻身份与完整初始布局。
  */
 export const PROTOCOL_VERSION = 10;
@@ -178,6 +183,7 @@ export interface HelloPayload {
 
 export type ClientMessage =
   | (Envelope & { type: 'hello'; roomId: null | string; payload: HelloPayload })
+  | (Envelope & { type: 'online.hello'; roomId: string; payload: Record<string, never> })
   | (Envelope & { type: 'leave'; roomId: string; payload: Record<string, never> })
   | (Envelope & { type: 'ping'; roomId: string; payload: { seq: number; clientTime?: number } })
   | (Envelope & { type: 'pong'; roomId: string; payload: { seq: number; serverReceiveTime?: number; serverSendTime?: number } })
@@ -489,6 +495,22 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
           ...(typeof resumeToken === 'string' ? { resumeToken } : {}),
         },
       },
+    };
+  }
+
+  if (message.type === 'online.hello') {
+    // 在线握手只确认目标房间：身份、角色与恢复凭据一律由服务器凭据解析，
+    // 载荷携带任何身份字段都按非法报文拒绝。
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'online-hello-room-id' };
+    }
+    const onlinePayload = message.payload as Record<string, unknown>;
+    if (Object.keys(onlinePayload).length > 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'online-hello-payload' };
+    }
+    return {
+      ok: true,
+      message: { ...message, type: 'online.hello', roomId: message.roomId, payload: {} },
     };
   }
 
@@ -1452,6 +1474,16 @@ export function buildClientHello(input: {
       ...(input.token ? { token: input.token } : {}),
       ...(input.resumeToken ? { resumeToken: input.resumeToken } : {}),
     },
+  };
+}
+
+/** 在线握手：只带目标房间，身份来自同源匿名凭据。 */
+export function buildClientOnlineHello(roomId: string): ClientMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'online.hello',
+    roomId,
+    payload: {},
   };
 }
 
