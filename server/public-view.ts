@@ -24,6 +24,20 @@ import type {
   PublicPiece,
 } from '../src/network/public-game.js';
 
+/**
+ * 轻量观测计数：证明 1Hz 计时广播与 5 秒版本核对不构造完整公开投影。
+ * 只累加调用次数，不含任何棋局内容；测试读取后自行重置。
+ */
+export const publicProjectionCounters = {
+  gameState: 0,
+  matchSnapshot: 0,
+};
+
+export function resetPublicProjectionCounters(): void {
+  publicProjectionCounters.gameState = 0;
+  publicProjectionCounters.matchSnapshot = 0;
+}
+
 function positionOrder(piece: { position: Position | null }): [number, number] {
   if (!piece.position) {
     return [Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER];
@@ -165,6 +179,7 @@ export function projectLegalMoves(match: MatchState): LegalMoveGroup[] {
 
 /** 权威内部状态 → 公开局面（唯一允许下发给客户端的棋局形状）。 */
 export function projectGameState(match: MatchState): PublicGameState {
+  publicProjectionCounters.gameState += 1;
   const mapId = createIdMapper(match);
   const state = match.gameState;
   const pieces = state.pieces.map((piece) => projectPiece(piece, mapId)).sort(comparePublicPieces);
@@ -184,6 +199,7 @@ export function projectGameState(match: MatchState): PublicGameState {
 
 /** 权威内部对局 → 公开对局快照（welcome / 同步 / 广播共用同一投影）。 */
 export function projectMatchSnapshot(match: MatchState, now?: number): PublicMatchSnapshot {
+  publicProjectionCounters.matchSnapshot += 1;
   return {
     matchId: match.matchId,
     stepNumber: match.stepNumber,

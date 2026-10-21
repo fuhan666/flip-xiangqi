@@ -3,6 +3,7 @@ import { createLobbyState, applyLobbyCommand, type LobbyState } from '../lobby';
 import {
   buildClientGameAction,
   buildClientGameSync,
+  buildClientGameVersion,
   buildClientHello,
   buildClientLeave,
   buildClientLobbyReady,
@@ -11,6 +12,7 @@ import {
   buildPing,
   buildPong,
   buildServerGameClock,
+  buildServerGameVersion,
   buildServerMessage,
   closeCodeForError,
   encodeMessage,
@@ -428,19 +430,9 @@ describe('heartbeat and session resumption envelopes', () => {
       requestId: 'req-1',
       payload: {
         matchId: 'match-1',
+        revision: 4,
         stepNumber: 0,
         reason: '非己方回合',
-        state: {
-          currentTurn: 'red',
-          winner: null,
-          checkedCamp: null,
-          lastError: null,
-          statusMessage: '红方行动',
-          pieces: [],
-          actionHistory: [],
-          recentAction: null,
-          legalMoves: [],
-        },
       },
     });
     const parsedRejected = parseServerMessage(serverRejected);
@@ -448,6 +440,33 @@ describe('heartbeat and session resumption envelopes', () => {
     if (parsedRejected.ok && parsedRejected.message.type === 'game.rejected') {
       expect(parsedRejected.message.payload.reason).toBe('非己方回合');
       expect(parsedRejected.message.payload.stepNumber).toBe(0);
+      expect(parsedRejected.message.payload.revision).toBe(4);
+      expect(parsedRejected.message.payload).not.toHaveProperty('state');
+    }
+
+    // 无对局时版本必须显式为 null/null，不能拿请求里的旧 matchId 冒充权威版本。
+    const noMatchRejected = parseServerMessage(
+      buildServerMessage({
+        type: 'game.rejected',
+        roomId: 'room-1',
+        payload: { matchId: null, revision: null, stepNumber: 0, reason: '对局尚未开始' },
+      }),
+    );
+    expect(noMatchRejected.ok).toBe(true);
+
+    // game.version：只核对版本，没有棋盘与时钟。
+    const version = buildClientGameVersion('room-1', { requestId: 'v-1', matchId: 'match-1', revision: 4 });
+    const parsedVersion = parseClientMessage(encodeMessage(version));
+    expect(parsedVersion.ok).toBe(true);
+    if (parsedVersion.ok && parsedVersion.message.type === 'game.version') {
+      expect(parsedVersion.message.payload).toEqual({ matchId: 'match-1', revision: 4 });
+    }
+    const parsedVersionReply = parseServerMessage(
+      buildServerMessage(buildServerGameVersion('room-1', { matchId: 'match-1', revision: 4, requestId: 'v-1' })),
+    );
+    expect(parsedVersionReply.ok).toBe(true);
+    if (parsedVersionReply.ok && parsedVersionReply.message.type === 'game.version') {
+      expect(parsedVersionReply.message.payload).toEqual({ matchId: 'match-1', revision: 4 });
     }
 
     // lobby.return

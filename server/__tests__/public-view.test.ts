@@ -148,6 +148,7 @@ function flip(session: RoomSession, actor: FakeConnection, matchId: string, requ
       requestId,
       matchId,
       stepNumber: match.stepNumber,
+      revision: match.revision,
       action: { type: 'flip', position: hidden.position! },
     }),
   );
@@ -177,8 +178,9 @@ function expectNoSecretKeys(payload: unknown): void {
   expect(JSON.stringify(payload)).not.toMatch(/(black|red)-(king|rook|cannon|horse|elephant|advisor|pawn)-/);
 }
 
-function expectHiddenPiecesAreOpaque(state: AnyMessage['payload']['state']): void {
-  for (const piece of state.pieces) {
+function expectHiddenPiecesAreOpaque(state: AnyMessage['payload']['state'] | AnyMessage['payload']['changes']['pieces']): void {
+  const pieces = Array.isArray(state) ? state : state.pieces;
+  for (const piece of pieces) {
     if (piece.revealed) {
       continue;
     }
@@ -199,32 +201,31 @@ describe('统一公开投影', () => {
     expectNoSecretKeys(start.payload);
     expectHiddenPiecesAreOpaque(start.payload.state);
 
-    // 动作确认
+    // 动作确认：常规走棋只发公开补丁，不再广播整份棋局。
     flip(session, host, matchId, 'req-1');
-    const confirmed = host.last('game.state')!;
+    const confirmed = host.last('game.patch')!;
+    expect(confirmed).not.toBeNull();
+    expect(host.last('game.state')).toBe(start);
     expectNoSecretKeys(confirmed.payload);
-    expectHiddenPiecesAreOpaque(confirmed.payload.state);
+    expectHiddenPiecesAreOpaque(confirmed.payload.changes.pieces ?? []);
     expect(confirmed.payload.revision).toBeGreaterThan(start.payload.revision);
+    expect(confirmed.payload.baseRevision).toBe(start.payload.revision);
+    expect(confirmed.payload.stepNumber).toBe(1);
 
-    // 重复请求：只有请求者收到同一公开全量，其他连接不重复接收
-    const guestBefore = guest.sent.length;
+    // 重复请求：只回精简回执给请求者，其他连接不重复接收任何棋局消息
     const hostBefore = host.sent.length;
     flip(session, guest, matchId, 'req-dup');
-    const dupSource = [...host.sent.slice(hostBefore), ...guest.sent.slice(guestBefore)]
-      .filter((message) => message.type === 'game.state')
-      .at(-1)!;
-    expect(dupSource).toBeTruthy();
-    // 原样重放同一 requestId：只回给请求者
+    expect(host.sent.length).toBeGreaterThan(hostBefore);
     const replayBefore = guest.sent.length;
     const hostReplayBefore = host.sent.length;
     flip(session, guest, matchId, 'req-dup');
-    const dup = guest.sent.slice(replayBefore).filter((message) => message.type === 'game.state');
+    const dup = guest.sent.slice(replayBefore).filter((message) => message.type === 'game.receipt');
     expect(dup).toHaveLength(1);
     expect(host.sent.slice(hostReplayBefore)).toHaveLength(0);
     expectNoSecretKeys(dup[0].payload);
-    expectHiddenPiecesAreOpaque(dup[0].payload.state);
+    expect(dup[0].payload).not.toHaveProperty('state');
 
-    // 拒绝
+    // 拒绝也只给权威版本，不夹带棋局
     deliver(
       session,
       host,
@@ -238,7 +239,7 @@ describe('统一公开投影', () => {
     const rejected = host.last('game.rejected')!;
     expect(rejected).not.toBeNull();
     expectNoSecretKeys(rejected.payload);
-    expectHiddenPiecesAreOpaque(rejected.payload.state);
+    expect(rejected.payload).not.toHaveProperty('state');
 
     // 显式同步
     deliver(session, guest, buildClientGameSync(session.roomId, matchId));
@@ -266,7 +267,7 @@ describe('统一公开投影', () => {
     const specRejected = spectator.last('game.rejected');
     expect(specRejected).not.toBeNull();
     expectNoSecretKeys(specRejected!.payload);
-    expectHiddenPiecesAreOpaque(specRejected!.payload.state);
+    expect(specRejected!.payload).not.toHaveProperty('state');
   });
 
   it('未握手连接收不到任何棋局或大厅广播，握手后才收到正确公开快照', () => {
@@ -291,8 +292,8 @@ describe('统一公开投影', () => {
 
     const staleCount = host.sent.length;
     flip(session, replacement, matchId, 'req-replace');
-    expect(host.sent.slice(staleCount).filter((message) => message.type === 'game.state')).toHaveLength(0);
-    expect(replacement.last('game.state')).not.toBeNull();
+    expect(host.sent.slice(staleCount).filter((message) => message.type === 'game.patch')).toHaveLength(0);
+    expect(replacement.last('game.patch')).not.toBeNull();
   });
 
   it('两个独立会话互不串流：一个会话的动作只出现在自己的连接上', () => {
@@ -302,7 +303,7 @@ describe('统一公开投影', () => {
 
     const beforeOther = b.host.sent.length;
     flip(a.session, a.host, a.matchId, 'req-isolated');
-    expect(a.host.last('game.state')!.payload.stepNumber).toBe(1);
+    expect(a.host.last('game.patch')!.payload.stepNumber).toBe(1);
     expect(b.host.sent.slice(beforeOther)).toHaveLength(0);
   });
 

@@ -31,7 +31,7 @@ async function setup() {
   await until(() => host.getState().status === 'connected');
   guest.connect({ host: '127.0.0.1', port }, { role: 'guest', name: '黑' });
   spectator.connect({ host: '127.0.0.1', port }, { role: 'spectator', name: '观' });
-  await until(() => clients.every(c => c.getState().status === 'connected'));
+  await until(() => clients.every(c => c.getState().status === 'connected'), 5000);
   host.sendLobbySettings('host-red', 'standard');
   await until(() => guest.getState().lobby?.settings.sidePreference === 'host-red');
   host.sendLobbyReady(true); guest.sendLobbyReady(true);
@@ -60,9 +60,9 @@ describe('real room fault matrix', () => {
   it('100–500ms bidirectional jitter and a lost action acknowledgement converge within 6.5s', async () => {
     const f = await setup();
     f.faults[0].rules.push({ direction: 'send', type: 'game.action', effect: 'delay', delayMs: 500 });
-    f.faults[0].rules.push({ direction: 'receive', type: 'game.state', effect: 'drop' });
-    f.faults[1].rules.push({ direction: 'receive', type: 'game.state', effect: 'delay', delayMs: 100 });
-    f.faults[2].rules.push({ direction: 'receive', type: 'game.state', effect: 'delay', delayMs: 300 });
+    f.faults[0].rules.push({ direction: 'receive', type: 'game.patch', effect: 'drop' });
+    f.faults[1].rules.push({ direction: 'receive', type: 'game.patch', effect: 'delay', delayMs: 100 });
+    f.faults[2].rules.push({ direction: 'receive', type: 'game.patch', effect: 'delay', delayMs: 300 });
     f.host.sendGameAction({ type: 'flip', position: { x: 0, y: 6 } });
     await until(() => f.clients.every(c => c.getState().game!.stepNumber === 1 && c.getState().game!.pendingAction === null), 6500);
     await f.consistent(1);
@@ -84,7 +84,7 @@ describe('real room fault matrix', () => {
 
   it('lost rejection while heartbeats continue clears the action and adopts the pending negotiation', async () => {
     const f = await setup();
-    f.faults[0].rules.push({ direction: 'receive', type: 'game.state', effect: 'hold' });
+    f.faults[0].rules.push({ direction: 'receive', type: 'game.patch', effect: 'hold' });
     f.faults[0].rules.push({ direction: 'receive', type: 'game.clock', effect: 'drop', count: 200 });
     f.guest.sendGameNegotiate('draw');
     await until(() => f.server.getMatch()!.pendingNegotiation !== null);
@@ -103,12 +103,13 @@ describe('real room fault matrix', () => {
 
   it('committed action with lost acknowledgement, duplicate action and reversed delayed state commits once', async () => {
     const f = await setup();
-    f.faults[0].rules.push({ direction: 'receive', type: 'game.state', effect: 'disconnect' });
+    f.faults[0].rules.push({ direction: 'receive', type: 'game.patch', effect: 'disconnect' });
     expect(f.host.sendGameAction({ type: 'flip', position: { x: 0, y: 6 } }).ok).toBe(true);
     await until(() => f.faults[0].sockets.length === 2 && f.host.getState().status === 'connected');
     await f.consistent(1);
     f.faults[1].rules.push({ direction: 'send', type: 'game.action', effect: 'duplicate', delayMs: 50 });
-    f.faults[2].rules.push({ direction: 'receive', type: 'game.state', effect: 'hold', count: 2 });
+    f.faults[2].rules.push({ direction: 'receive', type: 'game.patch', effect: 'hold' });
+    f.faults[2].rules.push({ direction: 'receive', type: 'game.state', effect: 'hold' });
     expect(f.guest.sendGameAction({ type: 'flip', position: { x: 0, y: 3 } }).ok).toBe(true);
     await until(() => f.server.getMatch()!.stepNumber === 2);
     f.spectator.requestGameSync();
@@ -144,8 +145,8 @@ describe('real room fault matrix', () => {
     const f = await setup();
     f.host.sendGameNegotiate('draw');
     await until(() => f.clients.every(c => c.getState().game!.pendingNegotiation !== null));
-    f.faults[0].rules.push({ direction: 'receive', type: 'game.state', effect: 'drop' });
-    f.faults[2].rules.push({ direction: 'receive', type: 'game.state', effect: 'drop' });
+    f.faults[0].rules.push({ direction: 'receive', type: 'game.patch', effect: 'drop' });
+    f.faults[2].rules.push({ direction: 'receive', type: 'game.patch', effect: 'drop' });
     f.guest.sendGameNegotiateReply(true);
     await until(() => f.clients.every(c => c.getState().game!.settlement?.reason === 'draw-agreement'), 6500);
     await f.consistent(0);
@@ -183,6 +184,44 @@ describe('real room fault matrix', () => {
     f.host.sendGameAction({ type: 'flip', position: { x: 0, y: 6 } });
     await f.consistent(1);
   });
+
+  it('a dropped opponent patch converges through the 5s version check without a manual sync', async () => {
+    const f = await setup();
+    f.host.sendGameAction({ type: 'flip', position: { x: 0, y: 6 } });
+    await until(() => f.clients.every(c => c.getState().game!.stepNumber === 1 && c.getState().game!.pendingAction === null));
+
+    f.faults[0].rules.push({ direction: 'receive', type: 'game.patch', effect: 'drop', count: 5 });
+    f.guest.sendGameAction({ type: 'flip', position: { x: 0, y: 3 } });
+    await until(() => f.server.getMatch()!.stepNumber === 2);
+    // 房主错过对手的补丁：自己没有任何在途动作，只能靠 5 秒版本核对发现并恢复。
+    expect(f.host.getState().game!.stepNumber).toBe(1);
+    expect(f.host.getState().game!.pendingAction).toBeNull();
+
+    await until(() => f.host.getState().game!.stepNumber === 2, 8000);
+    const authority = f.server.getPublicMatch()!;
+    expect(f.host.getState().game!.revision).toBe(authority.revision);
+    expect(f.host.getState().game!.gameState).toEqual(authority.gameState);
+    expect(f.host.getState().game!.matchEvents).toEqual(authority.matchEvents);
+    // 不自动重放：房主没有重发任何动作。
+    expect(f.server.getMatch()!.gameState.actionHistory).toHaveLength(2);
+  }, 12000);
+
+  it('a lost terminal settlement patch is found by the version check after the clock stops', async () => {
+    const f = await setup();
+    // 先让双方自然收敛，不发任何手动同步请求。
+    f.host.sendGameAction({ type: 'flip', position: { x: 0, y: 6 } });
+    await until(() => f.clients.every(c => c.getState().game!.stepNumber === 1 && c.getState().game!.pendingAction === null));
+
+    // 丢掉结算之后到达的所有补丁，模拟终局广播整体遗漏。
+    f.faults[1].rules.push({ direction: 'receive', type: 'game.patch', effect: 'drop', count: 5 });
+    f.host.sendGameResign();
+    await until(() => f.server.getMatch()!.settlement !== null);
+    expect(f.guest.getState().game!.settlement).toBeNull();
+
+    await until(() => f.guest.getState().game!.settlement !== null, 8000);
+    expect(f.guest.getState().game!.settlement!.reason).toBe('resignation');
+    expect(f.guest.getState().game!.gameState.winner).toBe('black');
+  }, 12000);
 
   it.each([89999, 90001])('resume at %dms uses the authoritative grace result', async elapsed => {
     const f = await setup();

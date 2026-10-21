@@ -724,9 +724,9 @@ describe('RoomClient', () => {
           requestId: 'old-stale-req-id',
           payload: {
             matchId: snap0.matchId,
+            revision: snap0.revision,
             stepNumber: 0,
             reason: '过期的旧请求拒绝',
-            state: snap0.gameState,
           },
         }),
       );
@@ -741,9 +741,9 @@ describe('RoomClient', () => {
           requestId: pendingReqId,
           payload: {
             matchId: snap0.matchId,
+            revision: snap0.revision,
             stepNumber: 0,
             reason: '你的操作未被采纳，请重新操作',
-            state: snap0.gameState,
           },
         }),
       );

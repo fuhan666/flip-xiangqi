@@ -266,7 +266,7 @@ describe('read-only enforcement', () => {
     const matchBefore = pair.room.getMatch()!;
     const revisionBefore = matchBefore.revision;
     const lobbyBefore = pair.room.getLobby();
-    const hostGameStatesBefore = pair.host.messages.filter((m) => m.type === 'game.state').length;
+    const hostGameStatesBefore = pair.host.messages.filter((m) => m.type === 'game.state' || m.type === 'game.patch').length;
     const position = hiddenPiecePosition(matchBefore.gameState);
 
     spectator.client.send(encodeMessage(buildClientLobbySettings(pair.room.roomId, { sidePreference: 'random', timeControlId: 'none' })));
@@ -327,7 +327,7 @@ describe('read-only enforcement', () => {
     expect(matchAfter.pendingNegotiation).toBeNull();
     expect(pair.room.getLobby()).toEqual(lobbyBefore);
     // 拒绝只回复请求方：玩家端不新增权威广播。
-    expect(pair.host.messages.filter((m) => m.type === 'game.state').length).toBe(hostGameStatesBefore);
+    expect(pair.host.messages.filter((m) => m.type === 'game.state' || m.type === 'game.patch').length).toBe(hostGameStatesBefore);
     // 连接保持：旁观者不因被拒而掉线。
     expect(spectator.client.closeCode()).toBeNull();
   });
@@ -360,7 +360,7 @@ describe('read-only enforcement', () => {
         }),
       ),
     );
-    const advanced = await pair.host.waitForType('game.state', (m) => m.payload.stepNumber === 1);
+    const advanced = await pair.host.waitForType('game.patch', (m) => m.payload.stepNumber === 1);
     expect(advanced.requestId).toBe('req-shared');
   });
 
@@ -404,7 +404,7 @@ describe('spectator lifecycle', () => {
         }),
       ),
     );
-    await pair.host.waitForType('game.state', (m) => Boolean(m.payload.pendingNegotiation));
+    await pair.host.waitForType('game.patch', (m) => Boolean(m.payload.changes.pendingNegotiation));
     const second = await joinSpectator(pair.room.actualPort);
     const revisionBeforeSecondDrop = pair.room.getMatch()!.revision;
     second.client.socket.terminate();

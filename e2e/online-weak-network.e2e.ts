@@ -91,7 +91,7 @@ for (const viewport of [{ width: 1366, height: 768 }, { width: 1920, height: 108
       await capture(host, 'game');
 
       // Commit with delayed acknowledgement; disconnect before it is delivered.
-      faults[1].rules.push({ direction: 'receive', type: 'game.state', effect: 'hold' });
+      faults[1].rules.push({ direction: 'receive', type: 'game.patch', effect: 'hold' });
       await guest.getByTestId('cell-0-3').click();
       await expect.poll(() => faults[1].held.length).toBe(1);
       faults[1].rules.push({ direction: 'send', type: 'hello', effect: 'hold' });
@@ -121,14 +121,14 @@ for (const viewport of [{ width: 1366, height: 768 }, { width: 1920, height: 108
       await expect.poll(async () => (await adoptedState(host)).game!.clock!.red.baseTimeRemainingMs!).toBeLessThan(before);
       // Both directions jitter, with an application duplicate. The next move still commits once.
       faults[0].rules.push({ direction: 'send', type: 'game.action', effect: 'duplicate', delayMs: 100 });
-      faults[2].rules.push({ direction: 'receive', type: 'game.state', effect: 'delay', delayMs: 500 });
+      faults[2].rules.push({ direction: 'receive', type: 'game.patch', effect: 'delay', delayMs: 500 });
       await host.getByTestId('cell-2-6').click();
       await consistent(3);
       await Promise.all(pages.map(flipIdle));
 
       // No more clocks are broadcast after settlement. Periodic sync must still converge.
-      faults[1].rules.push({ direction: 'receive', type: 'game.state', effect: 'drop' });
-      faults[2].rules.push({ direction: 'receive', type: 'game.state', effect: 'drop' });
+      faults[1].rules.push({ direction: 'receive', type: 'game.patch', effect: 'drop' });
+      faults[2].rules.push({ direction: 'receive', type: 'game.patch', effect: 'drop' });
       await host.getByTestId('btn-resign').click();
       await host.getByTestId('confirm-resign-btn').click();
       await expect.poll(async () => (await Promise.all(pages.map(p => adoptedState(p)))).every(s => s.game!.settlement !== null),

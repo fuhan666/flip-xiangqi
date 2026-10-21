@@ -101,6 +101,7 @@ describe('联机两端可玩（公开数据驱动）', () => {
             requestId,
             matchId,
             stepNumber: session.getPublicMatch()!.stepNumber,
+            revision: session.getPublicMatch()!.revision,
             action: {
               type: 'move',
               from: captureGroup.group.from,
@@ -109,7 +110,7 @@ describe('联机两端可玩（公开数据驱动）', () => {
           }),
         );
         captureSeen = true;
-        captureSnapshot = actor.last('game.state');
+        captureSnapshot = actor.last('game.patch');
         break;
       }
 
@@ -126,6 +127,7 @@ describe('联机两端可玩（公开数据驱动）', () => {
             requestId,
             matchId,
             stepNumber: session.getPublicMatch()!.stepNumber,
+            revision: session.getPublicMatch()!.revision,
             action: { type: 'move', from: moved.group.from, to: moved.target.position },
           }),
         );
@@ -140,13 +142,14 @@ describe('联机两端可玩（公开数据驱动）', () => {
           requestId,
           matchId,
           stepNumber: session.getPublicMatch()!.stepNumber,
+          revision: session.getPublicMatch()!.revision,
           action: { type: 'flip', position: hidden.position },
         }),
       );
     }
 
     expect(captureSeen).toBe(true);
-    const captured = captureSnapshot!.payload.state.actionHistory.at(-1);
+    const captured = captureSnapshot!.payload.changes.history.append.at(-1);
     expect(captured.consequences.some((consequence: AnyMessage) => consequence.type === 'capture')).toBe(true);
 
     // 悔棋：请求 → 同意后，被吃棋子重新回到棋盘（公开视图同样恢复）
