@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Camp } from '../game/index.js';
 import type { OnlineRecord, RecordUnavailable, RoomConnection } from '../network/client.js';
+import type { FinishedRecordSummary } from '../network/protocol.js';
 import { parseRecord, type GameRecord } from '../records/record.js';
 import { GameRecordControls, RecordReplay } from './GameRecordControls.js';
 
@@ -89,5 +90,50 @@ export function OnlineRecordPanel({ client, matchId, recordResult, recordError, 
     <p className="room-hint" data-testid="online-record-loading">
       正在取回服务器棋谱…
     </p>
+  );
+}
+
+export interface OnlineRecordLibraryProps {
+  client: RoomConnection;
+  records: FinishedRecordSummary[];
+  recordResult: OnlineRecord | null;
+  recordError: RecordUnavailable | null;
+  perspective: Camp;
+}
+
+/** 本房临时终局棋谱列表：返回大厅或再局后仍可取回保留期内的旧局。 */
+export function OnlineRecordLibrary({ client, records, recordResult, recordError, perspective }: OnlineRecordLibraryProps) {
+  const [selected, setSelected] = useState<string | null>(null);
+  if (records.length === 0) {
+    return null;
+  }
+  return (
+    <section className="room-panel online-record-panel" data-testid="online-record-list">
+      <h2>本房终局棋谱</h2>
+      <p className="room-hint">服务器保留 30 分钟；过期或服务器重启后不可再取回。</p>
+      <ul className="record-actions">
+        {records.map((item) => (
+          <li key={item.matchId}>
+            <button
+              className="panel-action-secondary"
+              data-testid={`online-record-entry-${item.matchId}`}
+              onClick={() => setSelected(item.matchId)}
+              type="button"
+            >
+              {new Date(item.endedAt).toLocaleTimeString()} 结束的对局
+            </button>
+          </li>
+        ))}
+      </ul>
+      {selected ? (
+        <OnlineRecordPanel
+          client={client}
+          matchId={selected}
+          perspective={perspective}
+          recordError={recordError}
+          recordResult={recordResult}
+        />
+      ) : null}
+    </section>
   );
 }

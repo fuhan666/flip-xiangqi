@@ -32,6 +32,8 @@ interface RoomLobbyProps {
   onStart: () => void;
   /** 成员区下方的连接状态说明（建房/加入两端各自文案）。 */
   connectionHint?: ReactNode;
+  /** 本房临时终局棋谱入口（有未过期记录时由调用方提供）。 */
+  recordsSlot?: ReactNode;
   /** 是否处于断线重连中（重连期间禁用设置/准备/开始发送动作，退出入口保持可用）。 */
   reconnecting?: boolean;
 }
@@ -83,6 +85,7 @@ export function RoomLobby({
   onReadyToggle,
   onStart,
   connectionHint,
+  recordsSlot,
   reconnecting = false,
 }: RoomLobbyProps) {
   const started = lobby?.phase === 'started';
@@ -111,6 +114,8 @@ export function RoomLobby({
         <SpectatorList members={members} selfId={selfId} />
         {connectionHint}
       </section>
+
+      {recordsSlot}
 
       {lobby ? (
         <section className="room-panel">

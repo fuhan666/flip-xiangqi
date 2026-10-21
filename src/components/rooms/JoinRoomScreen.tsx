@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { OnlineRecordLibrary } from '../OnlineRecordPanel.js';
 import { parseServerAddress, formatAddress } from '../../network/address';
 import { fetchRoomSummary, type RoomSummary } from '../../network/control-api';
 import type { RoomConnection, ConnectionState } from '../../network/client';
@@ -202,6 +203,17 @@ export function JoinRoomScreen({ createClient, storage, initialAddress, guestPag
                 onStart={() => clientRef.current?.sendLobbyStart()}
                 pendingCommand={connection.pendingCommand}
                 reconnecting={connection.reconnecting}
+            recordsSlot={
+              connection.records.length > 0 && clientRef.current ? (
+                <OnlineRecordLibrary
+                  client={clientRef.current}
+                  perspective="red"
+                  recordError={connection.recordError}
+                  recordResult={connection.recordResult}
+                  records={connection.records}
+                />
+              ) : undefined
+            }
                 selfId={connection.memberId}
                 viewerRole={connection.role ?? 'guest'}
               />
