@@ -33,6 +33,7 @@ import {
 // 线格式使用的领域类型从协议入口统一再导出，调用方无需两个导入源。
 export type { LobbyRejectCode, LobbyState, SidePreference, StartParameters, TimeControlId } from './lobby.js';
 export type { PublicGameState, PublicMatchSnapshot, PublicPiece } from './public-game.js';
+export type { PublicGameDelta, PublicGamePatch, PublicListDelta } from './public-patch.js';
 export type { EndgameReason, MatchAction, MatchClockSnapshot, MatchEvent, MatchSettlement, MatchSnapshot } from './match.js';
 export type { NegotiationEvent, NegotiationEventType, NegotiationType, PendingNegotiation } from './negotiation.js';
 export type {
@@ -70,13 +71,17 @@ import {
   type QuickPhraseEvent,
 } from './quick-chat.js';
 import { parseMatchEvents, type MatchEvent } from './match.js';
+import { parsePublicGamePatch, type PublicGameDelta, type PublicGamePatch } from './public-patch.js';
 
 /**
- * v8：棋局信封只承载公开投影。
- * 客户端不再收到 seed、完整开局帧或未翻棋子的阵营/棋种，
- * 所有发包路径（welcome / game.state / game.rejected）共用同一形状。
+ * v9：常规棋局变化只下发公开增量补丁。
+ *
+ * - welcome / 显式同步仍是完整公开快照（game.state）；
+ * - 常规走棋、协商、结算只发 game.patch；
+ * - 5 秒巡检用 game.version 核对版本，不再请求完整棋局；
+ * - game.rejected 只带权威版本与原因，不再夹带棋局快照。
  */
-export const PROTOCOL_VERSION = 8;
+export const PROTOCOL_VERSION = 9;
 
 /** WebSocket 握手路径（房间服务同时在该路径上提供客人页面）。 */
 export const WS_PATH = '/ws';
@@ -215,6 +220,12 @@ export type ClientMessage =
       payload: { matchId?: string };
     })
   | (Envelope & {
+      type: 'game.version';
+      requestId: string;
+      roomId: string;
+      payload: { matchId: string | null; revision: number | null };
+    })
+  | (Envelope & {
       type: 'chat.phrase';
       requestId: string;
       roomId: string;
@@ -281,13 +292,42 @@ export type ServerMessage =
       };
     })
   | (Envelope & {
-      type: 'game.rejected';
+      type: 'game.patch';
       roomId: string;
       payload: {
         matchId: string;
+        baseRevision: number;
+        revision: number;
+        stepNumber: number;
+        changes: PublicGameDelta;
+        actorMemberId?: string;
+        action?: MatchAction;
+      };
+    })
+  | (Envelope & {
+      type: 'game.version';
+      roomId: string;
+      payload: { matchId: string | null; revision: number | null };
+    })
+  | (Envelope & {
+      type: 'game.receipt';
+      roomId: string;
+      payload: {
+        matchId: string;
+        revision: number;
+        stepNumber: number;
+        acceptedRevision: number;
+        acceptedStepNumber: number;
+      };
+    })
+  | (Envelope & {
+      type: 'game.rejected';
+      roomId: string;
+      payload: {
+        matchId: string | null;
+        revision: number | null;
         stepNumber: number;
         reason: string;
-        state: PublicGameState;
       };
     })
   | (Envelope & {
@@ -679,6 +719,33 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
     };
   }
 
+  if (message.type === 'game.version') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-version-room-id' };
+    }
+    if (typeof message.requestId !== 'string' || message.requestId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-version-request-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    const matchId = payload.matchId;
+    const revision = payload.revision;
+    if ((matchId !== null && (typeof matchId !== 'string' || matchId.length === 0)) ||
+      (revision !== null && (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0)) ||
+      ((matchId === null) !== (revision === null))) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-version-payload' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.version',
+        requestId: message.requestId,
+        roomId: message.roomId,
+        payload: { matchId: matchId as string | null, revision: revision as number | null },
+      },
+    };
+  }
+
   if (message.type === 'chat.phrase') {
     if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'chat-phrase-room-id' };
@@ -945,13 +1012,99 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     };
   }
 
+  if (message.type === 'game.patch') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-patch-room-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    const patch = parsePublicGamePatch(payload);
+    if (!patch) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-patch-payload' };
+    }
+    const actorMemberId = typeof payload.actorMemberId === 'string' ? payload.actorMemberId : undefined;
+    const action = payload.action ? parseMatchAction(payload.action) ?? undefined : undefined;
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.patch',
+        roomId: message.roomId,
+        payload: {
+          ...patch,
+          ...(actorMemberId ? { actorMemberId } : {}),
+          ...(action ? { action } : {}),
+        },
+      },
+    };
+  }
+
+  if (message.type === 'game.version') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-version-room-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    const matchId = payload.matchId;
+    const revision = payload.revision;
+    if ((matchId !== null && (typeof matchId !== 'string' || matchId.length === 0)) ||
+      (revision !== null && (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0)) ||
+      ((matchId === null) !== (revision === null))) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-version-payload' };
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.version',
+        roomId: message.roomId,
+        payload: { matchId: matchId as string | null, revision: revision as number | null },
+      },
+    };
+  }
+
+  if (message.type === 'game.receipt') {
+    if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-receipt-room-id' };
+    }
+    const payload = message.payload as Record<string, unknown>;
+    if (typeof payload.matchId !== 'string' || payload.matchId.length === 0) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-receipt-match-id' };
+    }
+    const numbers = ['revision', 'stepNumber', 'acceptedRevision', 'acceptedStepNumber'] as const;
+    for (const key of numbers) {
+      const value = payload[key];
+      if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+        return { ok: false, code: 'INVALID_MESSAGE', detail: `game-receipt-${key}` };
+      }
+    }
+    return {
+      ok: true,
+      message: {
+        ...message,
+        type: 'game.receipt',
+        roomId: message.roomId,
+        ...(message.requestId ? { requestId: message.requestId } : {}),
+        payload: {
+          matchId: payload.matchId,
+          revision: payload.revision as number,
+          stepNumber: payload.stepNumber as number,
+          acceptedRevision: payload.acceptedRevision as number,
+          acceptedStepNumber: payload.acceptedStepNumber as number,
+        },
+      },
+    };
+  }
+
   if (message.type === 'game.rejected') {
     if (typeof message.roomId !== 'string' || message.roomId.length === 0) {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-rejected-room-id' };
     }
     const payload = message.payload as Record<string, unknown>;
-    if (typeof payload.matchId !== 'string' || payload.matchId.length === 0) {
-      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-rejected-match-id' };
+    const matchId = payload.matchId;
+    const revision = payload.revision;
+    if ((matchId !== null && (typeof matchId !== 'string' || matchId.length === 0)) ||
+      (revision !== null && (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0)) ||
+      ((matchId === null) !== (revision === null))) {
+      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-rejected-version' };
     }
     if (
       typeof payload.stepNumber !== 'number' ||
@@ -964,10 +1117,6 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     if (typeof payload.reason !== 'string') {
       return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-rejected-reason' };
     }
-    const state = parsePublicGameState(payload.state);
-    if (!state) {
-      return { ok: false, code: 'INVALID_MESSAGE', detail: 'game-rejected-state' };
-    }
     return {
       ok: true,
       message: {
@@ -975,10 +1124,10 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
         type: 'game.rejected',
         roomId: message.roomId,
         payload: {
-          matchId: payload.matchId,
+          matchId: matchId as string | null,
+          revision: revision as number | null,
           stepNumber: payload.stepNumber,
           reason: payload.reason,
-          state,
         },
       },
     };
@@ -1288,6 +1437,99 @@ export function buildClientGameSync(
     roomId,
     ...(requestId ? { requestId } : {}),
     payload: { ...(matchId ? { matchId } : {}) },
+  };
+}
+
+export function buildClientGameVersion(
+  roomId: string,
+  input: { requestId: string; matchId: string | null; revision: number | null },
+): ClientMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.version',
+    requestId: input.requestId,
+    roomId,
+    payload: { matchId: input.matchId, revision: input.revision },
+  };
+}
+
+export function buildServerGameVersion(
+  roomId: string,
+  payload: { matchId: string | null; revision: number | null; requestId?: string },
+): ServerMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.version',
+    roomId,
+    ...(payload.requestId ? { requestId: payload.requestId } : {}),
+    payload: { matchId: payload.matchId, revision: payload.revision },
+  };
+}
+
+export function buildServerGamePatch(
+  roomId: string,
+  payload: { patch: PublicGamePatch; requestId?: string; actorMemberId?: string; action?: MatchAction },
+): ServerMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.patch',
+    roomId,
+    ...(payload.requestId ? { requestId: payload.requestId } : {}),
+    payload: {
+      ...payload.patch,
+      ...(payload.actorMemberId ? { actorMemberId: payload.actorMemberId } : {}),
+      ...(payload.action ? { action: payload.action } : {}),
+    },
+  };
+}
+
+export function buildServerGameReceipt(
+  roomId: string,
+  payload: {
+    matchId: string;
+    revision: number;
+    stepNumber: number;
+    acceptedRevision: number;
+    acceptedStepNumber: number;
+    requestId?: string;
+  },
+): ServerMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.receipt',
+    roomId,
+    ...(payload.requestId ? { requestId: payload.requestId } : {}),
+    payload: {
+      matchId: payload.matchId,
+      revision: payload.revision,
+      stepNumber: payload.stepNumber,
+      acceptedRevision: payload.acceptedRevision,
+      acceptedStepNumber: payload.acceptedStepNumber,
+    },
+  };
+}
+
+export function buildServerGameRejected(
+  roomId: string,
+  payload: {
+    matchId: string | null;
+    revision: number | null;
+    stepNumber: number;
+    reason: string;
+    requestId?: string;
+  },
+): ServerMessage {
+  return {
+    version: PROTOCOL_VERSION,
+    type: 'game.rejected',
+    roomId,
+    ...(payload.requestId ? { requestId: payload.requestId } : {}),
+    payload: {
+      matchId: payload.matchId,
+      revision: payload.revision,
+      stepNumber: payload.stepNumber,
+      reason: payload.reason,
+    },
   };
 }
 

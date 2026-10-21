@@ -166,6 +166,7 @@ function flipAction(session: RoomSession, actor: FakeConnection, matchId: string
       requestId,
       matchId,
       stepNumber,
+      revision: state.revision,
       action: { type: 'flip', position: hidden!.position! },
     }),
   );
@@ -202,7 +203,7 @@ describe('无监听器的独立会话', () => {
     // 同一会话内重复 requestId 走幂等缓存，不再推进步数。
     flipAction(a.session, a.host, matchIdA, 1, 'dup-act');
     expect(a.session.getMatch()!.stepNumber).toBe(1);
-    expect(a.host.last('game.state', (m) => m.requestId === 'dup-act')!.payload.stepNumber).toBe(1);
+    expect(a.host.last('game.receipt', (m) => m.requestId === 'dup-act')!.payload.acceptedStepNumber).toBe(1);
 
     // 凭据互不通用：A 的 host token / guest resumeToken 在 B 一律拒绝。
     const fakeHost = connect(b.session);
@@ -252,7 +253,7 @@ describe('完整对局生命周期', () => {
     // 合法动作：host 翻子推进一步，双方收到同一权威状态。
     flipAction(session, host, matchId, 0, 'flip-1');
     expect(session.getMatch()!.stepNumber).toBe(1);
-    expect(guest.last('game.state')!.payload.stepNumber).toBe(1);
+    expect(guest.last('game.patch')!.payload.stepNumber).toBe(1);
 
     // 协商：客人申请悔棋，房主同意后棋盘回退。
     const revisionAfterFlip = session.getMatch()!.revision;
@@ -297,7 +298,7 @@ describe('完整对局生命周期', () => {
     // 新局的协商链路仍然可用。
     deliver(session, guest, buildClientGameNegotiate(session.roomId, { requestId: 'neg-new', matchId: rematch.matchId, revision: session.getMatch()!.revision, kind: 'draw' }));
     expect(session.getMatch()!.pendingNegotiation).not.toBeNull();
-    expect(host.last('game.state')!.payload.pendingNegotiation.type).toBe('draw');
+    expect(host.last('game.patch')!.payload.changes.pendingNegotiation.type).toBe('draw');
   });
 });
 
@@ -396,7 +397,7 @@ describe('旁观只读', () => {
 
     // 旁观者收到对局广播，且不影响权威状态。
     flipAction(session, host, matchId, 0, 'flip-1');
-    expect(spectator.last('game.state')!.payload.stepNumber).toBe(1);
+    expect(spectator.last('game.patch')!.payload.stepNumber).toBe(1);
     expect(session.getMatch()!.stepNumber).toBe(1);
 
     // 旁观者离开不影响对局。

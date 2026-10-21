@@ -37,16 +37,17 @@ import {
   type NegotiationEventType,
   type PendingNegotiation,
 } from '../src/network/negotiation.js';
-import {
-  createEmptyPublicGameState,
-  type PublicGameState,
-  type PublicMatchSnapshot,
-} from '../src/network/public-game.js';
-import { projectGameState, projectMatchSnapshot } from './public-view.js';
+import type { PublicMatchSnapshot } from '../src/network/public-game.js';
+import { projectMatchSnapshot } from './public-view.js';
+import { diffPublicSnapshot, type PublicGameDelta } from '../src/network/public-patch.js';
 import {
   buildServerChatPhrase,
   buildServerChatPhraseRejected,
   buildServerGameClock,
+  buildServerGamePatch,
+  buildServerGameReceipt,
+  buildServerGameRejected,
+  buildServerGameVersion,
   buildServerMessage,
   closeCodeForError,
   getQuickPhraseText,
@@ -145,6 +146,14 @@ function defaultDrawSeed(): number {
 
 type LobbyClientMessage = Extract<ClientMessage, { type: `lobby.${string}` }>;
 
+/** 已接受动作的去重记录：绑定对局与成员，避免旧局/他人命中同一 requestId。 */
+interface ProcessedAction {
+  matchId: string;
+  memberId: string;
+  revision: number;
+  stepNumber: number;
+}
+
 export class RoomSession {
   readonly roomId: string;
   readonly hostToken: string;
@@ -170,13 +179,18 @@ export class RoomSession {
   private spectatorNameSeq = 0;
   private guestResumeToken: string | null = null;
 
-  private readonly processedActions = new Map<string, { stepNumber: number }>();
+  private readonly processedActions = new Map<string, ProcessedAction>();
   private readonly phraseCooldownUntil = new Map<string, number>();
   private readonly processedPhraseRequests = new Map<string, { event: QuickPhraseEvent }>();
   private readonly spectatorExpiryTimers = new Map<MemberId, NodeJS.Timeout>();
 
   private lobby: LobbyState;
   private match: MatchState | null = null;
+  /**
+   * 已向全房间发布的公开棋局基线：增量补丁只从这里求差。
+   * 欢迎单播与显式同步单播读取当前投影，但不修改本基线。
+   */
+  private published: PublicMatchSnapshot | null = null;
   private closed = false;
 
   private clockTimer: NodeJS.Timeout | null = null;
@@ -320,11 +334,15 @@ export class RoomSession {
       return;
     }
 
-    // 旁观者只读：leave、game.sync 之外的一切消息在进入任何
+    // 旁观者只读：leave、game.sync、game.version 之外的一切消息在进入任何
     // 会修改大厅/对局的 handler 前拒绝，且只回复请求方、无其他副作用。
     if (member.role === 'spectator') {
       if (message.type === 'game.sync') {
         this.handleGameSync(connection, member, message);
+        return;
+      }
+      if (message.type === 'game.version') {
+        this.handleGameVersion(connection, message);
         return;
       }
       this.rejectSpectatorAction(connection, message);
@@ -368,6 +386,11 @@ export class RoomSession {
 
     if (message.type === 'game.sync') {
       this.handleGameSync(connection, member, message);
+      return;
+    }
+
+    if (message.type === 'game.version') {
+      this.handleGameVersion(connection, message);
       return;
     }
 
@@ -608,12 +631,12 @@ export class RoomSession {
 
     const eventType: NegotiationEventType = pending.type === 'undo' ? 'undo-timeout' : 'draw-timeout';
     const message = pending.type === 'undo' ? '悔棋申请超时未应答，已自动拒绝' : '求和申请超时未应答，已自动拒绝';
+    this.match.pendingNegotiation = null;
+    // 先推进版本再记录事件：matchEvents 里的 revision 必须指向本次提交。
+    this.match.revision++;
     this.recordMatchEvent(eventType, pending.initiatorMemberId, 'timeout', message, now);
 
-    this.match.pendingNegotiation = null;
-    this.match.revision++;
-
-    this.broadcastGameState();
+    this.publishGame();
     this.scheduleClockDeadline();
   }
 
@@ -647,7 +670,7 @@ export class RoomSession {
         winner: adv.timeoutResult.winner ?? undefined,
         reason: adv.timeoutResult.reason,
       });
-      this.broadcastGameState();
+      this.publishGame();
     }
   }
 
@@ -666,7 +689,7 @@ export class RoomSession {
         winner: adv.timeoutResult.winner ?? undefined,
         reason: adv.timeoutResult.reason,
       });
-      this.broadcastGameState();
+      this.publishGame();
       return;
     }
 
@@ -776,7 +799,7 @@ export class RoomSession {
       // 发起者同样收到权威状态：既确认操作成功，也清除在途请求。
       this.broadcastLobby();
       if (this.match) {
-        this.broadcastGameState();
+        this.publishGame();
       }
     }
   }
@@ -855,7 +878,7 @@ export class RoomSession {
         this.applyLobby({ type: 'member-left', role: 'host' });
         this.broadcastMembers();
         if (this.match) {
-          this.broadcastGameState();
+          this.publishGame();
         }
         return;
       }
@@ -872,7 +895,7 @@ export class RoomSession {
     this.applyLobby({ type: 'member-left', role: 'guest' });
     this.broadcastMembers();
     if (this.match) {
-      this.broadcastGameState();
+      this.publishGame();
     }
   }
 
@@ -905,7 +928,7 @@ export class RoomSession {
         this.match = finalizeMatch(this.match, hostSeat.side, 'disconnect-timeout', now);
         this.stopClockBroadcast();
         this.clearClockTimer();
-        this.broadcastGameState();
+        this.publishGame();
       }
     }
 
@@ -969,7 +992,7 @@ export class RoomSession {
           } else {
             this.scheduleClockDeadline();
           }
-          this.broadcastGameState();
+          this.publishGame();
         }
         return member;
       }
@@ -1017,7 +1040,7 @@ export class RoomSession {
         } else {
           this.scheduleClockDeadline();
         }
-        this.broadcastGameState();
+        this.publishGame();
       }
       return member;
     }
@@ -1146,77 +1169,60 @@ export class RoomSession {
     }
 
     if (!this.match || this.lobby.phase !== 'started') {
-      this.sendGameRejection(
-        connection,
-        message.payload.matchId,
-        0,
-        '对局尚未开始',
-        this.match ? projectGameState(this.match) : createEmptyPublicGameState(),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, '对局尚未开始', message.requestId);
       return;
     }
 
     // 双方在线检查：避免恢复窗口中的竞争
     if (!this.host?.connected || !this.guest?.connected) {
-      this.sendGameRejection(
-        connection,
-        this.match.matchId,
-        this.match.stepNumber,
-        '对手已离线，暂无法操作',
-        projectGameState(this.match),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, '对手已离线，暂无法操作', message.requestId);
       return;
     }
 
-    if (message.requestId && this.processedActions.has(message.requestId)) {
-      const cached = this.processedActions.get(message.requestId)!;
+    // 去重键绑定对局与成员：同名的旧局/他人请求不会被当成重复。
+    const cached = message.requestId
+      ? this.findProcessedAction(message.requestId, this.match.matchId, member.memberId)
+      : undefined;
+    if (cached) {
       this.logger('game.action_duplicate', {
         room: this.roomId,
         requestId: message.requestId,
         stepNumber: cached.stepNumber,
       });
-      const text = this.buildGameStateMessage({ requestId: message.requestId });
-      if (text) {
-        connection.send(text);
-      }
+      // 只回执权威版本，不重播旧效果，也不广播。
+      connection.send(
+        buildServerMessage(
+          buildServerGameReceipt(this.roomId, {
+            matchId: this.match.matchId,
+            revision: this.match.revision,
+            stepNumber: this.match.stepNumber,
+            acceptedRevision: cached.revision,
+            acceptedStepNumber: cached.stepNumber,
+            requestId: message.requestId!,
+          }),
+        ),
+      );
       return;
     }
 
     if (message.payload.matchId !== this.match.matchId) {
-      this.sendGameRejection(
-        connection,
-        this.match.matchId,
-        this.match.stepNumber,
-        '对局标识不匹配',
-        projectGameState(this.match),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, '对局标识不匹配', message.requestId);
       return;
     }
 
     if (message.payload.stepNumber !== this.match.stepNumber) {
-      this.sendGameRejection(
-        connection,
-        this.match.matchId,
-        this.match.stepNumber,
-        '操作步数已过期，请以最新棋盘为准',
-        projectGameState(this.match),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, '操作步数已过期，请以最新棋盘为准', message.requestId);
+      return;
+    }
+
+    // 版本也要对齐：悔棋会把步数降回旧值，只比步数会接纳悔棋前的迟到动作。
+    if (message.payload.revision !== this.match.revision) {
+      this.sendGameRejection(connection, '操作版本已过期，请以最新棋盘为准', message.requestId);
       return;
     }
 
     if (this.match.pendingNegotiation !== null) {
-      this.sendGameRejection(
-        connection,
-        this.match.matchId,
-        this.match.stepNumber,
-        '协商正在进行中，棋盘操作已锁定',
-        projectGameState(this.match),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, '协商正在进行中，棋盘操作已锁定', message.requestId);
       return;
     }
 
@@ -1225,18 +1231,12 @@ export class RoomSession {
       currentTurn === 'red' ? this.match.startParameters.redMemberId : this.match.startParameters.blackMemberId;
 
     if (member.memberId !== expectedMemberId) {
-      this.sendGameRejection(
-        connection,
-        this.match.matchId,
-        this.match.stepNumber,
-        '非己方回合，请等待对方行动',
-        projectGameState(this.match),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, '非己方回合，请等待对方行动', message.requestId);
       return;
     }
 
     const now = this.now();
+    const revisionBefore = this.match.revision;
     const result = applyMatchAction(this.match, member.memberId, message.payload.action, now);
     if (!result.ok) {
       this.logger('game.action_rejected', {
@@ -1244,14 +1244,14 @@ export class RoomSession {
         member: member.memberId,
         reason: result.reason,
       });
-      this.sendGameRejection(
-        connection,
-        this.match.matchId,
-        this.match.stepNumber,
-        result.reason,
-        projectGameState(this.match),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, result.reason, message.requestId);
+      // 超时检出会把对局结算为棋局变更（内部已递增 revision），必须照常发布结算补丁，
+      // 不能只在动作成功时发布，否则客户端会一直停在旧版本。
+      if (this.match.revision !== revisionBefore) {
+        this.stopClockBroadcast();
+        this.clearClockTimer();
+        this.publishGame();
+      }
       return;
     }
 
@@ -1265,6 +1265,9 @@ export class RoomSession {
 
     if (message.requestId) {
       this.processedActions.set(message.requestId, {
+        matchId: this.match.matchId,
+        memberId: member.memberId,
+        revision: this.match.revision,
         stepNumber: this.match.stepNumber,
       });
       if (this.processedActions.size > 200) {
@@ -1282,7 +1285,7 @@ export class RoomSession {
       member: member.memberId,
     });
 
-    this.broadcastGameState({
+    this.publishGame({
       requestId: message.requestId,
       actorMemberId: member.memberId,
       action: message.payload.action,
@@ -1300,62 +1303,27 @@ export class RoomSession {
     }
 
     if (!this.match || this.lobby.phase !== 'started') {
-      this.sendGameRejection(
-        connection,
-        message.payload.matchId,
-        0,
-        '对局尚未开始',
-        this.match ? projectGameState(this.match) : createEmptyPublicGameState(),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, '对局尚未开始', message.requestId);
       return;
     }
 
     if (!this.host?.connected || !this.guest?.connected) {
-      this.sendGameRejection(
-        connection,
-        this.match.matchId,
-        this.match.stepNumber,
-        '对手已离线，暂无法操作',
-        projectGameState(this.match),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, '对手已离线，暂无法操作', message.requestId);
       return;
     }
 
     if (this.match.settlement !== null || this.match.gameState.winner !== null) {
-      this.sendGameRejection(
-        connection,
-        this.match.matchId,
-        this.match.stepNumber,
-        '对局已经结束，请重新开局',
-        projectGameState(this.match),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, '对局已经结束，请重新开局', message.requestId);
       return;
     }
 
     if (message.payload.matchId !== this.match.matchId) {
-      this.sendGameRejection(
-        connection,
-        this.match.matchId,
-        this.match.stepNumber,
-        '对局标识不匹配',
-        projectGameState(this.match),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, '对局标识不匹配', message.requestId);
       return;
     }
 
     if (message.payload.revision !== this.match.revision) {
-      this.sendGameRejection(
-        connection,
-        this.match.matchId,
-        this.match.stepNumber,
-        '操作版本已过期，请以最新棋盘为准',
-        projectGameState(this.match),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, '操作版本已过期，请以最新棋盘为准', message.requestId);
       return;
     }
 
@@ -1367,41 +1335,20 @@ export class RoomSession {
     }
 
     if (this.match.pendingNegotiation !== null) {
-      this.sendGameRejection(
-        connection,
-        this.match.matchId,
-        this.match.stepNumber,
-        '已有协商正在进行中，请等待其结束',
-        projectGameState(this.match),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, '已有协商正在进行中，请等待其结束', message.requestId);
       return;
     }
 
     if (message.payload.kind === 'undo') {
       if (this.match.gameState.actionHistory.length === 0) {
-        this.sendGameRejection(
-          connection,
-          this.match.matchId,
-          this.match.stepNumber,
-          '开局暂无走子记录，无法申请悔棋',
-          projectGameState(this.match),
-          message.requestId,
-        );
+        this.sendGameRejection(connection, '开局暂无走子记录，无法申请悔棋', message.requestId);
         return;
       }
     } else if (message.payload.kind === 'draw') {
       const cooldownUntil = this.match.drawCooldownUntil[member.memberId] ?? 0;
       if (now < cooldownUntil) {
         const remaining = Math.ceil((cooldownUntil - now) / 1000);
-        this.sendGameRejection(
-          connection,
-          this.match.matchId,
-          this.match.stepNumber,
-          `求和申请冷却中，请在 ${remaining} 秒后再试`,
-          projectGameState(this.match),
-          message.requestId,
-        );
+        this.sendGameRejection(connection, `求和申请冷却中，请在 ${remaining} 秒后再试`, message.requestId);
         return;
       }
     }
@@ -1430,7 +1377,7 @@ export class RoomSession {
     this.recordMatchEvent(eventType, member.memberId, 'requested', eventMsg, now);
 
     this.scheduleNegotiationDeadline(this.match.matchId, negotiationId, deadline);
-    this.broadcastGameState({ requestId: message.requestId });
+    this.publishGame({ requestId: message.requestId });
   }
 
   private handleGameNegotiateReply(
@@ -1453,14 +1400,7 @@ export class RoomSession {
     }
 
     if (member.memberId !== pending.responderMemberId) {
-      this.sendGameRejection(
-        connection,
-        this.match.matchId,
-        this.match.stepNumber,
-        '非指定应答方，无法操作',
-        projectGameState(this.match),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, '非指定应答方，无法操作', message.requestId);
       return;
     }
 
@@ -1481,7 +1421,7 @@ export class RoomSession {
           this.match.pendingNegotiation = null;
           this.processedActions.clear();
           this.recordMatchEvent('undo-accepted', member.memberId, 'accepted', '对方同意了悔棋申请，棋盘已回退一步', now);
-          this.broadcastGameState({ requestId: message.requestId });
+          this.publishGame({ requestId: message.requestId });
           this.scheduleClockDeadline();
         }
       } else if (pending.type === 'draw') {
@@ -1490,7 +1430,7 @@ export class RoomSession {
         this.stopClockBroadcast();
         this.clearClockTimer();
         this.recordMatchEvent('draw-accepted', member.memberId, 'accepted', '双方同意握手言和，对局平局', now);
-        this.broadcastGameState({ requestId: message.requestId });
+        this.publishGame({ requestId: message.requestId });
       }
     } else {
       // 拒绝
@@ -1499,7 +1439,7 @@ export class RoomSession {
         this.match.pendingNegotiation = null;
         this.match.revision++;
         this.recordMatchEvent('undo-rejected', member.memberId, 'rejected', '对方拒绝了悔棋申请', now);
-        this.broadcastGameState({ requestId: message.requestId });
+        this.publishGame({ requestId: message.requestId });
         this.scheduleClockDeadline();
       } else if (pending.type === 'draw') {
         this.match.drawCooldownUntil[pending.initiatorMemberId] = now + DRAW_COOLDOWN_MS;
@@ -1507,7 +1447,7 @@ export class RoomSession {
         this.match.pendingNegotiation = null;
         this.match.revision++;
         this.recordMatchEvent('draw-rejected', member.memberId, 'rejected', '对方拒绝了求和申请', now);
-        this.broadcastGameState({ requestId: message.requestId });
+        this.publishGame({ requestId: message.requestId });
         this.scheduleClockDeadline();
       }
     }
@@ -1538,7 +1478,7 @@ export class RoomSession {
       this.stopClockBroadcast();
       this.clearClockTimer();
       this.clearNegotiationTimer();
-      this.broadcastGameState({ requestId: message.requestId });
+      this.publishGame({ requestId: message.requestId });
       return;
     }
 
@@ -1554,7 +1494,7 @@ export class RoomSession {
     this.stopClockBroadcast();
     this.clearClockTimer();
     this.recordMatchEvent('resigned', member.memberId, 'resigned', `${member.name} 认输，对局结束`, now);
-    this.broadcastGameState({ requestId: message.requestId });
+    this.publishGame({ requestId: message.requestId });
   }
 
   private handleGameSync(
@@ -1567,27 +1507,11 @@ export class RoomSession {
       return;
     }
     if (!this.match || this.lobby.phase !== 'started') {
-      this.sendGameRejection(
-        connection,
-        message.payload.matchId ?? '',
-        0,
-        '对局尚未开始',
-        createEmptyPublicGameState(),
-        message.requestId,
-      );
+      this.sendGameRejection(connection, '对局尚未开始', message.requestId);
       return;
     }
-    if (message.payload.matchId && message.payload.matchId !== this.match.matchId) {
-      this.sendGameRejection(
-        connection,
-        message.payload.matchId,
-        this.match.stepNumber,
-        '对局标识不匹配',
-        projectGameState(this.match),
-        message.requestId,
-      );
-      return;
-    }
+    // 显式同步永远返回当前权威局：客户端可能还停在旧 matchId，
+    // 若按请求标识拒绝，跨局后就会无限收到「标识不匹配」。
     const text = this.buildGameStateMessage(
       message.requestId ? { requestId: message.requestId } : undefined,
     );
@@ -1597,8 +1521,47 @@ export class RoomSession {
   }
 
   /**
-   * 全量公开棋局消息：welcome 之后的每次广播、单播同步与重复请求应答都由此构建，
-   * 保证所有发包路径共用同一份公开投影。
+   * 轻量版本核对：只回权威 matchId / revision，不投影、不构造棋盘。
+   * 供 5 秒巡检与跨局检测使用；没有对局时两者都为 null。
+   */
+  private handleGameVersion(
+    connection: SessionConnection,
+    message: Extract<ClientMessage, { type: 'game.version' }>,
+  ): void {
+    if (message.roomId !== this.roomId) {
+      this.reject(connection, 'INVALID_MESSAGE', 'room-id-mismatch');
+      return;
+    }
+    connection.send(
+      buildServerMessage(
+        buildServerGameVersion(this.roomId, {
+          matchId: this.match?.matchId ?? null,
+          revision: this.match?.revision ?? null,
+          requestId: message.requestId,
+        }),
+      ),
+    );
+  }
+
+  /**
+   * 已接受动作命中：同一 requestId 只在同一对局的同一成员下才算重复。
+   * 旧局或另一成员的请求即使撞了 ID 也按新请求处理。
+   */
+  private findProcessedAction(
+    requestId: string,
+    matchId: string,
+    memberId: string,
+  ): ProcessedAction | undefined {
+    const cached = this.processedActions.get(requestId);
+    if (!cached || cached.matchId !== matchId || cached.memberId !== memberId) {
+      return undefined;
+    }
+    return cached;
+  }
+
+  /**
+   * 全量公开快照消息：只用于欢迎单播与显式同步单播。
+   * 常规广播走 {@link publishGame} 的增量补丁。
    */
   private buildGameStateMessage(options?: {
     requestId?: string;
@@ -1633,15 +1596,54 @@ export class RoomSession {
     });
   }
 
-  private broadcastGameState(options?: {
+  /**
+   * 发布一次公开棋局变化。
+   *
+   * - 新局第一次发布（或基线落后于当前版本）发完整公开快照，作为全房间基线；
+   * - 之后每次只发 `game.patch`：棋子/历史/事件用差异，标量只带变化项；
+   * - 即使本次公开局面无差异，也发一条只带版本的最小补丁，保证客户端版本
+   *   与服务端一致，避免把它误判成缺口而不必要地全量同步；
+   * - 时钟不进入补丁：1Hz 广播只走 `game.clock`，避免每秒构造完整快照。
+   */
+  private publishGame(options?: {
     requestId?: string;
     actorMemberId?: string;
     action?: MatchAction;
   }): void {
-    const text = this.buildGameStateMessage(options);
-    if (text) {
-      this.broadcast(text);
+    if (!this.match) {
+      this.published = null;
+      return;
     }
+    const next = projectMatchSnapshot(this.match, this.now());
+    const previous = this.published;
+
+    if (!previous || previous.matchId !== next.matchId || next.revision <= previous.revision) {
+      const text = this.buildGameStateMessage(options);
+      this.published = next;
+      if (text) {
+        this.broadcast(text);
+      }
+      return;
+    }
+
+    const changes: PublicGameDelta = diffPublicSnapshot(previous, next);
+    this.published = next;
+    this.broadcast(
+      buildServerMessage(
+        buildServerGamePatch(this.roomId, {
+          patch: {
+            matchId: next.matchId,
+            baseRevision: previous.revision,
+            revision: next.revision,
+            stepNumber: next.stepNumber,
+            changes,
+          },
+          ...(options?.requestId ? { requestId: options.requestId } : {}),
+          ...(options?.actorMemberId ? { actorMemberId: options.actorMemberId } : {}),
+          ...(options?.action ? { action: options.action } : {}),
+        }),
+      ),
+    );
   }
 
   private handleChatPhrase(
@@ -1741,7 +1743,10 @@ export class RoomSession {
     const nextAllowedAt = now + QUICK_PHRASE_COOLDOWN_MS;
     this.phraseCooldownUntil.set(member.memberId, nextAllowedAt);
     if (this.match) {
+      // 短语冷却也是公开持久字段：推进版本并发布小补丁，才能被版本核对发现。
       this.match.phraseCooldownUntil[member.memberId] = nextAllowedAt;
+      this.match.revision++;
+      this.publishGame();
     }
 
     const event: QuickPhraseEvent = {
@@ -1814,6 +1819,7 @@ export class RoomSession {
       this.clearClockTimer();
       this.clearNegotiationTimer();
       this.match = null;
+      this.published = null;
       this.processedActions.clear();
       this.phraseCooldownUntil.clear();
       this.processedPhraseRequests.clear();
@@ -1889,43 +1895,26 @@ export class RoomSession {
       );
       return;
     }
-    const matchId =
-      message.type === 'game.action' ||
-      message.type === 'game.negotiate' ||
-      message.type === 'game.negotiate.reply' ||
-      message.type === 'game.resign'
-        ? message.payload.matchId
-        : '';
-    this.sendGameRejection(
-      connection,
-      matchId,
-      this.match?.stepNumber ?? 0,
-      '旁观者不可操作对局',
-      this.match ? projectGameState(this.match) : createEmptyPublicGameState(),
-      message.requestId,
-    );
+    this.sendGameRejection(connection, '旁观者不可操作对局', message.requestId);
   }
 
-  private sendGameRejection(
-    connection: SessionConnection,
-    matchId: string,
-    stepNumber: number,
-    reason: string,
-    state: PublicGameState,
-    requestId?: string,
-  ): void {
+  /**
+   * 精简拒绝：只给权威版本与原因，不夹带棋局快照。
+   * 有对局时报当前对局身份与版本（客户端据此发现版本落后并走权威同步）；
+   * 无对局时明确为 null，不拿请求里的旧 matchId 冒充权威版本。
+   */
+  private sendGameRejection(connection: SessionConnection, reason: string, requestId?: string): void {
+    const match = this.match;
     connection.send(
-      buildServerMessage({
-        type: 'game.rejected',
-        roomId: this.roomId,
-        ...(requestId ? { requestId } : {}),
-        payload: {
-          matchId,
-          stepNumber,
+      buildServerMessage(
+        buildServerGameRejected(this.roomId, {
+          matchId: match?.matchId ?? null,
+          revision: match?.revision ?? null,
+          stepNumber: match?.stepNumber ?? 0,
           reason,
-          state,
-        },
-      }),
+          ...(requestId ? { requestId } : {}),
+        }),
+      ),
     );
   }
 

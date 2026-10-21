@@ -5,6 +5,8 @@ import { buildStartParameters, createLobbyState } from '../lobby';
 import { createMatch } from '../match';
 import { publicSnapshotOf } from './helpers/public-fixtures';
 import { buildServerMessage } from '../protocol';
+import type { MatchAction } from '../match';
+import type { PublicGameDelta } from '../public-patch';
 import { computeReconnectDelay } from '../heartbeat';
 
 /** Application delivery faults; WebSocket itself remains ordered and reliable. */
@@ -66,11 +68,30 @@ function fixture() {
     roomId: 'room',
     payload: { matchId: snap.matchId, revision, sampleSeq, clock: { ...snap.clock!, sampleSeq } },
   });
+  const patch = (
+    baseRevision: number,
+    revision: number,
+    changes: PublicGameDelta,
+    extra: { requestId?: string; stepNumber?: number; actorMemberId?: string; action?: MatchAction } = {},
+  ) => ({
+    type: 'game.patch' as const,
+    roomId: 'room',
+    ...(extra.requestId ? { requestId: extra.requestId } : {}),
+    payload: {
+      matchId: snap.matchId,
+      baseRevision,
+      revision,
+      stepNumber: extra.stepNumber ?? snap.stepNumber,
+      changes,
+      ...(extra.actorMemberId ? { actorMemberId: extra.actorMemberId } : {}),
+      ...(extra.action ? { action: extra.action } : {}),
+    },
+  });
   const pong = () => {
     const ping = socket.sent.filter(m => m.type === 'ping').at(-1);
     if (ping) socket.deliver({ type: 'pong', roomId: 'room', payload: { seq: ping.payload.seq } });
   };
-  return { client, socket, sockets, snap, state, clock, pong };
+  return { client, socket, sockets, snap, state, patch, clock, pong };
 }
 
 describe('bounded weak-network recovery', () => {
@@ -163,16 +184,17 @@ describe('bounded weak-network recovery', () => {
     const f = fixture();
     f.socket.deliver(f.state(5));
     f.socket.deliver({ type: 'game.rejected', roomId: 'room', requestId: 'old', payload: {
-      matchId: 'match', stepNumber: 0, state: { ...f.snap.gameState, currentTurn: 'black' }, reason: 'stale',
+      matchId: 'match', revision: 6, stepNumber: 0, reason: 'stale',
     } });
     expect(f.client.getState().game!.gameState.currentTurn).toBe('red');
   });
 
-  it('recovers a lost terminal broadcast even when no further board or clock updates arrive', () => {
+  it('the 5s audit only asks for the version, never a full snapshot', () => {
     const f = fixture();
     for (let i = 0; i < 2; i++) { vi.advanceTimersByTime(2000); f.pong(); }
     vi.advanceTimersByTime(1000);
-    expect(f.socket.sent.some(m => m.type === 'game.sync')).toBe(true);
+    expect(f.socket.sent.some(m => m.type === 'game.version')).toBe(true);
+    expect(f.socket.sent.some(m => m.type === 'game.sync')).toBe(false);
   });
 
   it('coalesces manual reconnects and ignores delayed messages from the old generation', () => {
@@ -185,6 +207,76 @@ describe('bounded weak-network recovery', () => {
     expect(f.client.getState().game!.revision).toBe(f.snap.revision);
     f.client.disconnect();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('applies a patch only when it chains onto the local revision and confirms one action once', () => {
+    const f = fixture();
+    const action: MatchAction = { type: 'flip', position: { x: 0, y: 6 } };
+    f.client.sendGameAction(action);
+    const requestId = f.client.getState().game!.pendingAction!.requestId;
+
+    f.socket.deliver(
+      f.patch(0, 1, { currentTurn: 'black' }, { requestId, stepNumber: 1, actorMemberId: 'host', action }),
+    );
+    const game = f.client.getState().game!;
+    expect(game.revision).toBe(1);
+    expect(game.stepNumber).toBe(1);
+    expect(game.gameState.currentTurn).toBe('black');
+    expect(game.pendingAction).toBeNull();
+    expect(game.lastAcceptedAction?.eventId).toBe(`${f.snap.matchId}:1`);
+    expect(game.lastAcceptedAction?.action).toEqual(action);
+
+    // 重复补丁：不重复应用，也不产生第二次动作反馈。
+    const before = f.client.getState().game!;
+    f.socket.deliver(f.patch(0, 1, { currentTurn: 'black' }, { requestId, stepNumber: 1, actorMemberId: 'host', action }));
+    expect(f.client.getState().game).toBe(before);
+  });
+
+  it('detects a patch gap without buffering and asks for the authoritative snapshot', () => {
+    const f = fixture();
+    f.socket.deliver(f.patch(1, 2, { currentTurn: 'black' }, { stepNumber: 1 }));
+    expect(f.client.getState().game!.revision).toBe(f.snap.revision);
+    const sync = f.socket.sent.at(-1)!;
+    expect(sync.type).toBe('game.sync');
+
+    // 缺口补丁之后到来的新补丁也不会被缓存，仍然只同步。
+    f.socket.deliver(f.patch(2, 3, { currentTurn: 'black' }, { stepNumber: 2 }));
+    expect(f.client.getState().game!.revision).toBe(f.snap.revision);
+    expect(f.socket.sent.filter(m => m.type === 'game.sync')).toHaveLength(1);
+  });
+
+  it('a version reply only counts for the current probe and a newer version triggers sync', () => {
+    const f = fixture();
+    f.client.requestGameVersion();
+    const first = f.socket.sent.at(-1)!;
+    expect(first.type).toBe('game.version');
+    expect(first.payload).toEqual({ matchId: f.snap.matchId, revision: f.snap.revision });
+
+    // 迟到的旧应答：请求 ID 不匹配，直接忽略。
+    f.socket.deliver({
+      type: 'game.version',
+      roomId: 'room',
+      requestId: 'stale-probe',
+      payload: { matchId: f.snap.matchId, revision: f.snap.revision + 3 },
+    });
+    expect(f.socket.sent.filter(m => m.type === 'game.sync')).toHaveLength(0);
+
+    f.socket.deliver({
+      type: 'game.version',
+      roomId: 'room',
+      requestId: first.requestId,
+      payload: { matchId: f.snap.matchId, revision: f.snap.revision + 3 },
+    });
+    expect(f.socket.sent.at(-1)!.type).toBe('game.sync');
+  });
+
+  it('a version-only patch advances the revision without replaying feedback', () => {
+    const f = fixture();
+    f.socket.deliver(f.patch(0, 1, {}));
+    const game = f.client.getState().game!;
+    expect(game.revision).toBe(1);
+    expect(game.lastAcceptedAction).toBeNull();
+    expect(game.gameState).toEqual(f.snap.gameState);
   });
 
   it('higher revision undo may lower the step, while old snapshots and a retired match cannot revive it', () => {

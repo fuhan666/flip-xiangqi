@@ -22,6 +22,7 @@ import {
   buildClientGameNegotiateReply,
   buildClientGameResign,
   buildClientGameSync,
+  buildClientGameVersion,
   buildClientChatPhrase,
   buildClientHello,
   buildClientLeave,
@@ -57,6 +58,7 @@ import {
   type StartParameters,
   type TimeControlId,
 } from './protocol.js';
+import { applyPublicGameDelta } from './public-patch.js';
 import type { LobbyState } from './lobby.js';
 
 export type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'error';
@@ -266,6 +268,7 @@ export class RoomClient implements RoomConnection {
   private reconnectAttempt = 0;
   private reconnecting = false;
   private pendingSyncRequestId: string | null = null;
+  private pendingVersionRequestId: string | null = null;
   private syncTimer: ReturnType<typeof setTimeout> | null = null;
   private actionRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
   private stateAuditTimer: ReturnType<typeof setTimeout> | null = null;
@@ -682,6 +685,37 @@ export class RoomClient implements RoomConnection {
     return { ok: true };
   }
 
+  /**
+   * 轻量版本核对：只问服务端当前 matchId/revision，不请求完整棋局。
+   * 只有版本不一致（或事件缺口）才走 {@link requestGameSync} 的权威同步。
+   */
+  requestGameVersion(): void {
+    const socket = this.socket;
+    if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
+      return;
+    }
+    const roomId = this.state.roomId;
+    if (!roomId) {
+      return;
+    }
+    const game = this.state.game;
+    const requestId = generateRequestId();
+    this.pendingVersionRequestId = requestId;
+    try {
+      socket.send(
+        encodeMessage(
+          buildClientGameVersion(roomId, {
+            requestId,
+            matchId: game?.matchId ?? null,
+            revision: game?.revision ?? null,
+          }),
+        ),
+      );
+    } catch {
+      // 版本核对是尽力而为：发送失败交给心跳与下一轮巡检。
+    }
+  }
+
   requestGameSync(): void {
     if (this.pendingSyncRequestId) return;
     const socket = this.socket;
@@ -916,6 +950,7 @@ export class RoomClient implements RoomConnection {
       if (isLobbyPhase && this.state.game) this.retiredMatchIds.add(this.state.game.matchId);
       if (isLobbyPhase) {
         this.pendingSyncRequestId = null;
+        this.pendingVersionRequestId = null;
         if (this.syncTimer) clearTimeout(this.syncTimer);
         this.syncTimer = null;
       }
@@ -960,6 +995,21 @@ export class RoomClient implements RoomConnection {
           },
         });
       }
+      return;
+    }
+
+    if (message.type === 'game.patch') {
+      this.handleGamePatch(message);
+      return;
+    }
+
+    if (message.type === 'game.version') {
+      this.handleGameVersion(message);
+      return;
+    }
+
+    if (message.type === 'game.receipt') {
+      this.handleGameReceipt(message);
       return;
     }
 
@@ -1101,64 +1151,7 @@ export class RoomClient implements RoomConnection {
     }
 
     if (message.type === 'game.rejected') {
-      const incoming = message.payload;
-      const currentGame = this.state.game;
-      if (!currentGame || currentGame.matchId !== incoming.matchId) {
-        return;
-      }
-      // Rejections carry no revision. Only a currently pending action can own one.
-      // A snapshot request, rather than an uncorrelated rejection, repairs missed state.
-      if (!currentGame.pendingAction) {
-        if (message.requestId && message.requestId === this.pendingControlRequestId) {
-          this.pendingControlRequestId = null;
-          this.setState({ ...this.state, game: { ...currentGame, lastError: incoming.reason, statusNotice: incoming.reason } });
-          this.requestGameSync();
-        }
-        return;
-      }
-
-      // 如果带 requestId 且不匹配当前 pendingAction，属于旧请求的延迟拒绝，忽略
-      if (
-        message.requestId &&
-        currentGame.pendingAction &&
-        currentGame.pendingAction.requestId !== message.requestId
-      ) {
-        return;
-      }
-
-      if (incoming.stepNumber < currentGame.stepNumber) {
-        if (
-          currentGame.pendingAction &&
-          currentGame.pendingAction.stepNumber === incoming.stepNumber &&
-          (!message.requestId || currentGame.pendingAction.requestId === message.requestId)
-        ) {
-          this.setState({
-            ...this.state,
-            game: {
-              ...currentGame,
-              pendingAction: null,
-              lastRejectedReason: incoming.reason,
-              statusNotice: '你的操作未被采纳，请重新操作',
-              lastAcceptedAction: null,
-            },
-          });
-        }
-        return;
-      }
-
-      this.setState({
-        ...this.state,
-        game: {
-          ...currentGame,
-          stepNumber: incoming.stepNumber,
-          gameState: incoming.state,
-          pendingAction: null,
-          lastError: incoming.reason,
-          lastRejectedReason: incoming.reason,
-          statusNotice: '你的操作未被采纳，请重新操作',
-          lastAcceptedAction: null,
-        },
-      });
+      this.handleGameRejected(message.payload, message.requestId);
       return;
     }
 
@@ -1250,6 +1243,202 @@ export class RoomClient implements RoomConnection {
         }
       }
       this.fail(generation, code);
+    }
+  }
+
+  /**
+   * 公开增量补丁。
+   *
+   * - 只在与本地基线严格衔接（baseRevision === 本地 revision）时原子应用；
+   * - 重复或更旧的补丁直接丢弃；
+   * - 基线不衔接（漏包/乱序/旧局）不缓存、不猜测，交给既有权威同步；
+   * - 只有携带 actorMemberId + action 的新补丁才产生一次动作反馈，
+   *   eventId 由 matchId + revision 决定，重复补丁不会重播音效/动画。
+   */
+  private handleGamePatch(message: {
+    requestId?: string;
+    payload: {
+      matchId: string;
+      baseRevision: number;
+      revision: number;
+      stepNumber: number;
+      changes: Parameters<typeof applyPublicGameDelta>[2];
+      actorMemberId?: string;
+      action?: MatchAction;
+    };
+  }): void {
+    const patch = message.payload;
+    const current = this.state.game;
+    if (this.retiredMatchIds.has(patch.matchId)) {
+      return;
+    }
+    if (!current || current.matchId !== patch.matchId) {
+      // 没有这份棋局的基线：补丁不能凭空拼出局面。
+      if (this.state.lobby?.phase === 'started') {
+        this.requestGameSync();
+      }
+      return;
+    }
+    if (patch.revision <= current.revision) {
+      return;
+    }
+    if (patch.baseRevision !== current.revision) {
+      this.requestGameSync();
+      return;
+    }
+
+    const applied = applyPublicGameDelta(current.gameState, current.matchEvents ?? [], patch.changes);
+    if (!applied.ok) {
+      this.requestGameSync();
+      return;
+    }
+
+    const changes = patch.changes;
+    // 补丁只在时钟状态转换时携带一次采样；同序号更旧的采样仍然丢弃。
+    const nextClock =
+      applied.clock === undefined
+        ? current.clock
+        : applied.clock === null
+          ? null
+          : isStaleClockSample(applied.clock, current.clock)
+            ? current.clock
+            : applied.clock;
+    const clearsPending = Boolean(
+      message.requestId && current.pendingAction && current.pendingAction.requestId === message.requestId,
+    );
+    const accepted: AcceptedGameAction | null =
+      patch.actorMemberId && patch.action
+        ? {
+            eventId: `${patch.matchId}:${patch.revision}`,
+            stepNumber: patch.stepNumber - 1,
+            actorMemberId: patch.actorMemberId,
+            action: patch.action,
+            source: patch.actorMemberId === this.state.memberId ? 'local' : 'remote',
+            confirmed: true,
+          }
+        : null;
+
+    this.setState({
+      ...this.state,
+      game: {
+        ...current,
+        revision: patch.revision,
+        stepNumber: patch.stepNumber,
+        gameState: applied.gameState,
+        matchEvents: applied.matchEvents,
+        clock: nextClock,
+        settlement: changes.settlement !== undefined ? changes.settlement : current.settlement,
+        pendingNegotiation:
+          changes.pendingNegotiation !== undefined ? changes.pendingNegotiation : current.pendingNegotiation,
+        drawCooldownUntil: changes.drawCooldownUntil ?? current.drawCooldownUntil,
+        phraseCooldownUntil: changes.phraseCooldownUntil ?? current.phraseCooldownUntil,
+        negotiationEvent:
+          changes.negotiationEvent !== undefined ? changes.negotiationEvent : current.negotiationEvent,
+        pendingAction: clearsPending ? null : current.pendingAction,
+        lastError: null,
+        lastRejectedReason: null,
+        statusNotice: null,
+        lastAcceptedAction: accepted,
+      },
+    });
+  }
+
+  /**
+   * 版本核对应答：只比较身份与版本，不修改任何局面。
+   * 只有与本轮请求 ID 匹配的应答才算数，迟到应答不会覆盖更新局面。
+   */
+  private handleGameVersion(message: {
+    requestId?: string;
+    payload: { matchId: string | null; revision: number | null };
+  }): void {
+    if (!message.requestId || message.requestId !== this.pendingVersionRequestId) {
+      return;
+    }
+    this.pendingVersionRequestId = null;
+
+    const current = this.state.game;
+    if (!current) {
+      if (message.payload.matchId !== null && this.state.lobby?.phase === 'started') {
+        this.requestGameSync();
+      }
+      return;
+    }
+    if (message.payload.matchId !== current.matchId || message.payload.revision !== current.revision) {
+      this.requestGameSync();
+    }
+  }
+
+  /**
+   * 重复动作回执：不重播旧效果，只按权威版本决定是否需要补齐。
+   */
+  private handleGameReceipt(message: {
+    requestId?: string;
+    payload: { matchId: string; revision: number; stepNumber: number };
+  }): void {
+    const current = this.state.game;
+    if (!current || current.matchId !== message.payload.matchId) {
+      if (this.state.lobby?.phase === 'started') {
+        this.requestGameSync();
+      }
+      return;
+    }
+    const ownsPending = Boolean(
+      message.requestId && current.pendingAction && current.pendingAction.requestId === message.requestId,
+    );
+    if (message.payload.revision > current.revision) {
+      if (ownsPending) {
+        this.setState({ ...this.state, game: { ...current, pendingAction: null } });
+      }
+      this.requestGameSync();
+    }
+  }
+
+  /**
+   * 精简拒绝：只清对应在途请求并给出原因；不采纳拒绝里的任何局面。
+   * 权威版本领先本地时，交给既有权威同步补齐。
+   */
+  private handleGameRejected(
+    payload: { matchId: string | null; revision: number | null; stepNumber: number; reason: string },
+    requestId: string | undefined,
+  ): void {
+    if (requestId && requestId === this.pendingSyncRequestId) {
+      this.pendingSyncRequestId = null;
+      if (this.syncTimer) {
+        clearTimeout(this.syncTimer);
+        this.syncTimer = null;
+      }
+    }
+
+    const current = this.state.game;
+    const ownsPending = Boolean(
+      current && requestId && current.pendingAction && current.pendingAction.requestId === requestId,
+    );
+    const ownsControl = Boolean(requestId && requestId === this.pendingControlRequestId);
+    if (ownsControl) {
+      this.pendingControlRequestId = null;
+    }
+    if (!current) {
+      return;
+    }
+    if (!ownsPending && !ownsControl) {
+      // 迟到或与本端在途请求无关的拒绝：不改变任何状态。
+      return;
+    }
+
+    this.setState({
+      ...this.state,
+      game: {
+        ...current,
+        ...(ownsPending ? { pendingAction: null } : {}),
+        lastError: payload.reason,
+        lastRejectedReason: payload.reason,
+        statusNotice: ownsPending ? '你的操作未被采纳，请重新操作' : payload.reason,
+        ...(ownsPending ? { lastAcceptedAction: null } : {}),
+      },
+    });
+
+    if (payload.revision !== null && payload.revision > current.revision) {
+      this.requestGameSync();
     }
   }
 
@@ -1550,13 +1739,19 @@ export class RoomClient implements RoomConnection {
     this.pendingPingSeq = null;
   }
 
+  /**
+   * 5 秒巡检只核对版本：同版本时零完整快照、零投影。
+   * 终局也要继续核对，因为最后的结算补丁可能丢失。
+   * 有待确认动作时不巡检（等待态由动作恢复定时器负责强制同步）。
+   */
   private startStateAudit(generation: number): void {
     if (this.stateAuditTimer) clearTimeout(this.stateAuditTimer);
     this.stateAuditTimer = setTimeout(() => {
       this.stateAuditTimer = null;
       if (generation !== this.generation || this.state.status !== 'connected') return;
-      // Includes terminal positions: their final broadcast may be the lost message.
-      if ((this.state.game || this.state.lobby?.phase === 'started') && !this.state.game?.pendingAction) this.requestGameSync();
+      if ((this.state.game || this.state.lobby?.phase === 'started') && !this.state.game?.pendingAction) {
+        this.requestGameVersion();
+      }
       this.startStateAudit(generation);
     }, STATE_AUDIT_INTERVAL_MS);
   }
@@ -1567,6 +1762,7 @@ export class RoomClient implements RoomConnection {
     }
     this.syncTimer = this.actionRecoveryTimer = this.stateAuditTimer = null;
     this.pendingSyncRequestId = null;
+    this.pendingVersionRequestId = null;
     this.pendingControlRequestId = null;
   }
 

@@ -858,11 +858,13 @@ describe('heartbeat and reconnection', () => {
       ),
     );
 
-    const step1Host = await pair.host.waitForType('game.state', (m) => m.payload.stepNumber === 1);
-    const step1Guest = await pair.guest.waitForType('game.state', (m) => m.payload.stepNumber === 1);
+    const step1Host = await pair.host.waitForType('game.patch', (m) => m.payload.stepNumber === 1);
+    const step1Guest = await pair.guest.waitForType('game.patch', (m) => m.payload.stepNumber === 1);
     expect(step1Host.payload.action).toEqual({ type: 'flip', position: hiddenPiece.position! });
     expect(step1Guest.payload.actorMemberId).toBe(pair.hostId);
-    expect(step1Host.payload.state.currentTurn).toBe('black');
+    expect(step1Host.payload.changes.currentTurn).toBe('black');
+    expect(step1Host.payload.baseRevision).toBe(0);
+    expect(step1Host.payload.revision).toBe(1);
 
     // 3. 再次发送已过期的第 0 步 -> 拒绝
     pair.guest.send(
@@ -991,7 +993,7 @@ describe('heartbeat and reconnection', () => {
       ),
     );
 
-    const step1 = await pair.host.waitForType('game.state', (m) => m.payload.stepNumber === 1);
+    const step1 = await pair.host.waitForType('game.patch', (m) => m.payload.stepNumber === 1);
     expect(step1.requestId).toBe('req-idem-1');
 
     // 重复发送完全相同的 requestId -> 幂等命中，返回相同步数 1，不产生第 2 步
@@ -1006,8 +1008,10 @@ describe('heartbeat and reconnection', () => {
       ),
     );
 
-    const idemResponse = await pair.host.waitForType('game.state', (m) => m.requestId === 'req-idem-1');
+    // 重复请求只回精简回执：不重播旧效果，也不广播。
+    const idemResponse = await pair.host.waitForType('game.receipt', (m) => m.requestId === 'req-idem-1');
     expect(idemResponse.payload.stepNumber).toBe(1);
+    expect(idemResponse.payload.acceptedStepNumber).toBe(1);
 
     // 测试旧 socket 替换：房主重连获得新 socket
     const newHost = await openClient(pair.room.actualPort);
@@ -1028,10 +1032,10 @@ describe('heartbeat and reconnection', () => {
     pair.host.send(encodeMessage(buildClientLobbyStart(pair.room.roomId)));
     await pair.host.waitForType('game.state');
 
-    // 1. 错误的 matchId (返回 game.rejected，不破坏连接)
+    // 1. 跨局同步：永远返回当前权威局，不再按请求里的旧 matchId 无限拒绝。
     pair.host.send(JSON.stringify({ version: PROTOCOL_VERSION, type: 'game.sync', roomId: pair.room.roomId, requestId: 'sync-bad-match', payload: { matchId: 'non-existent-match' } }));
-    const rej = await pair.host.waitForType('game.rejected', (m) => m.requestId === 'sync-bad-match');
-    expect(rej.payload.reason).toContain('对局标识不匹配');
+    const synced = await pair.host.waitForType('game.state', (m) => m.requestId === 'sync-bad-match');
+    expect(synced.payload.matchId).toBe(pair.room.getMatch()!.matchId);
 
     // 2. 错误的 roomId (协议层错误，返回 error 并关闭)
     pair.host.send(JSON.stringify({ version: PROTOCOL_VERSION, type: 'game.sync', roomId: 'wrong-room', payload: {} }));
@@ -1064,9 +1068,9 @@ describe('heartbeat and reconnection', () => {
 
     // 步时超时：推进 31 秒
     simulatedTime += 31_000;
-    const timeoutState = await pair.host.waitForType('game.state', (m) => m.payload.settlement != null);
-    expect(timeoutState.payload.settlement.winner).toBe('black');
-    expect(timeoutState.payload.settlement.reason).toBe('step-timeout');
+    const timeoutState = await pair.host.waitForType('game.patch', (m) => m.payload.changes?.settlement != null);
+    expect(timeoutState.payload.changes.settlement.winner).toBe('black');
+    expect(timeoutState.payload.changes.settlement.reason).toBe('step-timeout');
   });
 
   it('triggers 90-second disconnect grace when guest drops, and settles on expiration', async () => {
@@ -1085,15 +1089,15 @@ describe('heartbeat and reconnection', () => {
 
     // 客人掉线
     pair.guest.socket.close();
-    const pausedState = await pair.host.waitForType('game.state', (m) => m.payload.clock?.paused === true);
-    expect(pausedState.payload.clock.disconnectGrace.guestDeadlineMs).toBe(simulatedTime + 90_000);
+    const pausedState = await pair.host.waitForType('game.patch', (m) => m.payload.changes?.clock?.paused === true);
+    expect(pausedState.payload.changes.clock.disconnectGrace.guestDeadlineMs).toBe(simulatedTime + 90_000);
 
     // 90秒耗尽
     simulatedTime += 90_001;
     // 触发时钟检查（可通过定期 broadcast 或手动检查）
-    const endedState = await pair.host.waitForType('game.state', (m) => m.payload.settlement != null);
-    expect(endedState.payload.settlement.reason).toBe('disconnect-timeout');
-    expect(endedState.payload.settlement.winner).toBe('red');
+    const endedState = await pair.host.waitForType('game.patch', (m) => m.payload.changes?.settlement != null);
+    expect(endedState.payload.changes.settlement.reason).toBe('disconnect-timeout');
+    expect(endedState.payload.changes.settlement.winner).toBe('red');
   });
 
   it('handles rematch and return to lobby flow', async () => {
@@ -1120,12 +1124,12 @@ describe('heartbeat and reconnection', () => {
         }),
       ),
     );
-    await pair.host.waitForType('game.state', (m) => m.payload.stepNumber === 1);
+    await pair.host.waitForType('game.patch', (m) => m.payload.stepNumber === 1);
 
     // 客人主动离开当前局，客人判负终局
     pair.guest.send(encodeMessage(buildClientLeave(pair.room.roomId)));
-    const endedState = await pair.host.waitForType('game.state', (m) => m.payload.settlement != null);
-    expect(endedState.payload.settlement.reason).toBe('disconnect-timeout');
+    const endedState = await pair.host.waitForType('game.patch', (m) => m.payload.changes?.settlement != null);
+    expect(endedState.payload.changes.settlement.reason).toBe('disconnect-timeout');
 
     // 房主点击再来一局
     pair.host.send(encodeMessage(buildClientLobbyReturn(pair.room.roomId, { matchId, intent: 'rematch' })));

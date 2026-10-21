@@ -290,12 +290,13 @@ describe('RoomServer negotiation protocol flows', () => {
           requestId: 'req-1',
           matchId,
           stepNumber: 0,
+          revision: 0,
           action: { type: 'flip', position: hidden.position },
         }),
       ),
     );
-    const hostState1 = await host.waitForType('game.state', (m) => m.payload.stepNumber === 1);
-    await guest.waitForType('game.state', (m) => m.payload.stepNumber === 1);
+    const hostState1 = await host.waitForType('game.patch', (m) => m.payload.stepNumber === 1);
+    await guest.waitForType('game.patch', (m) => m.payload.stepNumber === 1);
 
     // 房主发起悔棋协商
     host.send(
@@ -310,10 +311,10 @@ describe('RoomServer negotiation protocol flows', () => {
     );
 
     // 双方收到 pendingNegotiation 广播
-    const negStateHost = await host.waitForType('game.state', (m) => Boolean(m.payload.pendingNegotiation));
-    expect(negStateHost.payload.pendingNegotiation.type).toBe('undo');
-    const negStateGuest = await guest.waitForType('game.state', (m) => Boolean(m.payload.pendingNegotiation));
-    const negId = negStateGuest.payload.pendingNegotiation.negotiationId;
+    const negStateHost = await host.waitForType('game.patch', (m) => Boolean(m.payload.changes.pendingNegotiation));
+    expect(negStateHost.payload.changes.pendingNegotiation.type).toBe('undo');
+    const negStateGuest = await guest.waitForType('game.patch', (m) => Boolean(m.payload.changes.pendingNegotiation));
+    const negId = negStateGuest.payload.changes.pendingNegotiation.negotiationId;
 
     // 客人同意悔棋
     guest.send(
@@ -329,10 +330,10 @@ describe('RoomServer negotiation protocol flows', () => {
 
     // 棋局回退至第 0 步，并携带 undo-accepted 事件
     const rolledBackHost = await host.waitForType(
-      'game.state',
-      (m) => m.payload.stepNumber === 0 && m.payload.negotiationEvent?.type === 'undo-accepted',
+      'game.patch',
+      (m) => m.payload.stepNumber === 0 && m.payload.changes.negotiationEvent?.type === 'undo-accepted',
     );
-    expect(rolledBackHost.payload.pendingNegotiation).toBeNull();
+    expect(rolledBackHost.payload.changes.pendingNegotiation).toBeNull();
   });
 
   it('handles draw negotiation: request -> reject -> cooldown enforcement', async () => {
@@ -350,8 +351,8 @@ describe('RoomServer negotiation protocol flows', () => {
       ),
     );
 
-    const negState = await host.waitForType('game.state', (m) => m.payload.pendingNegotiation?.type === 'draw');
-    const negId = negState.payload.pendingNegotiation.negotiationId;
+    const negState = await host.waitForType('game.patch', (m) => m.payload.changes.pendingNegotiation?.type === 'draw');
+    const negId = negState.payload.changes.pendingNegotiation.negotiationId;
 
     // 房主拒绝求和
     host.send(
@@ -367,10 +368,10 @@ describe('RoomServer negotiation protocol flows', () => {
 
     // 双方收到 draw-rejected 事件，且客人进入 10 秒冷却
     const rejectedGuest = await guest.waitForType(
-      'game.state',
-      (m) => m.payload.negotiationEvent?.type === 'draw-rejected',
+      'game.patch',
+      (m) => m.payload.changes.negotiationEvent?.type === 'draw-rejected',
     );
-    expect(rejectedGuest.payload.drawCooldownUntil[guestMemberId]).toBeGreaterThan(Date.now());
+    expect(rejectedGuest.payload.changes.drawCooldownUntil[guestMemberId]).toBeGreaterThan(Date.now());
 
     // 客人在冷却期内再次请求求和 -> 收到 game.rejected
     guest.send(
@@ -402,10 +403,10 @@ describe('RoomServer negotiation protocol flows', () => {
     );
 
     // 房主获胜
-    const settled = await host.waitForType('game.state', (m) => Boolean(m.payload.settlement));
-    expect(settled.payload.settlement.winner).toBe('red');
-    expect(settled.payload.settlement.loser).toBe('black');
-    expect(settled.payload.settlement.reason).toBe('resignation');
-    expect(settled.payload.negotiationEvent?.type).toBe('resigned');
+    const settled = await host.waitForType('game.patch', (m) => Boolean(m.payload.changes.settlement));
+    expect(settled.payload.changes.settlement.winner).toBe('red');
+    expect(settled.payload.changes.settlement.loser).toBe('black');
+    expect(settled.payload.changes.settlement.reason).toBe('resignation');
+    expect(settled.payload.changes.negotiationEvent?.type).toBe('resigned');
   });
 });
