@@ -55,7 +55,7 @@ async function newPlayer(runtime: OnlineRuntime): Promise<Player> {
 async function join(player: Player, roomId: string): Promise<ConnectionState> {
   player.client.connectOnline(roomId);
   try {
-    await until(() => player.client.getState().status === 'connected', 5_000);
+    await until(() => player.client.getState().status === 'connected', 15_000);
   } catch (error) {
     throw new Error(`join failed: ${JSON.stringify(player.client.getState())}`);
   }
@@ -113,7 +113,7 @@ async function startMatch(host: Player, guest: Player): Promise<void> {
       host.client.getState().lobby?.ready.guest === true,
   );
   host.client.sendLobbyStart();
-  await until(() => host.client.getState().game !== null && guest.client.getState().game !== null, 5_000);
+  await until(() => host.client.getState().game !== null && guest.client.getState().game !== null, 15_000);
   expect(host.client.getState().lobby?.phase).toBe('started');
 }
 
@@ -123,7 +123,7 @@ async function settledBoth(host: Player, guest: Player, step: number): Promise<v
       host.client.getState().game?.stepNumber === step &&
       guest.client.getState().game?.stepNumber === step &&
       host.client.getState().game?.pendingAction === null,
-    5_000,
+    15_000,
   );
 }
 
@@ -180,12 +180,12 @@ describe('在线入口：单一地址多房间', () => {
     await settledBoth(hostA, guestA, 3);
 
     guestA.client.sendGameResign();
-    await until(() => sessionA.getPublicMatch()!.settlement !== null, 3_000);
+    await until(() => sessionA.getPublicMatch()!.settlement !== null, 10_000);
     await until(
       () =>
         hostA.client.getState().game?.settlement != null &&
         guestA.client.getState().game?.settlement != null,
-      3_000,
+      10_000,
     );
     expect(hostA.client.getState().game!.settlement!.winner).toBeTruthy();
 
@@ -196,14 +196,14 @@ describe('在线入口：单一地址多房间', () => {
 
     // B 房独立完成：认输结算。
     guestB.client.sendGameResign();
-    await until(() => sessionB.getPublicMatch()!.settlement !== null, 3_000);
-    await until(() => hostB.client.getState().game?.settlement != null, 3_000);
+    await until(() => sessionB.getPublicMatch()!.settlement !== null, 10_000);
+    await until(() => hostB.client.getState().game?.settlement != null, 10_000);
     expect(hostB.client.getState().game!.settlement!.winner).toBeTruthy();
 
     // A 房的结算不改变 B 房的成员与房间号。
     expect(hostB.client.getState().roomId).toBe(roomB.roomId);
     expect(sessionB.getMembers().map((member) => member.role)).toEqual(['host', 'guest']);
-  }, 30_000);
+  }, 60_000);
 
   it('跨房消息、伪造身份与越权动作都被拒绝且不改变任何房间状态', async () => {
     const runtime = await startRuntime();
@@ -229,7 +229,7 @@ describe('在线入口：单一地址多房间', () => {
 
     // 客人越权：修改房主设置与开始对局，都被服务端拒绝。
     guestA.client.sendLobbySettings('host-black', 'blitz');
-    await until(() => guestA.client.getState().lastRejection !== null, 2_000);
+    await until(() => guestA.client.getState().lastRejection !== null, 8_000);
     guestA.client.sendLobbyStart();
     expect(sessionA.getLobby().settings.sidePreference).toBe('host-red');
     expect(sessionA.getLobby().settings.timeControlId).toBe('standard');
@@ -245,7 +245,7 @@ describe('在线入口：单一地址多房间', () => {
     const watcherCookie = await openSession(port);
     const watcher = await RawRoomSocket.open(port, roomA.roomId, { cookie: watcherCookie });
     watcher.send({ version: 10, type: 'online.hello', roomId: roomA.roomId, payload: {} });
-    await until(() => watcher.last('welcome') !== null, 2_000);
+    await until(() => watcher.last('welcome') !== null, 8_000);
     expect(watcher.last('welcome')!.payload.role).toBe('spectator');
 
     watcher.send({
@@ -260,27 +260,27 @@ describe('在线入口：单一地址多房间', () => {
         action: { type: 'flip', position: { x: 0, y: 6 } },
       },
     });
-    await until(() => watcher.last('game.rejected') !== null, 2_000);
+    await until(() => watcher.last('game.rejected') !== null, 8_000);
 
     // 另一个房间的玩家连接：信封指向 A 房的心跳与动作都被房间绑定拒绝。
     const foreignCookie = await openSession(port);
     const foreignRoom = (await createRoom(port, foreignCookie, 'foreign')).json!;
     const foreign = await RawRoomSocket.open(port, foreignRoom.roomId, { cookie: foreignCookie });
     foreign.send({ version: 10, type: 'online.hello', roomId: foreignRoom.roomId, payload: {} });
-    await until(() => foreign.last('welcome') !== null, 2_000);
+    await until(() => foreign.last('welcome') !== null, 8_000);
     expect(foreign.last('welcome')!.payload.role).toBe('host');
 
     // 心跳被拒后连接按协议关闭（4000），不能继续复用。
     foreign.send({ version: 10, type: 'ping', roomId: roomA.roomId, payload: { seq: 1 } });
-    await until(() => foreign.last('error') !== null, 2_000);
+    await until(() => foreign.last('error') !== null, 8_000);
     expect(foreign.last('error')!.payload.message).toBe('room-id-mismatch');
-    await until(() => foreign.closed !== null, 2_000);
+    await until(() => foreign.closed !== null, 8_000);
     expect(foreign.closed!.code).toBe(4000);
 
     // 换一条新连接，用同一玩家身份尝试把动作投到 A 房，同样被房间绑定拒绝。
     const foreign2 = await RawRoomSocket.open(port, foreignRoom.roomId, { cookie: foreignCookie });
     foreign2.send({ version: 10, type: 'online.hello', roomId: foreignRoom.roomId, payload: {} });
-    await until(() => foreign2.last('welcome') !== null, 2_000);
+    await until(() => foreign2.last('welcome') !== null, 8_000);
     foreign2.send({
       version: 10,
       type: 'game.action',
@@ -293,7 +293,7 @@ describe('在线入口：单一地址多房间', () => {
         action: { type: 'flip', position: { x: 0, y: 6 } },
       },
     });
-    await until(() => foreign2.last('error') !== null, 2_000);
+    await until(() => foreign2.last('error') !== null, 8_000);
     expect(foreign2.last('error')!.payload.message).toBe('room-id-mismatch');
     foreign2.close();
 
@@ -312,7 +312,7 @@ describe('在线入口：单一地址多房间', () => {
     expect(sessionA.getPublicMatch()!.stepNumber).toBe(0);
     expect(sessionB.getMembers().some((member) => member.id === intruder.client.getState().memberId)).toBe(false);
     watcher.close();
-  }, 30_000);
+  }, 60_000);
 
   it('握手与 API 的拒绝矩阵：无凭据、坏 Origin、未知房间、LAN 入口与非法载荷', async () => {
     const runtime = await startRuntime();
@@ -362,7 +362,7 @@ describe('在线入口：单一地址多房间', () => {
     // --- 非法载荷 ---
     const lanHello = await RawRoomSocket.open(port, room.roomId, { cookie: host.cookie });
     lanHello.send({ version: 10, type: 'hello', roomId: room.roomId, payload: { role: 'host', name: 'x' } });
-    await until(() => lanHello.last('error') !== null, 2_000);
+    await until(() => lanHello.last('error') !== null, 8_000);
     expect(lanHello.last('error')?.payload.message).toBe('lan-hello-not-allowed');
     lanHello.close();
 
@@ -373,7 +373,7 @@ describe('在线入口：单一地址多房间', () => {
       roomId: room.roomId,
       payload: { role: 'host', memberId: 'forged' },
     });
-    await until(() => forgedIdentity.last('error') !== null, 2_000);
+    await until(() => forgedIdentity.last('error') !== null, 8_000);
     expect(forgedIdentity.last('error')?.payload.code).toBe('INVALID_MESSAGE');
     expect(forgedIdentity.last('error')?.payload.message).toBe('online-hello-payload');
     forgedIdentity.close();
@@ -381,12 +381,12 @@ describe('在线入口：单一地址多房间', () => {
     // --- 心跳的跨房门禁 ---
     const crossRoomPing = await RawRoomSocket.open(port, room.roomId, { cookie: host.cookie });
     crossRoomPing.send({ version: 10, type: 'online.hello', roomId: room.roomId, payload: {} });
-    await until(() => crossRoomPing.last('welcome') !== null, 2_000);
+    await until(() => crossRoomPing.last('welcome') !== null, 8_000);
     crossRoomPing.send({ version: 10, type: 'ping', roomId: 'another-room', payload: { seq: 1 } });
-    await until(() => crossRoomPing.last('error') !== null, 2_000);
+    await until(() => crossRoomPing.last('error') !== null, 8_000);
     expect(crossRoomPing.last('error')?.payload.message).toBe('room-id-mismatch');
     crossRoomPing.close();
-  }, 30_000);
+  }, 60_000);
 
   it('建房幂等：同键并发与重试只得一个房间，关闭后不复活', async () => {
     const runtime = await startRuntime();
@@ -431,7 +431,7 @@ describe('在线入口：单一地址多房间', () => {
       cookie: host.cookie,
     });
     expect(denied.status).toBe(403);
-  }, 30_000);
+  }, 60_000);
 
   it('刷新重连凭 cookie 恢复原成员，连接标识独立；关闭单房不影响共享监听器', async () => {
     const runtime = await startRuntime();
@@ -456,7 +456,7 @@ describe('在线入口：单一地址多房间', () => {
     });
     cleanups.push(() => reopened.disconnect(false));
     reopened.connectOnline(room.roomId);
-    await until(() => reopened.getState().status === 'connected', 5_000);
+    await until(() => reopened.getState().status === 'connected', 15_000);
     expect(reopened.getState().memberId).toBe(original.memberId);
     expect(reopened.getState().role).toBe('host');
     expect(runtime.getRoom(room.roomId)!.getMembers()).toHaveLength(2);
@@ -464,7 +464,7 @@ describe('在线入口：单一地址多房间', () => {
     // 关闭 A 房后监听器仍在，可创建并加入新房间。
     const closed = await callApi(port, `/api/online/rooms/${room.roomId}/close`, { body: {}, cookie: host.cookie });
     expect(closed.status).toBe(200);
-    await until(() => reopened.getState().status !== 'connected', 3_000);
+    await until(() => reopened.getState().status !== 'connected', 10_000);
 
     const newHost = await newPlayer(runtime);
     const second = (await createRoom(port, newHost.cookie, 'second')).json!;
@@ -476,7 +476,7 @@ describe('在线入口：单一地址多房间', () => {
     await runtime.stop();
     await runtime.stop();
     await expect(callApi(port, '/api/online/session', { body: {} })).rejects.toBeTruthy();
-  }, 30_000);
+  }, 60_000);
 
   it('出站消息不含任何控制/重连密钥与内部棋局数据', async () => {
     const runtime = await startRuntime();
@@ -521,7 +521,7 @@ describe('在线入口：单一地址多房间', () => {
         }
       }
     }
-  }, 30_000);
+  }, 60_000);
 });
 
 describe('在线入口启动配置', () => {

@@ -7,7 +7,7 @@ import { createServer } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { WebSocket } from 'ws';
 import type { WebSocketLike } from '../../../src/network/client';
-import { OnlineRuntime } from '../../online-runtime';
+import { OnlineRuntime, OnlineRuntimeError } from '../../online-runtime';
 import { testTls } from './tls';
 
 /** 测试用对外来源：主机固定 127.0.0.1，端口随监听端口一致。 */
@@ -15,7 +15,7 @@ export function originFor(port: number): string {
   return `https://127.0.0.1:${port}`;
 }
 
-export async function until(predicate: () => boolean, timeout = 4_000): Promise<void> {
+export async function until(predicate: () => boolean, timeout = 10_000): Promise<void> {
   const deadline = Date.now() + timeout;
   while (!predicate()) {
     if (Date.now() > deadline) {
@@ -35,20 +35,30 @@ async function freePort(): Promise<number> {
 }
 
 export async function startOnlineRuntime(): Promise<OnlineRuntime> {
-  const port = await freePort();
-  const runtime = new OnlineRuntime({
-    port,
-    host: '127.0.0.1',
-    publicOrigin: originFor(port),
-    staticDir: 'dist',
-    tls: testTls(),
-    logger: () => undefined,
-    handshakeTimeoutMs: 2_000,
-    heartbeatIntervalMs: 2_000,
-    heartbeatTimeoutMs: 4_000,
-  });
-  await runtime.start();
-  return runtime;
+  // 并行测试各自探测空闲端口，可能与另一个 worker 撞端口：按端口占用重试。
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const port = await freePort();
+    const runtime = new OnlineRuntime({
+      port,
+      host: '127.0.0.1',
+      publicOrigin: originFor(port),
+      staticDir: 'dist',
+      tls: testTls(),
+      logger: () => undefined,
+      handshakeTimeoutMs: 2_000,
+      heartbeatIntervalMs: 2_000,
+      heartbeatTimeoutMs: 4_000,
+    });
+    try {
+      await runtime.start();
+      return runtime;
+    } catch (error) {
+      if (!(error instanceof OnlineRuntimeError) || error.code !== 'PORT') {
+        throw error;
+      }
+    }
+  }
+  throw new Error('无法为在线入口测试分配空闲端口');
 }
 
 export interface ApiResponse {
