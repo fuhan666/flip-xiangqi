@@ -8,10 +8,14 @@
 
 - 联机终局棋谱：首次结算时由服务器用该局独立开局帧、权威有效主线与结算信息生成格式 1 的 JSON/中文文本，按 matchId 在内存保留 30 分钟；本房双方玩家与获准旁观者可导出并只读复盘。
 - 房间内临时终局棋谱入口与「棋谱不可用」明确提示（进行中、已过期或服务器重启）。
+- 独立在线入口：单一 HTTPS/WSS 地址按 roomId 承载多个匿名房间，可创建/凭房间号加入并完成一整盘对战。
+- 服务器签发并校验的匿名凭据（HttpOnly cookie，仅存摘要）；身份、成员席位与连接标识三层分离，刷新/重连恢复原成员。
+- 建房请求幂等（同身份同 requestId 只建一个房间）；邀请链接只含公开房间号，不含房主控制或重连密钥。
+- `npm run dev:online` / `npm run start:online` 与 `docs/online-setup.md`；局域网启动入口保持不变。
 
 ### Changed
 
-- 协议升至 v10：新增 `game.record.request`、`game.record`、`game.record.unavailable`、`game.records`；进行中对局仍不下发完整初始布局。
+- 协议统一升至 v10：新增 `game.record.request`、`game.record`、`game.record.unavailable`、`game.records` 与在线入口的 `online.hello`；进行中对局仍不下发完整初始布局。
 - 棋谱纯逻辑与浏览器下载模块拆分，服务端可直接复用格式 1 的生成与校验。
 
 ## [0.9.0] - 2026-10-19

@@ -18,22 +18,17 @@ import {
   DEFAULT_HEARTBEAT_TIMEOUT_MS,
 } from '../src/network/heartbeat.js';
 import {
-  buildPong,
-  buildServerMessage,
   closeCodeForError,
-  parseClientMessage,
   WS_PATH,
-  type ClientMessage,
   type MemberSnapshot,
   type RoomClosedReason,
-  type ServerErrorCode,
 } from '../src/network/protocol.js';
 import type { LobbyState } from '../src/network/lobby.js';
 import type { MatchSnapshot } from '../src/network/match.js';
 import type { PublicMatchSnapshot } from '../src/network/public-game.js';
-import { asConnectionId, generateId, type ConnectionId } from './room-identity.js';
 import { defaultLogger, type Logger } from './log.js';
-import { RoomSession, type SessionConnection } from './room-session.js';
+import { RoomSession } from './room-session.js';
+import { serveSessionSocket, type SessionSocketHandle } from './session-transport.js';
 
 export type RoomServerErrorCode = 'INVALID_PORT' | 'PORT_UNAVAILABLE' | 'NO_PERMISSION' | 'INTERNAL_ERROR';
 
@@ -72,45 +67,6 @@ const DEFAULT_MAX_PORT_ATTEMPTS = 20;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 const CLOSE_DRAIN_TIMEOUT_MS = 1_000;
 
-interface SocketWatchdog {
-  intervalTimer: NodeJS.Timeout | null;
-  timeoutTimer: NodeJS.Timeout | null;
-  pendingPongSeq: number | null;
-  seq: number;
-}
-
-/** WebSocket 连接端口：会话只见 connectionId + 发送/关闭，不接触 socket 细节。 */
-class WebSocketConnection implements SessionConnection {
-  readonly connectionId: ConnectionId;
-
-  private readonly socket: WebSocket;
-
-  constructor(connectionId: ConnectionId, socket: WebSocket) {
-    this.connectionId = connectionId;
-    this.socket = socket;
-  }
-
-  send(text: string): void {
-    // 1 === WebSocket.OPEN
-    if (this.socket.readyState !== 1) {
-      return;
-    }
-    try {
-      this.socket.send(text);
-    } catch {
-      // 忽略单个发送失败。
-    }
-  }
-
-  close(code: number, reason: string): void {
-    try {
-      this.socket.close(code, reason);
-    } catch {
-      // socket 可能已关闭。
-    }
-  }
-}
-
 export class RoomServer {
   private readonly options: Required<Pick<RoomServerOptions, 'maxPortAttempts' | 'handshakeTimeoutMs' | 'heartbeatIntervalMs' | 'heartbeatTimeoutMs'>> & RoomServerOptions;
   private readonly logger: Logger;
@@ -120,8 +76,7 @@ export class RoomServer {
   private readonly server: Server;
   private readonly wss: WebSocketServer;
   private readonly tcpSockets = new Set<Socket>();
-  private readonly openSockets = new Set<WebSocket>();
-  private readonly watchdogs = new Map<WebSocket, SocketWatchdog>();
+  private readonly sockets = new Set<SessionSocketHandle>();
   private closed = false;
   private port = 0;
 
@@ -280,82 +235,12 @@ export class RoomServer {
 
     // 传输侧：收尾仍未关闭的 socket（room.closed 已由会话经连接端口投递，不重复发送），
     // 清理心跳探测并释放 TCP/WS 监听资源。
-    for (const socket of [...this.openSockets]) {
-      try {
-        socket.close(closeCodeForError('ROOM_CLOSED'), reason);
-      } catch {
-        // socket 可能已断开。
-      }
+    for (const handle of [...this.sockets]) {
+      handle.dispose(closeCodeForError('ROOM_CLOSED'), reason);
     }
-    this.clearAllWatchdogs();
+    this.sockets.clear();
 
     await this.stopListener();
-  }
-
-  private startWatchdog(socket: WebSocket): void {
-    this.clearSocketWatchdog(socket);
-    const watchdog: SocketWatchdog = {
-      intervalTimer: null,
-      timeoutTimer: null,
-      pendingPongSeq: null,
-      seq: 0,
-    };
-    this.watchdogs.set(socket, watchdog);
-
-    watchdog.intervalTimer = setInterval(() => {
-      // 1 === WebSocket.OPEN
-      if (socket.readyState !== 1) {
-        this.clearSocketWatchdog(socket);
-        return;
-      }
-      if (watchdog.pendingPongSeq !== null) {
-        // 等待旧探测的应答中，既有超时计时器已在计时，不发送新探测
-        return;
-      }
-      watchdog.seq += 1;
-      const seq = watchdog.seq;
-      watchdog.pendingPongSeq = seq;
-      try {
-        socket.send(buildServerMessage({ type: 'ping', roomId: this.roomId, payload: { seq } }));
-      } catch {
-        // 忽略发送失败
-      }
-      watchdog.timeoutTimer = setTimeout(() => {
-        if (watchdog.pendingPongSeq === seq) {
-          this.logger('ws.heartbeat_timeout', { room: this.roomId, seq });
-          this.clearSocketWatchdog(socket);
-          try {
-            socket.terminate();
-          } catch {
-            // socket 可能已关闭
-          }
-        }
-      }, this.options.heartbeatTimeoutMs);
-      watchdog.timeoutTimer.unref?.();
-    }, this.options.heartbeatIntervalMs);
-    watchdog.intervalTimer.unref?.();
-  }
-
-  private clearSocketWatchdog(socket: WebSocket): void {
-    const wd = this.watchdogs.get(socket);
-    if (!wd) {
-      return;
-    }
-    if (wd.intervalTimer) {
-      clearInterval(wd.intervalTimer);
-      wd.intervalTimer = null;
-    }
-    if (wd.timeoutTimer) {
-      clearTimeout(wd.timeoutTimer);
-      wd.timeoutTimer = null;
-    }
-    this.watchdogs.delete(socket);
-  }
-
-  private clearAllWatchdogs(): void {
-    for (const socket of [...this.watchdogs.keys()]) {
-      this.clearSocketWatchdog(socket);
-    }
   }
 
   private listenOn(port: number): Promise<void> {
@@ -399,132 +284,21 @@ export class RoomServer {
     this.logger('room.listener_released', { room: this.roomId, port: this.port });
   }
 
-  /** 连接层：真实 socket ↔ 会话连接端口，负责编解码、握手超时与心跳。 */
+  /** 连接层：真实 socket ↔ 会话连接端口，共用传输适配完成编解码、握手超时与心跳。 */
   private handleConnection(socket: WebSocket): void {
-    this.openSockets.add(socket);
-    const connectionId = asConnectionId(generateId());
-    const connection = new WebSocketConnection(connectionId, socket);
-
-    this.logger('ws.connected', { room: this.roomId, conn: connectionId });
-
-    const handshakeTimer = setTimeout(() => {
-      if (!this.session.isHelloComplete(connectionId)) {
-        this.sendError(socket, 'HANDSHAKE_TIMEOUT', '握手超时');
-        socket.close(closeCodeForError('HANDSHAKE_TIMEOUT'), 'handshake-timeout');
-      }
-    }, this.options.handshakeTimeoutMs);
-    handshakeTimer.unref?.();
-
-    this.session.attach(connection);
-
-    socket.on('message', (data) => {
-      const raw = typeof data === 'string' ? data : data.toString('utf8');
-      const parsed = parseClientMessage(raw);
-
-      if (!parsed.ok) {
-        this.logger('ws.invalid_message', { room: this.roomId, conn: connectionId, code: parsed.code, detail: parsed.detail });
-        this.sendError(socket, parsed.code, parsed.detail);
-        socket.close(closeCodeForError(parsed.code), parsed.code);
-        return;
-      }
-
-      const message = parsed.message;
-
-      // 心跳（服务端探测与应答）属连接层；其余命令交权威会话裁决。
-      if (message.type === 'ping' || message.type === 'pong') {
-        this.handleHeartbeat(socket, connectionId, message);
-        return;
-      }
-
-      this.session.handleMessage(connectionId, message);
-
-      if (message.type === 'hello' && this.session.isHelloComplete(connectionId)) {
-        clearTimeout(handshakeTimer);
-        this.startWatchdog(socket);
-      }
+    const handle = serveSessionSocket({
+      session: this.session,
+      socket,
+      logger: this.logger,
+      now: this.now,
+      handshakeTimeoutMs: this.options.handshakeTimeoutMs,
+      heartbeatIntervalMs: this.options.heartbeatIntervalMs,
+      heartbeatTimeoutMs: this.options.heartbeatTimeoutMs,
+      onClosed: () => {
+        this.sockets.delete(handle);
+      },
     });
-
-    socket.on('close', (code, reason) => {
-      clearTimeout(handshakeTimer);
-      this.clearSocketWatchdog(socket);
-      this.openSockets.delete(socket);
-      // 迟到 close 带原 connectionId：席位已被新连接替换时不误下线新连接。
-      this.session.handleDisconnect(connectionId, code, reason.toString());
-    });
-
-    socket.on('error', () => {
-      // 交给 close 事件统一清理。
-    });
-  }
-
-  /**
-   * 心跳处理：门禁与会话的连接归属校验一致（未握手 / 已被替换的连接一律拒绝），
-   * 保证旧连接的迟到心跳不影响新连接。
-   */
-  private handleHeartbeat(
-    socket: WebSocket,
-    connectionId: ConnectionId,
-    message: Extract<ClientMessage, { type: 'ping' | 'pong' }>,
-  ): void {
-    const standing = this.session.getStanding(connectionId);
-    if (standing === 'superseded') {
-      this.reject(socket, connectionId, 'UNAUTHORIZED', 'socket-superseded');
-      return;
-    }
-    if (standing !== 'active') {
-      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'not-handshaked');
-      return;
-    }
-    if (message.roomId !== this.roomId) {
-      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
-      return;
-    }
-
-    if (message.type === 'ping') {
-      const now = this.now();
-      try {
-        socket.send(
-          buildServerMessage(
-            buildPong(this.roomId, message.payload.seq, {
-              serverReceiveTime: now,
-              serverSendTime: now,
-            }),
-          ),
-        );
-      } catch {
-        // 忽略发送失败
-      }
-      return;
-    }
-
-    const wd = this.watchdogs.get(socket);
-    if (wd && wd.pendingPongSeq === message.payload.seq) {
-      wd.pendingPongSeq = null;
-      if (wd.timeoutTimer) {
-        clearTimeout(wd.timeoutTimer);
-        wd.timeoutTimer = null;
-      }
-    }
-  }
-
-  private sendError(socket: WebSocket, code: ServerErrorCode, message: string): void {
-    try {
-      socket.send(
-        buildServerMessage({
-          type: 'error',
-          roomId: this.roomId,
-          payload: { code, message },
-        }),
-      );
-    } catch {
-      // socket 已关闭。
-    }
-  }
-
-  private reject(socket: WebSocket, connectionId: ConnectionId, code: ServerErrorCode, detail: string): void {
-    this.logger('ws.rejected', { room: this.roomId, conn: connectionId, code, detail });
-    this.sendError(socket, code, detail);
-    socket.close(closeCodeForError(code), code);
+    this.sockets.add(handle);
   }
 }
 

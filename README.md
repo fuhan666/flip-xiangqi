@@ -90,6 +90,27 @@ npm start -- --port 4173
 
 连接层协议（消息封包、握手、错误码）定义在 `src/network/protocol.ts`，公开棋局形状与校验定义在 `src/network/public-game.ts`，宿主实现在 `server/`（公开投影在 `server/public-view.ts`），两端共享同一套校验。
 
+## 在线匿名多房间（单一 HTTPS/WSS 入口）
+
+除了局域网建房，仓库还提供一个**独立的在线入口**：一个 HTTPS/WSS 地址承载多个匿名房间，两名玩家用同一个邀请链接即可完成建房、加入、就绪、对战与结算，刷新后凭同一匿名身份恢复原席位。
+
+```bash
+npm run build
+ONLINE_PUBLIC_ORIGIN=https://localhost:8443 \
+ONLINE_TLS_KEY=.certs/key.pem \
+ONLINE_TLS_CERT=.certs/cert.pem \
+npm run start:online
+# 打开 https://localhost:8443/online
+```
+
+- 房间地址为 `/online/rooms/:roomId`，邀请链接只包含公开房间号，不含房主控制或重连密钥。
+- 身份由服务器签发的匿名 cookie 解析，成员席位与连接标识分离；客户端自报的角色/身份一律不被采信。
+- 公网入口不代理也不暴露局域网本机控制 API（`/api/room/*`、`/api/guest`），HTTPS 页面只连接同源 WSS。
+- 全部状态在内存中：进程重启会结束进行中的对局与房间；空的/终局的房间自动回收、邀请分享 UI、大厅与手机改版属于后续阶段。
+- `npm run dev` / `npm start` 的局域网入口与既有行为保持不变。
+
+完整说明（自签证书、环境变量、身份模型、验证方式）见 [在线入口搭建指南](docs/online-setup.md)。
+
 ## 测试与构建
 
 ```bash
@@ -137,6 +158,7 @@ npm run test:e2e   # 等价于 npx playwright test
 - [Changelog](CHANGELOG.md)
 - [长局历史存储与动作耗时](docs/performance/history.md)
 - [局域网联机搭建指南](docs/lan-setup.md)
+- [在线入口搭建指南](docs/online-setup.md)
 - [v0.9.0 版本说明](docs/releases/v0.9.0.md)
 - [v0.8.0 版本说明](docs/releases/v0.8.0.md)
 - [v0.7.0 版本说明](docs/releases/v0.7.0.md)

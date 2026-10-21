@@ -26,6 +26,7 @@ import {
   buildClientChatPhrase,
   buildClientHello,
   buildClientLeave,
+  buildClientOnlineHello,
   buildClientLobbyLock,
   buildClientGameRecordRequest,
   buildClientLobbyReady,
@@ -264,6 +265,11 @@ export interface RoomClientOptions {
   reconnectBudgetMs?: number;
   clock?: { now(): number };
   random?: () => number;
+  /**
+   * 在线入口公开来源（https://host[:port]）；缺省取浏览器当前 origin。
+   * 在线连接的首连与重连都从这里构造 wss://…/ws/rooms/:roomId。
+   */
+  onlineOrigin?: string;
 }
 
 export class RoomClient implements RoomConnection {
@@ -275,6 +281,7 @@ export class RoomClient implements RoomConnection {
   private readonly reconnectBudgetMs: number;
   private readonly clock?: { now(): number };
   private readonly random: () => number;
+  private readonly onlineOrigin: string | null;
   private readonly listeners = new Set<(state: ConnectionState) => void>();
   private state: ConnectionState = IDLE_STATE;
   private socket: WebSocketLike | null = null;
@@ -289,6 +296,8 @@ export class RoomClient implements RoomConnection {
   private savedJoinOptions: JoinOptions | null = null;
   private savedRoomId: string | null = null;
   private savedResumeToken: string | null = null;
+  /** 在线连接目标：房间号与来源；非在线连接为 null。 */
+  private savedOnline: { roomId: string; url: string } | null = null;
   private pingSeq = 0;
   private pendingPingSeq: number | null = null;
   private pingSentAt = 0;
@@ -316,6 +325,9 @@ export class RoomClient implements RoomConnection {
     this.reconnectBudgetMs = options.reconnectBudgetMs ?? DEFAULT_RECONNECT_BUDGET_MS;
     this.clock = options.clock;
     this.random = options.random ?? Math.random;
+    // 浏览器环境下用当前来源；Node（服务端/测试）没有 location，由调用方显式提供。
+    const location = (globalThis as { location?: { origin?: string } }).location;
+    this.onlineOrigin = options.onlineOrigin ?? location?.origin ?? null;
   }
 
   private now(): number {
@@ -372,6 +384,64 @@ export class RoomClient implements RoomConnection {
       this.fail(generation, 'CONNECT_FAILED');
       return;
     }
+    this.wireSocket(generation, socket, () =>
+      buildClientHello({ role: options.role, name: options.name, token: options.token }),
+    );
+  }
+
+  /**
+   * 在线接入：只给房间号，身份由同源匿名凭据（cookie）在服务器解析。
+   * URL 固定为同一来源的 wss://…/ws/rooms/:roomId，不经过 LAN 地址解析。
+   */
+  connectOnline(roomId: string): void {
+    if (this.state.status === 'connected') {
+      this.setState({
+        ...this.state,
+        status: 'error',
+        errorCode: 'ALREADY_CONNECTED',
+        message: describeErrorCode('ALREADY_CONNECTED'),
+      });
+      return;
+    }
+
+    if (this.state.status === 'connecting' || this.reconnecting) {
+      this.teardown();
+    }
+
+    const url = this.onlineSocketUrl(roomId);
+
+    this.reconnecting = false;
+    this.savedAddress = null;
+    this.savedJoinOptions = null;
+    this.savedRoomId = null;
+    this.savedResumeToken = null;
+    this.savedOnline = { roomId, url };
+    this.reconnectStartTime = null;
+    this.reconnectAttempt = 0;
+
+    const generation = ++this.generation;
+    this.joinedAddress = url;
+    this.setState({ ...IDLE_STATE, status: 'connecting' });
+
+    let socket: WebSocketLike;
+    try {
+      socket = this.webSocketFactory(url);
+    } catch {
+      this.fail(generation, 'CONNECT_FAILED');
+      return;
+    }
+    this.wireSocket(generation, socket, () => buildClientOnlineHello(roomId));
+  }
+
+  private onlineSocketUrl(roomId: string): string {
+    const origin = this.onlineOrigin ?? 'https://localhost';
+    const url = new URL(`/ws/rooms/${encodeURIComponent(roomId)}`, origin);
+    url.protocol = url.protocol === 'http:' ? 'ws:' : 'wss:';
+    return url.toString();
+  }
+
+  /** 首次连接与在线重连共用的 socket 接线：超时、hello、消息与关闭回调。 */
+  private wireSocket(generation: number, socket: WebSocketLike, buildHello: () => ClientMessage): void {
     this.socket = socket;
 
     this.timer = setTimeout(() => {
@@ -386,9 +456,7 @@ export class RoomClient implements RoomConnection {
         return;
       }
       try {
-        socket.send(
-          encodeMessage(buildClientHello({ role: options.role, name: options.name, token: options.token })),
-        );
+        socket.send(encodeMessage(buildHello()));
       } catch {
         this.fail(generation, 'CONNECT_FAILED');
       }
@@ -413,13 +481,17 @@ export class RoomClient implements RoomConnection {
     };
   }
 
-  disconnect(): void {
+  /**
+   * 断开连接。`notify` 为 false 时只释放传输：刷新/卸载不会向服务器发送主动离开，
+   * 成员席位由本人凭据在下次进入时恢复。
+   */
+  disconnect(notify = true): void {
     if (!this.socket && this.state.status === 'idle') {
       return;
     }
 
     const socket = this.socket;
-    if (socket && this.state.roomId && socket.readyState === SOCKET_OPEN) {
+    if (notify && socket && this.state.roomId && socket.readyState === SOCKET_OPEN) {
       try {
         socket.send(encodeMessage(buildClientLeave(this.state.roomId)));
       } catch {
@@ -430,6 +502,7 @@ export class RoomClient implements RoomConnection {
     this.reconnecting = false;
     this.savedRoomId = null;
     this.savedResumeToken = null;
+    this.savedOnline = null;
     this.teardown();
     this.generation += 1;
     this.setState({ ...IDLE_STATE, status: 'disconnected' });
@@ -1603,14 +1676,16 @@ export class RoomClient implements RoomConnection {
     this.stopStateRecovery();
     this.teardownSocket();
 
-    // 仅已入房成员且有恢复凭据支持自动重连（客人/旁观者用 resumeToken，房主用 host token）
+    // 仅已入房成员且有恢复凭据支持自动重连（客人/旁观者用 resumeToken，房主用 host token）；
+    // 在线连接凭同源匿名凭据恢复，不需要实例内保存的重连密钥。
     const isGuest = this.savedJoinOptions?.role === 'guest';
     const isSpectator = this.savedJoinOptions?.role === 'spectator';
     const isHost = this.savedJoinOptions?.role === 'host';
     const canReconnectGuest = (isGuest || isSpectator) && this.savedRoomId && this.savedResumeToken && this.savedAddress;
     const canReconnectHost = isHost && this.savedRoomId && this.savedJoinOptions?.token && this.savedAddress;
+    const canReconnectOnline = Boolean(this.savedOnline && this.savedRoomId);
 
-    if (canReconnectGuest || canReconnectHost) {
+    if (canReconnectOnline || canReconnectGuest || canReconnectHost) {
       this.reconnecting = true;
       if (this.reconnectStartTime === null) {
         this.reconnectStartTime = this.now();
@@ -1696,14 +1771,20 @@ export class RoomClient implements RoomConnection {
     const isGuest = this.savedJoinOptions?.role === 'guest';
     const isSpectator = this.savedJoinOptions?.role === 'spectator';
     const isHost = this.savedJoinOptions?.role === 'host';
-    const hasCredentials = ((isGuest || isSpectator) && this.savedResumeToken) || (isHost && this.savedJoinOptions?.token);
+    const onlineRoomId = this.savedOnline?.roomId ?? null;
+    const canReconnectOnline = Boolean(onlineRoomId && this.savedRoomId);
+    const hasCredentials =
+      canReconnectOnline ||
+      ((isGuest || isSpectator) && this.savedResumeToken) ||
+      (isHost && this.savedJoinOptions?.token);
 
     if (
       !this.reconnecting ||
-      !this.savedAddress ||
-      !this.savedJoinOptions ||
+      (!this.savedAddress && !canReconnectOnline) ||
+      (!this.savedJoinOptions && !canReconnectOnline) ||
       !this.savedRoomId ||
-      !hasCredentials
+      !hasCredentials ||
+      (!canReconnectOnline && !this.savedAddress)
     ) {
       return;
     }
@@ -1719,7 +1800,9 @@ export class RoomClient implements RoomConnection {
 
     let socket: WebSocketLike;
     try {
-      socket = this.webSocketFactory(toWebSocketUrl(this.savedAddress));
+      socket = this.webSocketFactory(
+        canReconnectOnline ? this.savedOnline!.url : toWebSocketUrl(this.savedAddress!),
+      );
     } catch {
       this.scheduleReconnect();
       return;
@@ -1739,19 +1822,21 @@ export class RoomClient implements RoomConnection {
         return;
       }
       try {
-        const helloMsg = isHost
-          ? buildClientHello({
-              role: 'host',
-              name: this.savedJoinOptions!.name,
-              roomId: this.savedRoomId,
-              token: this.savedJoinOptions!.token,
-            })
-          : buildClientHello({
-              role: isSpectator ? 'spectator' : 'guest',
-              name: this.savedJoinOptions!.name,
-              roomId: this.savedRoomId,
-              resumeToken: this.savedResumeToken!,
-            });
+        const helloMsg = canReconnectOnline
+          ? buildClientOnlineHello(onlineRoomId!)
+          : isHost
+            ? buildClientHello({
+                role: 'host',
+                name: this.savedJoinOptions!.name,
+                roomId: this.savedRoomId,
+                token: this.savedJoinOptions!.token,
+              })
+            : buildClientHello({
+                role: isSpectator ? 'spectator' : 'guest',
+                name: this.savedJoinOptions!.name,
+                roomId: this.savedRoomId,
+                resumeToken: this.savedResumeToken!,
+              });
         socket.send(encodeMessage(helloMsg));
       } catch {
         this.teardownSocket();
