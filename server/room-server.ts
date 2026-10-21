@@ -1,69 +1,38 @@
 /**
- * 房间服务：局域网 HTTP + WebSocket 监听，承载客人页面与连接层握手。
+ * 房间服务（LAN 适配器）：局域网 HTTP + WebSocket 监听，承载客人页面与连接层握手，
+ * 把传输层连接接入共享的权威会话（RoomSession）。
  *
+ * 分层：
+ * - 本适配器负责真实 socket、编解码与协议校验、握手超时、心跳探测、监听端口策略与静态页面；
+ * - 权威状态（大厅/对局/计时/协商/短语/成员与凭据）全部由 RoomSession 持有，这里不再保留第二套权威状态；
  * - 默认端口被占用时自动顺延（仅 EADDRINUSE，最多 20 次且不超过 65535）；
  * - 握手阶段校验封包结构、协议版本与房主凭据，非法输入不会导致进程异常；
  * - 房主离开/关闭、宿主进程退出都会释放全部 socket 与监听端口。
  */
-import { randomBytes } from 'node:crypto';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
 import type { Socket } from 'node:net';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
-  applyLobbyCommand,
-  createLobbyState,
-  snapshotLobbyState,
-  type LobbyCommand,
-  type LobbyRejectCode,
-  type LobbyState,
-} from '../src/network/lobby.js';
-import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_HEARTBEAT_TIMEOUT_MS,
 } from '../src/network/heartbeat.js';
 import {
-  createMatch,
-  finalizeMatch,
-  finalizeMatchDraw,
-  undoMatchAction,
-  snapshotMatch,
-  applyMatchAction,
-  type MatchAction,
-  type MatchSnapshot,
-  type MatchState,
-} from '../src/network/match.js';
-import {
-  DRAW_COOLDOWN_MS,
-  NEGOTIATION_TIMEOUT_MS,
-  type NegotiationEvent,
-  type NegotiationEventType,
-  type PendingNegotiation,
-} from '../src/network/negotiation.js';
-import { createEmptyGameState } from '../src/game/index.js';
-import type { GameStateSnapshot } from '../src/game/index.js';
-import {
   buildPong,
-  buildServerChatPhrase,
-  buildServerChatPhraseRejected,
-  buildServerGameClock,
   buildServerMessage,
   closeCodeForError,
-  getQuickPhraseText,
-  isQuickPhraseId,
   parseClientMessage,
-  QUICK_PHRASE_COOLDOWN_MS,
   WS_PATH,
   type ClientMessage,
   type MemberSnapshot,
-  type MemberLeaveReason,
-  type QuickChatRejection,
-  type QuickPhraseEvent,
-  type Role,
   type RoomClosedReason,
   type ServerErrorCode,
 } from '../src/network/protocol.js';
+import type { LobbyState } from '../src/network/lobby.js';
+import type { MatchSnapshot } from '../src/network/match.js';
+import { asConnectionId, generateId, type ConnectionId } from './room-identity.js';
 import { defaultLogger, type Logger } from './log.js';
+import { RoomSession, type SessionConnection } from './room-session.js';
 
 export type RoomServerErrorCode = 'INVALID_PORT' | 'PORT_UNAVAILABLE' | 'NO_PERMISSION' | 'INTERNAL_ERROR';
 
@@ -98,58 +67,9 @@ export interface RoomServerOptions {
   spectatorResumeWindowMs?: number;
 }
 
-interface RoomMember {
-  id: string;
-  role: Role;
-  name: string;
-  socket: WebSocket | null;
-  connected: boolean;
-  leaveReason: MemberLeaveReason | null;
-  /** 旁观者独立恢复凭据；host/guest 沿用 host token / 全局 guest resumeToken。 */
-  resumeToken?: string;
-}
-
-type LobbyClientMessage = Extract<ClientMessage, { type: `lobby.${string}` }>;
-
-const HOST_NAME = '房主';
-const GUEST_NAME = '客人';
-const SPECTATOR_NAME = '旁观';
 const DEFAULT_MAX_PORT_ATTEMPTS = 20;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
-const DEFAULT_SPECTATOR_RESUME_WINDOW_MS = 95_000;
 const CLOSE_DRAIN_TIMEOUT_MS = 1_000;
-
-function memberSnapshot(member: RoomMember): MemberSnapshot {
-  return {
-    id: member.id,
-    role: member.role,
-    name: member.name,
-    connected: member.connected,
-    ...(member.connected || !member.leaveReason ? {} : { leaveReason: member.leaveReason }),
-  };
-}
-
-function defaultDrawHostRed(): boolean {
-  return randomBytes(1)[0] % 2 === 0;
-}
-
-function defaultDrawSeed(): number {
-  if (process.env.TEST_ROOM_SEED) {
-    const parsed = Number(process.env.TEST_ROOM_SEED);
-    if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 0xffffffff) {
-      return parsed >>> 0;
-    }
-  }
-  return randomBytes(4).readUInt32BE(0);
-}
-
-function generateToken(): string {
-  return randomBytes(16).toString('hex');
-}
-
-function generateId(): string {
-  return randomBytes(8).toString('hex');
-}
 
 interface SocketWatchdog {
   intervalTimer: NodeJS.Timeout | null;
@@ -158,37 +78,51 @@ interface SocketWatchdog {
   seq: number;
 }
 
-export class RoomServer {
-  readonly roomId: string;
-  readonly hostToken: string;
+/** WebSocket 连接端口：会话只见 connectionId + 发送/关闭，不接触 socket 细节。 */
+class WebSocketConnection implements SessionConnection {
+  readonly connectionId: ConnectionId;
 
+  private readonly socket: WebSocket;
+
+  constructor(connectionId: ConnectionId, socket: WebSocket) {
+    this.connectionId = connectionId;
+    this.socket = socket;
+  }
+
+  send(text: string): void {
+    // 1 === WebSocket.OPEN
+    if (this.socket.readyState !== 1) {
+      return;
+    }
+    try {
+      this.socket.send(text);
+    } catch {
+      // 忽略单个发送失败。
+    }
+  }
+
+  close(code: number, reason: string): void {
+    try {
+      this.socket.close(code, reason);
+    } catch {
+      // socket 可能已关闭。
+    }
+  }
+}
+
+export class RoomServer {
   private readonly options: Required<Pick<RoomServerOptions, 'maxPortAttempts' | 'handshakeTimeoutMs' | 'heartbeatIntervalMs' | 'heartbeatTimeoutMs'>> & RoomServerOptions;
   private readonly logger: Logger;
-  private readonly drawHostRed: () => boolean;
-  private readonly drawSeed: () => number;
+  private readonly now: () => number;
+  /** 权威会话：本适配器唯一的权威状态来源。 */
+  private readonly session: RoomSession;
   private readonly server: Server;
   private readonly wss: WebSocketServer;
   private readonly tcpSockets = new Set<Socket>();
   private readonly openSockets = new Set<WebSocket>();
   private readonly watchdogs = new Map<WebSocket, SocketWatchdog>();
-  private guestResumeToken: string | null = null;
-  private readonly processedActions = new Map<string, { stepNumber: number }>();
-  private readonly phraseCooldownUntil = new Map<string, number>();
-  private readonly processedPhraseRequests = new Map<string, { event: QuickPhraseEvent }>();
-  private host: RoomMember | null = null;
-  private guest: RoomMember | null = null;
-  /** 旁观者注册表：不占执色席位，各自持有独立恢复凭据。 */
-  private readonly spectators: RoomMember[] = [];
-  private spectatorNameSeq = 0;
-  private readonly spectatorExpiryTimers = new Map<string, NodeJS.Timeout>();
-  private lobby: LobbyState;
-  private match: MatchState | null = null;
   private closed = false;
   private port = 0;
-  private readonly now: () => number;
-  private clockTimer: NodeJS.Timeout | null = null;
-  private clockBroadcastInterval: NodeJS.Timeout | null = null;
-  private negotiationTimer: NodeJS.Timeout | null = null;
 
   constructor(options: RoomServerOptions) {
     this.options = {
@@ -200,11 +134,20 @@ export class RoomServer {
     };
     this.now = options.nowFn ?? (() => Date.now());
     this.logger = options.logger ?? defaultLogger;
-    this.drawHostRed = options.drawHostRed ?? defaultDrawHostRed;
-    this.drawSeed = options.drawSeed ?? defaultDrawSeed;
-    this.roomId = generateId();
-    this.hostToken = generateToken();
-    this.lobby = createLobbyState();
+
+    this.session = new RoomSession({
+      logger: this.logger,
+      nowFn: this.now,
+      drawHostRed: options.drawHostRed,
+      drawSeed: options.drawSeed,
+      clockIntervalMs: options.clockIntervalMs,
+      spectatorResumeWindowMs: options.spectatorResumeWindowMs,
+      // 会话自身关闭（大厅阶段房主掉线、房主主动离开等）→ 适配器补齐广播投递与监听资源释放。
+      onClose: (reason) => {
+        void this.closeRoom(reason);
+      },
+    });
+
     this.wss = new WebSocketServer({ noServer: true });
 
     this.server = createServer((request, response) => {
@@ -239,6 +182,14 @@ export class RoomServer {
     });
   }
 
+  get roomId(): string {
+    return this.session.roomId;
+  }
+
+  get hostToken(): string {
+    return this.session.hostToken;
+  }
+
   get actualPort(): number {
     return this.port;
   }
@@ -247,36 +198,27 @@ export class RoomServer {
     return this.closed;
   }
 
+  /** 当前权威成员快照（委托共享会话）。 */
   getMembers(): MemberSnapshot[] {
-    const members: MemberSnapshot[] = [];
-    if (this.host) {
-      members.push(memberSnapshot(this.host));
-    }
-    if (this.guest) {
-      members.push(memberSnapshot(this.guest));
-    }
-    for (const spectator of this.spectators) {
-      members.push(memberSnapshot(spectator));
-    }
-    return members;
+    return this.session.getMembers();
   }
 
-  /** 当前权威大厅快照（独立副本，测试与内部状态隔离）。 */
+  /** 当前权威大厅快照（委托共享会话，独立副本）。 */
   getLobby(): LobbyState {
-    return snapshotLobbyState(this.lobby);
+    return this.session.getLobby();
   }
 
-  /** 当前权威对局快照（无对局时为 null）。 */
+  /** 当前权威对局快照（委托共享会话，无对局时为 null）。 */
   getMatch(): MatchSnapshot | null {
-    return this.match ? snapshotMatch(this.match) : null;
+    return this.session.getMatch();
   }
 
   isHostConnected(): boolean {
-    return Boolean(this.host?.connected);
+    return this.session.isHostConnected();
   }
 
   getLobbyPhase(): LobbyState['phase'] {
-    return this.lobby.phase;
+    return this.session.getLobbyPhase();
   }
 
   async start(): Promise<number> {
@@ -320,226 +262,28 @@ export class RoomServer {
     throw new RoomServerError('PORT_UNAVAILABLE', `端口 ${preferredPort} 起没有可用端口，请更换起始端口后重试`);
   }
 
-  /** 房主显式关闭房间：广播 room.closed 后释放全部资源（幂等）。 */
+  /** 关闭房间（幂等）：会话广播 room.closed 并关闭连接，适配器清心跳、收尾 socket 并释放监听端口。 */
   async closeRoom(reason: RoomClosedReason = 'host-closed'): Promise<void> {
     if (this.closed) {
       return;
     }
     this.closed = true;
-    this.logger('room.closing', { room: this.roomId, reason });
 
-    const notice = buildServerMessage({
-      type: 'room.closed',
-      roomId: this.roomId,
-      payload: { reason },
-    });
+    // 会话侧：向全部连接投递 room.closed 并关闭连接、释放领域状态与定时器（幂等）。
+    this.session.close(reason);
 
+    // 传输侧：收尾仍未关闭的 socket（room.closed 已由会话经连接端口投递，不重复发送），
+    // 清理心跳探测并释放 TCP/WS 监听资源。
     for (const socket of [...this.openSockets]) {
       try {
-        socket.send(notice);
         socket.close(closeCodeForError('ROOM_CLOSED'), reason);
       } catch {
         // socket 可能已断开。
       }
     }
-
-    if (this.host) {
-      this.host.connected = false;
-      this.host.socket = null;
-    }
-    if (this.guest) {
-      this.guest.connected = false;
-      this.guest.socket = null;
-    }
-    for (const spectator of this.spectators) {
-      spectator.connected = false;
-      spectator.socket = null;
-    }
-    for (const timer of this.spectatorExpiryTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.spectatorExpiryTimers.clear();
-
     this.clearAllWatchdogs();
-    this.stopClockBroadcast();
-    this.clearClockTimer();
-    this.clearNegotiationTimer();
-    this.processedActions.clear();
-    this.phraseCooldownUntil.clear();
-    this.processedPhraseRequests.clear();
-    this.guestResumeToken = null;
-    this.match = null;
 
     await this.stopListener();
-    this.logger('room.closed', { room: this.roomId, reason });
-  }
-
-  private startClockBroadcast(): void {
-    this.stopClockBroadcast();
-    const intervalMs = this.options.clockIntervalMs ?? 1000;
-    this.clockBroadcastInterval = setInterval(() => {
-      this.broadcastClock();
-    }, intervalMs);
-  }
-
-  private stopClockBroadcast(): void {
-    if (this.clockBroadcastInterval) {
-      clearInterval(this.clockBroadcastInterval);
-      this.clockBroadcastInterval = null;
-    }
-  }
-
-  private clearClockTimer(): void {
-    if (this.clockTimer) {
-      clearTimeout(this.clockTimer);
-      this.clockTimer = null;
-    }
-  }
-
-  private clearNegotiationTimer(): void {
-    if (this.negotiationTimer) {
-      clearTimeout(this.negotiationTimer);
-      this.negotiationTimer = null;
-    }
-  }
-
-  private scheduleNegotiationDeadline(matchId: string, negotiationId: string, deadline: number): void {
-    this.clearNegotiationTimer();
-    const delay = Math.max(0, deadline - this.now());
-    this.negotiationTimer = setTimeout(() => {
-      this.handleNegotiationTimeout(matchId, negotiationId);
-    }, delay);
-  }
-
-  private recordMatchEvent(
-    type: NegotiationEventType | 'game-started' | 'game-ended',
-    actorMemberId: string,
-    result: string,
-    message: string,
-    now: number = this.now(),
-  ): NegotiationEvent {
-    const event: NegotiationEvent = {
-      id: `evt-${now}-${Math.random().toString(36).slice(2, 7)}`,
-      type: type as NegotiationEventType,
-      actorMemberId,
-      createdAt: now,
-      message,
-    };
-    if (this.match) {
-      this.match.negotiationEvent = event;
-      this.match.matchEvents.push({
-        id: event.id,
-        type,
-        actorMemberId,
-        stepNumber: this.match.stepNumber,
-        revision: this.match.revision,
-        result,
-        createdAt: now,
-        message,
-      });
-    }
-    return event;
-  }
-
-  private handleNegotiationTimeout(matchId: string, negotiationId: string): void {
-    if (!this.match || this.match.matchId !== matchId) {
-      return;
-    }
-    const pending = this.match.pendingNegotiation;
-    if (!pending || pending.negotiationId !== negotiationId) {
-      return;
-    }
-
-    const now = this.now();
-    this.match.clock.resumeNegotiation(now);
-
-    if (pending.type === 'draw') {
-      this.match.drawCooldownUntil[pending.initiatorMemberId] = now + DRAW_COOLDOWN_MS;
-    }
-
-    const eventType: NegotiationEventType = pending.type === 'undo' ? 'undo-timeout' : 'draw-timeout';
-    const message = pending.type === 'undo' ? '悔棋申请超时未应答，已自动拒绝' : '求和申请超时未应答，已自动拒绝';
-    this.recordMatchEvent(eventType, pending.initiatorMemberId, 'timeout', message, now);
-
-    this.match.pendingNegotiation = null;
-    this.match.revision++;
-
-    this.broadcastGameState();
-    this.scheduleClockDeadline();
-  }
-
-  private scheduleClockDeadline(): void {
-    this.clearClockTimer();
-    if (!this.match || this.match.settlement !== null) {
-      return;
-    }
-    const next = this.match.clock.getNextDeadlineTime(this.now());
-    if (next === null) {
-      return;
-    }
-    const delay = Math.max(0, next - this.now());
-    this.clockTimer = setTimeout(() => {
-      this.checkClockDeadline();
-    }, delay + 5);
-  }
-
-  private checkClockDeadline(): void {
-    if (!this.match || this.match.settlement !== null || this.closed) {
-      return;
-    }
-    const adv = this.match.clock.advance(this.now());
-    if (adv.timeoutResult) {
-      this.match = finalizeMatch(this.match, adv.timeoutResult.winner, adv.timeoutResult.reason, this.now());
-      this.stopClockBroadcast();
-      this.clearClockTimer();
-      this.logger('game.timeout', {
-        room: this.roomId,
-        matchId: this.match.matchId,
-        winner: adv.timeoutResult.winner ?? undefined,
-        reason: adv.timeoutResult.reason,
-      });
-      this.broadcastGameState();
-    }
-  }
-
-  private broadcastClock(): void {
-    if (!this.match || this.match.settlement !== null || this.closed) {
-      return;
-    }
-    const adv = this.match.clock.advance(this.now());
-    if (adv.timeoutResult) {
-      this.match = finalizeMatch(this.match, adv.timeoutResult.winner, adv.timeoutResult.reason, this.now());
-      this.stopClockBroadcast();
-      this.clearClockTimer();
-      this.logger('game.timeout', {
-        room: this.roomId,
-        matchId: this.match.matchId,
-        winner: adv.timeoutResult.winner ?? undefined,
-        reason: adv.timeoutResult.reason,
-      });
-      this.broadcastGameState();
-      return;
-    }
-
-    const snap = snapshotMatch(this.match, this.now());
-    const text = buildServerMessage(
-      buildServerGameClock(this.roomId, {
-        matchId: this.match.matchId,
-        revision: this.match.revision,
-        sampleSeq: snap.clock.sampleSeq,
-        clock: snap.clock,
-      }),
-    );
-
-    for (const socket of this.openSockets) {
-      if (socket.readyState === 1) {
-        try {
-          socket.send(text);
-        } catch {
-          // 忽略单个发送失败
-        }
-      }
-    }
   }
 
   private startWatchdog(socket: WebSocket): void {
@@ -649,20 +393,23 @@ export class RoomServer {
     this.logger('room.listener_released', { room: this.roomId, port: this.port });
   }
 
+  /** 连接层：真实 socket ↔ 会话连接端口，负责编解码、握手超时与心跳。 */
   private handleConnection(socket: WebSocket): void {
     this.openSockets.add(socket);
-    const connectionId = generateId();
-    let joinedMember: RoomMember | null = null;
+    const connectionId = asConnectionId(generateId());
+    const connection = new WebSocketConnection(connectionId, socket);
 
     this.logger('ws.connected', { room: this.roomId, conn: connectionId });
 
     const handshakeTimer = setTimeout(() => {
-      if (!joinedMember) {
+      if (!this.session.isHelloComplete(connectionId)) {
         this.sendError(socket, 'HANDSHAKE_TIMEOUT', '握手超时');
         socket.close(closeCodeForError('HANDSHAKE_TIMEOUT'), 'handshake-timeout');
       }
     }, this.options.handshakeTimeoutMs);
     handshakeTimer.unref?.();
+
+    this.session.attach(connection);
 
     socket.on('message', (data) => {
       const raw = typeof data === 'string' ? data : data.toString('utf8');
@@ -677,206 +424,26 @@ export class RoomServer {
 
       const message = parsed.message;
 
-      if (message.type === 'hello') {
-        if (joinedMember) {
-          this.reject(socket, connectionId, 'INVALID_MESSAGE', 'duplicate-hello');
-          return;
-        }
+      // 心跳（服务端探测与应答）属连接层；其余命令交权威会话裁决。
+      if (message.type === 'ping' || message.type === 'pong') {
+        this.handleHeartbeat(socket, connectionId, message);
+        return;
+      }
 
-        if (message.roomId !== null && message.roomId !== this.roomId) {
-          this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
-          return;
-        }
+      this.session.handleMessage(connectionId, message);
 
-        const member = this.admitMember(socket, message.payload);
-        if (!member) {
-          return;
-        }
-        joinedMember = member;
+      if (message.type === 'hello' && this.session.isHelloComplete(connectionId)) {
         clearTimeout(handshakeTimer);
-
-        // 先落座再发 welcome：快照里带上本人 presence，其他成员收 lobby.state。
-        // 旁观者不占执色、不进入准备就绪流程，不改动 presence/ready。
-        if (member.role !== 'spectator') {
-          this.applyLobby({ type: 'member-joined', role: member.role }, socket);
-        }
-
-        // 恢复凭据按真实身份发放：客人用全局 guest token，旁观者用本人独立 token。
-        const resumeToken =
-          member.role === 'guest'
-            ? this.guestResumeToken ?? undefined
-            : member.role === 'spectator'
-              ? member.resumeToken
-              : undefined;
-
-        socket.send(
-          buildServerMessage({
-            type: 'welcome',
-            roomId: this.roomId,
-            payload: {
-              roomId: this.roomId,
-              memberId: member.id,
-              role: member.role,
-              name: member.name,
-              members: this.getMembers(),
-              lobby: this.getLobby(),
-              ...(resumeToken ? { resumeToken } : {}),
-              ...(this.match ? { game: snapshotMatch(this.match, this.now()) } : {}),
-            },
-          }),
-        );
-        this.broadcastMembers();
         this.startWatchdog(socket);
-        this.logger('ws.joined', { room: this.roomId, member: member.id, role: member.role });
-        return;
       }
-
-      if (!joinedMember) {
-        this.reject(socket, connectionId, 'INVALID_MESSAGE', 'not-handshaked');
-        return;
-      }
-
-      // 席位与当前 socket 校验：玩家按席位记录比对，旁观者按本人记录比对，
-      // 防止旧 socket 在被新连接替换后继续操作。
-      const activeMember =
-        joinedMember.role === 'spectator' ? joinedMember : joinedMember.role === 'host' ? this.host : this.guest;
-      if (!activeMember || activeMember.socket !== socket) {
-        this.reject(socket, connectionId, 'UNAUTHORIZED', 'socket-superseded');
-        return;
-      }
-
-      if (message.type === 'ping') {
-        if (message.roomId !== this.roomId) {
-          this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
-          return;
-        }
-        const now = this.now();
-        try {
-          socket.send(
-            buildServerMessage(
-              buildPong(this.roomId, message.payload.seq, {
-                serverReceiveTime: now,
-                serverSendTime: now,
-              }),
-            ),
-          );
-        } catch {
-          // 忽略发送失败
-        }
-        return;
-      }
-
-      if (message.type === 'pong') {
-        if (message.roomId !== this.roomId) {
-          this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
-          return;
-        }
-        const wd = this.watchdogs.get(socket);
-        if (wd && wd.pendingPongSeq === message.payload.seq) {
-          wd.pendingPongSeq = null;
-          if (wd.timeoutTimer) {
-            clearTimeout(wd.timeoutTimer);
-            wd.timeoutTimer = null;
-          }
-        }
-        return;
-      }
-
-      if (message.type === 'leave') {
-        if (message.roomId !== this.roomId) {
-          this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
-          return;
-        }
-        this.logger('ws.leave', { room: this.roomId, member: joinedMember.id });
-        const member = joinedMember;
-        joinedMember = null;
-        this.depart(member, 'leave');
-        return;
-      }
-
-      // 旁观者只读：心跳、leave、game.sync 之外的一切消息在进入任何
-      // 会修改大厅/对局的 handler 前拒绝，且只回复请求方、无其他副作用。
-      if (joinedMember.role === 'spectator') {
-        if (message.type === 'game.sync') {
-          this.handleGameSync(socket, connectionId, joinedMember, message);
-          return;
-        }
-        this.rejectSpectatorAction(socket, message);
-        return;
-      }
-
-      if (message.type === 'lobby.return') {
-        this.handleLobbyReturn(socket, connectionId, joinedMember, message);
-        return;
-      }
-
-      if (
-        message.type === 'lobby.settings' ||
-        message.type === 'lobby.lock' ||
-        message.type === 'lobby.ready' ||
-        message.type === 'lobby.start'
-      ) {
-        this.handleLobbyMessage(socket, connectionId, joinedMember, message);
-        return;
-      }
-
-      if (message.type === 'game.action') {
-        this.handleGameAction(socket, connectionId, joinedMember, message);
-        return;
-      }
-
-      if (message.type === 'game.negotiate') {
-        this.handleGameNegotiate(socket, connectionId, joinedMember, message);
-        return;
-      }
-
-      if (message.type === 'game.negotiate.reply') {
-        this.handleGameNegotiateReply(socket, connectionId, joinedMember, message);
-        return;
-      }
-
-      if (message.type === 'game.resign') {
-        this.handleGameResign(socket, connectionId, joinedMember, message);
-        return;
-      }
-
-      if (message.type === 'game.sync') {
-        this.handleGameSync(socket, connectionId, joinedMember, message);
-        return;
-      }
-
-      if (message.type === 'chat.phrase') {
-        this.handleChatPhrase(socket, connectionId, joinedMember, message);
-        return;
-      }
-
-      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'unexpected-type');
     });
 
     socket.on('close', (code, reason) => {
       clearTimeout(handshakeTimer);
       this.clearSocketWatchdog(socket);
       this.openSockets.delete(socket);
-      this.logger('ws.disconnected', {
-        room: this.roomId,
-        conn: connectionId,
-        code,
-        reason: reason.toString(),
-        role: joinedMember?.role,
-      });
-
-      if (!joinedMember) {
-        return;
-      }
-
-      // 若当前席位已被同会话重连的新 socket 替换，旧 close 不能将新连接标为离线
-      if (joinedMember.socket !== socket) {
-        return;
-      }
-
-      const member = joinedMember;
-      joinedMember = null;
-      this.handleMemberDrop(member);
+      // 迟到 close 带原 connectionId：席位已被新连接替换时不误下线新连接。
+      this.session.handleDisconnect(connectionId, code, reason.toString());
     });
 
     socket.on('error', () => {
@@ -884,197 +451,22 @@ export class RoomServer {
     });
   }
 
-  private admitMember(socket: WebSocket, payload: { role: Role; name: string; token?: string; resumeToken?: string }): RoomMember | null {
-    if (payload.role === 'host') {
-      if (!payload.token || payload.token !== this.hostToken) {
-        this.reject(socket, 'host', 'UNAUTHORIZED', 'bad-host-token');
-        return null;
-      }
-      if (this.host && this.lobby.phase === 'started') {
-        const member = this.host;
-        const oldSocket = member.socket;
-        if (oldSocket && oldSocket !== socket) {
-          this.clearSocketWatchdog(oldSocket);
-          try {
-            this.sendError(oldSocket, 'UNAUTHORIZED', 'socket-superseded');
-            oldSocket.close(closeCodeForError('UNAUTHORIZED'), 'socket-superseded');
-          } catch {
-            // ignore
-          }
-        }
-        member.socket = socket;
-        member.connected = true;
-        member.leaveReason = null;
-        if (this.match) {
-          const recRes = this.match.clock.onReconnect('host', this.now());
-          this.match.revision++;
-          if (recRes.settlement) {
-            this.match = finalizeMatch(this.match, recRes.settlement.winner, recRes.settlement.reason, this.now());
-            this.stopClockBroadcast();
-            this.clearClockTimer();
-          } else {
-            this.scheduleClockDeadline();
-          }
-          this.broadcastGameState();
-        }
-        return member;
-      }
-      if (this.host?.connected) {
-        this.reject(socket, 'host', 'UNAUTHORIZED', 'host-slot-taken');
-        return null;
-      }
-      const member: RoomMember = {
-        id: generateId(),
-        role: 'host',
-        name: HOST_NAME,
-        socket,
-        connected: true,
-        leaveReason: null,
-      };
-      this.host = member;
-      return member;
-    }
-
-    if (payload.role === 'spectator') {
-      // 显式旁观：始终不占执色席位。
-      return this.admitSpectator(socket, payload.resumeToken);
-    }
-
-    // 客人恢复只接受全局 guest token：旁观者/房主凭据禁止跨身份使用。
-    if (payload.resumeToken) {
-      if (!this.guestResumeToken || payload.resumeToken !== this.guestResumeToken || !this.guest) {
-        this.reject(socket, 'guest', 'UNAUTHORIZED', 'bad-resume-token');
-        return null;
-      }
-      const member = this.guest;
-      const oldSocket = member.socket;
-      if (oldSocket && oldSocket !== socket) {
-        this.clearSocketWatchdog(oldSocket);
-        try {
-          this.sendError(oldSocket, 'UNAUTHORIZED', 'socket-superseded');
-          oldSocket.close(closeCodeForError('UNAUTHORIZED'), 'socket-superseded');
-        } catch {
-          // 忽略关闭失败
-        }
-      }
-      member.socket = socket;
-      member.connected = true;
-      member.leaveReason = null;
-      if (this.match && this.lobby.phase === 'started') {
-        const recRes = this.match.clock.onReconnect('guest', this.now());
-        this.match.revision++;
-        if (recRes.settlement) {
-          this.match = finalizeMatch(this.match, recRes.settlement.winner, recRes.settlement.reason, this.now());
-          this.stopClockBroadcast();
-          this.clearClockTimer();
-        } else {
-          this.scheduleClockDeadline();
-        }
-        this.broadcastGameState();
-      }
-      return member;
-    }
-
-    if (this.guest?.connected) {
-      // 客人席位已被占用：普通加入自动分流为旁观者，不占执色、不参与准备就绪。
-      return this.admitSpectator(socket, undefined);
-    }
-    if (this.lobby.phase === 'started' && this.guest) {
-      // 开局后保持已冻结身份，不接受新成员替换：后来者以旁观身份进入。
-      return this.admitSpectator(socket, undefined);
-    }
-
-    this.guestResumeToken = generateToken();
-    const member: RoomMember = {
-      id: generateId(),
-      role: 'guest',
-      name: GUEST_NAME,
-      socket,
-      connected: true,
-      leaveReason: null,
-    };
-    // 只保留一个客人席位：离线客人卡片被新成员替换，不累积幽灵成员。
-    if (this.guest) {
-      this.applyLobby({ type: 'member-left', role: 'guest' }, socket);
-    }
-    this.guest = member;
-    return member;
-  }
-
   /**
-   * 旁观者准入：有恢复凭据时只认本人凭据并替换旧 socket（禁止跨身份 token），
-   * 无凭据时新建旁观记录；错误凭据一律拒绝，不回退为新成员。
+   * 心跳处理：门禁与会话的连接归属校验一致（未握手 / 已被替换的连接一律拒绝），
+   * 保证旧连接的迟到心跳不影响新连接。
    */
-  private admitSpectator(socket: WebSocket, resumeToken: string | undefined): RoomMember | null {
-    if (resumeToken) {
-      const existing = this.spectators.find((member) => member.resumeToken && member.resumeToken === resumeToken);
-      if (!existing) {
-        this.reject(socket, 'spectator', 'UNAUTHORIZED', 'bad-resume-token');
-        return null;
-      }
-      const oldSocket = existing.socket;
-      if (oldSocket && oldSocket !== socket) {
-        this.clearSocketWatchdog(oldSocket);
-        try {
-          this.sendError(oldSocket, 'UNAUTHORIZED', 'socket-superseded');
-          oldSocket.close(closeCodeForError('UNAUTHORIZED'), 'socket-superseded');
-        } catch {
-          // 忽略关闭失败
-        }
-      }
-      existing.socket = socket;
-      existing.connected = true;
-      existing.leaveReason = null;
-      this.clearSpectatorExpiry(existing.id);
-      return existing;
-    }
-
-    this.spectatorNameSeq += 1;
-    const member: RoomMember = {
-      id: generateId(),
-      role: 'spectator',
-      name: `${SPECTATOR_NAME}${this.spectatorNameSeq}`,
-      socket,
-      connected: true,
-      leaveReason: null,
-      resumeToken: generateToken(),
-    };
-    this.spectators.push(member);
-    return member;
-  }
-
-  private clearSpectatorExpiry(memberId: string): void {
-    const timer = this.spectatorExpiryTimers.get(memberId);
-    if (timer) {
-      clearTimeout(timer);
-      this.spectatorExpiryTimers.delete(memberId);
-    }
-  }
-
-  /** 旁观者掉线后的恢复窗口：超时未恢复即清理记录并同步名单。 */
-  private scheduleSpectatorExpiry(member: RoomMember): void {
-    this.clearSpectatorExpiry(member.id);
-    const timer = setTimeout(() => {
-      this.spectatorExpiryTimers.delete(member.id);
-      const index = this.spectators.indexOf(member);
-      if (index >= 0 && !member.connected) {
-        this.spectators.splice(index, 1);
-        this.logger('ws.spectator_expired', { room: this.roomId, member: member.id });
-        this.broadcastMembers();
-      }
-    }, this.options.spectatorResumeWindowMs ?? DEFAULT_SPECTATOR_RESUME_WINDOW_MS);
-    timer.unref?.();
-    this.spectatorExpiryTimers.set(member.id, timer);
-  }
-
-  private handleLobbyMessage(
+  private handleHeartbeat(
     socket: WebSocket,
-    connectionId: string,
-    member: RoomMember,
-    message: LobbyClientMessage,
+    connectionId: ConnectionId,
+    message: Extract<ClientMessage, { type: 'ping' | 'pong' }>,
   ): void {
-    // 旁观消息已在分发层拒绝；这里仅为类型收窄到执色玩家。
-    if (member.role === 'spectator') {
+    const standing = this.session.getStanding(connectionId);
+    if (standing === 'superseded') {
+      this.reject(socket, connectionId, 'UNAUTHORIZED', 'socket-superseded');
+      return;
+    }
+    if (standing !== 'active') {
+      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'not-handshaked');
       return;
     }
     if (message.roomId !== this.roomId) {
@@ -1082,1158 +474,30 @@ export class RoomServer {
       return;
     }
 
-    let command: LobbyCommand;
-    switch (message.type) {
-      case 'lobby.settings':
-        command = {
-          type: 'update-settings',
-          actor: member.role,
-          sidePreference: message.payload.sidePreference,
-          timeControlId: message.payload.timeControlId,
-        };
-        break;
-      case 'lobby.lock':
-        command = { type: 'set-locked', actor: member.role, locked: message.payload.locked };
-        break;
-      case 'lobby.ready':
-        command = {
-          type: 'set-ready',
-          actor: member.role,
-          ready: message.payload.ready,
-          settingsVersion: message.payload.settingsVersion,
-        };
-        break;
-      default: {
-        const host = this.host;
-        const guest = this.guest;
-        if (!host || !guest) {
-          this.sendLobbyRejection(socket, 'MEMBER_MISSING', 'start-identity');
-          return;
-        }
-        // 随机分先只在真正冻结时抽取一次；重复开始在状态机里先被拒绝，不会再抽。
-        const needsDraw = this.lobby.phase === 'lobby' && this.lobby.settings.sidePreference === 'random';
-        command = {
-          type: 'start',
-          actor: member.role,
-          roomId: this.roomId,
-          host: { memberId: host.id, name: host.name },
-          guest: { memberId: guest.id, name: guest.name },
-          hostRedWhenRandom: needsDraw ? this.drawHostRed() : null,
-        };
-        break;
-      }
-    }
-
-    const result = applyLobbyCommand(this.lobby, command);
-    if (!result.ok) {
-      this.logger('lobby.rejected', { room: this.roomId, member: member.id, code: result.code, detail: result.detail });
-      // 操作拒绝一律非致命：提示原因但保持连接，可继续其他操作。
-      this.sendLobbyRejection(socket, result.code, result.detail);
-      return;
-    }
-
-    if (result.changed) {
-      this.lobby = result.state;
-      this.logger('lobby.changed', {
-        room: this.roomId,
-        member: member.id,
-        command: command.type,
-        phase: result.state.phase,
-        settingsVersion: result.state.settings.settingsVersion,
-      });
-      if (result.state.phase === 'started' && !this.match) {
-        this.phraseCooldownUntil.clear();
-        this.processedPhraseRequests.clear();
-        const seed = this.drawSeed();
-        const matchId = generateId();
-        this.match = createMatch({
-          matchId,
-          seed,
-          startParameters: result.state.startParameters!,
-          nowFn: this.now,
-        });
-        this.logger('game.started', { room: this.roomId, matchId, seed });
-        this.startClockBroadcast();
-        this.scheduleClockDeadline();
-      }
-      // 发起者同样收到权威状态：既确认操作成功，也清除在途请求。
-      this.broadcastLobby();
-      if (this.match) {
-        this.broadcastGameState();
-      }
-    }
-  }
-
-  private applyLobby(command: LobbyCommand, exclude?: WebSocket): void {
-    const result = applyLobbyCommand(this.lobby, command);
-    if (result.ok && result.changed) {
-      this.lobby = result.state;
-      this.broadcastLobby(exclude);
-    }
-  }
-
-  /** 广播权威大厅快照（welcome 与 lobby.state 携带同一份结构）。 */
-  private broadcastLobby(exclude?: WebSocket): void {
-    const text = buildServerMessage({
-      type: 'lobby.state',
-      roomId: this.roomId,
-      payload: { lobby: this.getLobby() },
-    });
-    for (const socket of this.openSockets) {
-      if (socket === exclude) {
-        continue;
-      }
-      // 1 === WebSocket.OPEN
-      if (socket.readyState === 1) {
-        try {
-          socket.send(text);
-        } catch {
-          // 忽略单个连接的发送失败。
-        }
-      }
-    }
-  }
-
-  private sendLobbyRejection(socket: WebSocket, code: LobbyRejectCode, detail: string): void {
-    try {
-      socket.send(
-        buildServerMessage({
-          type: 'lobby.rejected',
-          roomId: this.roomId,
-          payload: { code, message: detail },
-        }),
-      );
-    } catch {
-      // socket 已关闭。
-    }
-  }
-
-  private handleMemberDrop(member: RoomMember): void {
-    if (member.role === 'spectator') {
-      if (member.socket) {
-        this.clearSocketWatchdog(member.socket);
-      }
-      member.connected = false;
-      member.socket = null;
-      member.leaveReason = 'dropped';
-      // 旁观者掉线不影响对局：不暂停时钟、不取消协商、不动 ready/presence/revision。
-      this.scheduleSpectatorExpiry(member);
-      this.logger('ws.spectator_dropped', { room: this.roomId, member: member.id });
-      this.broadcastMembers();
-      return;
-    }
-
-    if (this.lobby.phase === 'started' && this.match) {
-      if (this.match.pendingNegotiation) {
-        this.clearNegotiationTimer();
-        this.match.clock.resumeNegotiation(this.now());
-        this.match.pendingNegotiation = null;
-        this.match.negotiationEvent = {
-          id: `evt-${this.now()}-${Math.random().toString(36).slice(2, 7)}`,
-          type: 'negotiation-cancelled',
-          actorMemberId: member.id,
-          createdAt: this.now(),
-          message: '成员连接中断，协商已取消',
-        };
-      }
+    if (message.type === 'ping') {
       const now = this.now();
-      const dropRes = this.match.clock.onDrop(member.role, now);
-      this.match.revision++;
-      if (dropRes.settlement) {
-        this.match = finalizeMatch(this.match, dropRes.settlement.winner, dropRes.settlement.reason, now);
-        this.stopClockBroadcast();
-        this.clearClockTimer();
-      } else {
-        this.scheduleClockDeadline();
-      }
-    }
-
-    if (member.role === 'host') {
-      if (this.lobby.phase === 'started') {
-        if (member.socket) {
-          this.clearSocketWatchdog(member.socket);
-        }
-        member.connected = false;
-        member.socket = null;
-        member.leaveReason = 'dropped';
-        this.logger('ws.host_dropped', { room: this.roomId, member: member.id });
-        this.applyLobby({ type: 'member-left', role: 'host' });
-        this.broadcastMembers();
-        if (this.match) {
-          this.broadcastGameState();
-        }
-        return;
-      }
-      this.logger('ws.host_dropped', { room: this.roomId, member: member.id });
-      void this.closeRoom('host-disconnected');
-      return;
-    }
-
-    if (member.socket) {
-      this.clearSocketWatchdog(member.socket);
-    }
-    member.connected = false;
-    member.socket = null;
-    member.leaveReason = 'dropped';
-    this.logger('ws.guest_dropped', { room: this.roomId, member: member.id });
-    this.applyLobby({ type: 'member-left', role: 'guest' });
-    this.broadcastMembers();
-    if (this.match) {
-      this.broadcastGameState();
-    }
-  }
-
-  private depart(member: RoomMember, reason: 'leave'): void {
-    if (member.role === 'spectator') {
-      // 旁观者主动退出：撤销恢复凭据并清理记录，不影响对局与大厅状态。
-      this.clearSpectatorExpiry(member.id);
-      const index = this.spectators.indexOf(member);
-      if (index >= 0) {
-        this.spectators.splice(index, 1);
-      }
-      const socket = member.socket;
-      if (socket) {
-        this.clearSocketWatchdog(socket);
-      }
-      member.connected = false;
-      member.socket = null;
-      member.leaveReason = 'left';
-      member.resumeToken = undefined;
-      this.broadcastMembers();
-      this.logger('ws.spectator_left', { room: this.roomId, member: member.id, reason });
       try {
-        socket?.close(1000, reason);
-      } catch {
-        // socket 已关闭。
-      }
-      return;
-    }
-
-    if (this.lobby.phase === 'started' && this.match) {
-      if (this.match.pendingNegotiation) {
-        this.clearNegotiationTimer();
-        this.match.pendingNegotiation = null;
-      }
-      if (member.role === 'guest') {
-        const now = this.now();
-        const hostSeat = this.match.startParameters.players.find((p) => p.role === 'host')!;
-        this.match = finalizeMatch(this.match, hostSeat.side, 'disconnect-timeout', now);
-        this.stopClockBroadcast();
-        this.clearClockTimer();
-        this.broadcastGameState();
-      }
-    }
-
-    if (member.role === 'host') {
-      void this.closeRoom('host-closed');
-      return;
-    }
-
-    if (member.role === 'guest') {
-      this.guestResumeToken = null;
-    }
-
-    const socket = member.socket;
-    if (socket) {
-      this.clearSocketWatchdog(socket);
-    }
-    member.connected = false;
-    member.socket = null;
-    member.leaveReason = 'left';
-    this.applyLobby({ type: 'member-left', role: 'guest' });
-    this.broadcastMembers();
-    this.logger('ws.guest_left', { room: this.roomId, member: member.id, reason });
-    try {
-      socket?.close(1000, reason);
-    } catch {
-      // socket 已关闭。
-    }
-  }
-
-  private broadcastMembers(): void {
-    const snapshot = this.getMembers();
-    const text = buildServerMessage({
-      type: 'members',
-      roomId: this.roomId,
-      payload: { members: snapshot },
-    });
-    for (const socket of this.openSockets) {
-      // 1 === WebSocket.OPEN
-      if (socket.readyState === 1) {
-        try {
-          socket.send(text);
-        } catch {
-          // 忽略单个连接的发送失败。
-        }
-      }
-    }
-  }
-
-  private handleGameAction(
-    socket: WebSocket,
-    connectionId: string,
-    member: RoomMember,
-    message: Extract<ClientMessage, { type: 'game.action' }>,
-  ): void {
-    if (message.roomId !== this.roomId) {
-      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
-      return;
-    }
-
-    if (!this.match || this.lobby.phase !== 'started') {
-      this.sendGameRejection(
-        socket,
-        message.payload.matchId,
-        0,
-        '对局尚未开始',
-        this.match ? snapshotMatch(this.match, this.now()).gameState : createEmptyGameState(),
-        message.requestId,
-      );
-      return;
-    }
-
-    // 双方在线检查：避免恢复窗口中的竞争
-    if (!this.host?.connected || !this.guest?.connected) {
-      this.sendGameRejection(
-        socket,
-        this.match.matchId,
-        this.match.stepNumber,
-        '对手已离线，暂无法操作',
-        snapshotMatch(this.match, this.now()).gameState,
-        message.requestId,
-      );
-      return;
-    }
-
-    if (message.requestId && this.processedActions.has(message.requestId)) {
-      const cached = this.processedActions.get(message.requestId)!;
-      this.logger('game.action_duplicate', {
-        room: this.roomId,
-        requestId: message.requestId,
-        stepNumber: cached.stepNumber,
-      });
-      const snap = snapshotMatch(this.match, this.now());
-      try {
-        socket.send(
-          buildServerMessage({
-            type: 'game.state',
-            roomId: this.roomId,
-            requestId: message.requestId,
-            payload: {
-              matchId: snap.matchId,
-              seed: snap.seed,
-              stepNumber: snap.stepNumber,
-              revision: snap.revision,
-              state: snap.gameState,
-              startParameters: snap.startParameters,
-              clock: snap.clock,
-              ...(snap.settlement ? { settlement: snap.settlement } : {}),
-              pendingNegotiation: snap.pendingNegotiation,
-              drawCooldownUntil: snap.drawCooldownUntil,
-              phraseCooldownUntil: snap.phraseCooldownUntil,
-              negotiationEvent: snap.negotiationEvent,
-              matchEvents: snap.matchEvents,
-            },
-          }),
-        );
-      } catch {
-        // 忽略发送失败
-      }
-      return;
-    }
-
-    if (message.payload.matchId !== this.match.matchId) {
-      this.sendGameRejection(
-        socket,
-        this.match.matchId,
-        this.match.stepNumber,
-        '对局标识不匹配',
-        snapshotMatch(this.match, this.now()).gameState,
-        message.requestId,
-      );
-      return;
-    }
-
-    if (message.payload.stepNumber !== this.match.stepNumber) {
-      this.sendGameRejection(
-        socket,
-        this.match.matchId,
-        this.match.stepNumber,
-        '操作步数已过期，请以最新棋盘为准',
-        snapshotMatch(this.match, this.now()).gameState,
-        message.requestId,
-      );
-      return;
-    }
-
-    if (this.match.pendingNegotiation !== null) {
-      this.sendGameRejection(
-        socket,
-        this.match.matchId,
-        this.match.stepNumber,
-        '协商正在进行中，棋盘操作已锁定',
-        snapshotMatch(this.match, this.now()).gameState,
-        message.requestId,
-      );
-      return;
-    }
-
-    const currentTurn = this.match.gameState.currentTurn;
-    const expectedMemberId =
-      currentTurn === 'red' ? this.match.startParameters.redMemberId : this.match.startParameters.blackMemberId;
-
-    if (member.id !== expectedMemberId) {
-      this.sendGameRejection(
-        socket,
-        this.match.matchId,
-        this.match.stepNumber,
-        '非己方回合，请等待对方行动',
-        snapshotMatch(this.match, this.now()).gameState,
-        message.requestId,
-      );
-      return;
-    }
-
-    const now = this.now();
-    const result = applyMatchAction(this.match, member.id, message.payload.action, now);
-    if (!result.ok) {
-      this.logger('game.action_rejected', {
-        room: this.roomId,
-        member: member.id,
-        reason: result.reason,
-      });
-      this.sendGameRejection(
-        socket,
-        this.match.matchId,
-        this.match.stepNumber,
-        result.reason,
-        snapshotMatch(this.match, now).gameState,
-        message.requestId,
-      );
-      return;
-    }
-
-    this.match = result.match;
-    if (this.match.settlement !== null) {
-      this.stopClockBroadcast();
-      this.clearClockTimer();
-    } else {
-      this.scheduleClockDeadline();
-    }
-
-    if (message.requestId) {
-      this.processedActions.set(message.requestId, {
-        stepNumber: this.match.stepNumber,
-      });
-      if (this.processedActions.size > 200) {
-        const oldestKey = this.processedActions.keys().next().value;
-        if (oldestKey) {
-          this.processedActions.delete(oldestKey);
-        }
-      }
-    }
-
-    this.logger('game.action_applied', {
-      room: this.roomId,
-      matchId: this.match.matchId,
-      stepNumber: this.match.stepNumber,
-      member: member.id,
-    });
-
-    this.broadcastGameState({
-      requestId: message.requestId,
-      actorMemberId: member.id,
-      action: message.payload.action,
-    });
-  }
-
-  private handleGameNegotiate(
-    socket: WebSocket,
-    connectionId: string,
-    member: RoomMember,
-    message: Extract<ClientMessage, { type: 'game.negotiate' }>,
-  ): void {
-    if (message.roomId !== this.roomId) {
-      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
-      return;
-    }
-
-    if (!this.match || this.lobby.phase !== 'started') {
-      this.sendGameRejection(
-        socket,
-        message.payload.matchId,
-        0,
-        '对局尚未开始',
-        this.match ? snapshotMatch(this.match, this.now()).gameState : createEmptyGameState(),
-        message.requestId,
-      );
-      return;
-    }
-
-    if (!this.host?.connected || !this.guest?.connected) {
-      this.sendGameRejection(
-        socket,
-        this.match.matchId,
-        this.match.stepNumber,
-        '对手已离线，暂无法操作',
-        snapshotMatch(this.match, this.now()).gameState,
-        message.requestId,
-      );
-      return;
-    }
-
-    if (this.match.settlement !== null || this.match.gameState.winner !== null) {
-      this.sendGameRejection(
-        socket,
-        this.match.matchId,
-        this.match.stepNumber,
-        '对局已经结束，请重新开局',
-        snapshotMatch(this.match, this.now()).gameState,
-        message.requestId,
-      );
-      return;
-    }
-
-    if (message.payload.matchId !== this.match.matchId) {
-      this.sendGameRejection(
-        socket,
-        this.match.matchId,
-        this.match.stepNumber,
-        '对局标识不匹配',
-        snapshotMatch(this.match, this.now()).gameState,
-        message.requestId,
-      );
-      return;
-    }
-
-    if (message.payload.revision !== this.match.revision) {
-      this.sendGameRejection(
-        socket,
-        this.match.matchId,
-        this.match.stepNumber,
-        '操作版本已过期，请以最新棋盘为准',
-        snapshotMatch(this.match, this.now()).gameState,
-        message.requestId,
-      );
-      return;
-    }
-
-    const now = this.now();
-
-    // 先检查是否已有到期的协商
-    if (this.match.pendingNegotiation && now >= this.match.pendingNegotiation.deadline) {
-      this.handleNegotiationTimeout(this.match.matchId, this.match.pendingNegotiation.negotiationId);
-    }
-
-    if (this.match.pendingNegotiation !== null) {
-      this.sendGameRejection(
-        socket,
-        this.match.matchId,
-        this.match.stepNumber,
-        '已有协商正在进行中，请等待其结束',
-        snapshotMatch(this.match, now).gameState,
-        message.requestId,
-      );
-      return;
-    }
-
-    if (message.payload.kind === 'undo') {
-      if (this.match.gameState.actionHistory.length === 0) {
-        this.sendGameRejection(
-          socket,
-          this.match.matchId,
-          this.match.stepNumber,
-          '开局暂无走子记录，无法申请悔棋',
-          snapshotMatch(this.match, now).gameState,
-          message.requestId,
-        );
-        return;
-      }
-    } else if (message.payload.kind === 'draw') {
-      const cooldownUntil = this.match.drawCooldownUntil[member.id] ?? 0;
-      if (now < cooldownUntil) {
-        const remaining = Math.ceil((cooldownUntil - now) / 1000);
-        this.sendGameRejection(
-          socket,
-          this.match.matchId,
-          this.match.stepNumber,
-          `求和申请冷却中，请在 ${remaining} 秒后再试`,
-          snapshotMatch(this.match, now).gameState,
-          message.requestId,
-        );
-        return;
-      }
-    }
-
-    const responder = member.role === 'host' ? this.guest! : this.host!;
-    const negotiationId = randomBytes(16).toString('hex');
-    const deadline = now + NEGOTIATION_TIMEOUT_MS;
-
-    const pending: PendingNegotiation = {
-      negotiationId,
-      type: message.payload.kind,
-      initiatorMemberId: member.id,
-      responderMemberId: responder.id,
-      baselineRevision: this.match.revision,
-      createdAt: now,
-      deadline,
-    };
-
-    this.match.pendingNegotiation = pending;
-    this.match.clock.pauseNegotiation(now);
-    this.clearClockTimer();
-    this.match.revision++;
-
-    const eventType: NegotiationEventType = message.payload.kind === 'undo' ? 'undo-request' : 'draw-request';
-    const eventMsg = message.payload.kind === 'undo' ? '对方发起了悔棋申请' : '对方发起了求和申请';
-    this.recordMatchEvent(eventType, member.id, 'requested', eventMsg, now);
-
-    this.scheduleNegotiationDeadline(this.match.matchId, negotiationId, deadline);
-    this.broadcastGameState({ requestId: message.requestId });
-  }
-
-  private handleGameNegotiateReply(
-    socket: WebSocket,
-    connectionId: string,
-    member: RoomMember,
-    message: Extract<ClientMessage, { type: 'game.negotiate.reply' }>,
-  ): void {
-    if (message.roomId !== this.roomId) {
-      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
-      return;
-    }
-
-    if (!this.match || this.lobby.phase !== 'started') {
-      return;
-    }
-
-    const pending = this.match.pendingNegotiation;
-    if (!pending || pending.negotiationId !== message.payload.negotiationId) {
-      return;
-    }
-
-    if (member.id !== pending.responderMemberId) {
-      this.sendGameRejection(
-        socket,
-        this.match.matchId,
-        this.match.stepNumber,
-        '非指定应答方，无法操作',
-        snapshotMatch(this.match, this.now()).gameState,
-        message.requestId,
-      );
-      return;
-    }
-
-    const now = this.now();
-    if (now >= pending.deadline) {
-      this.handleNegotiationTimeout(this.match.matchId, pending.negotiationId);
-      return;
-    }
-
-    this.clearNegotiationTimer();
-
-    if (message.payload.accept) {
-      if (pending.type === 'undo') {
-        const undoRes = undoMatchAction(this.match, now);
-        if (undoRes.ok) {
-          this.match = undoRes.match;
-          this.match.clock.resumeNegotiation(now);
-          this.match.pendingNegotiation = null;
-          this.processedActions.clear();
-          this.recordMatchEvent('undo-accepted', member.id, 'accepted', '对方同意了悔棋申请，棋盘已回退一步', now);
-          this.broadcastGameState({ requestId: message.requestId });
-          this.scheduleClockDeadline();
-        }
-      } else if (pending.type === 'draw') {
-        this.match = finalizeMatchDraw(this.match, 'draw-agreement', now);
-        this.match.pendingNegotiation = null;
-        this.stopClockBroadcast();
-        this.clearClockTimer();
-        this.recordMatchEvent('draw-accepted', member.id, 'accepted', '双方同意握手言和，对局平局', now);
-        this.broadcastGameState({ requestId: message.requestId });
-      }
-    } else {
-      // 拒绝
-      if (pending.type === 'undo') {
-        this.match.clock.resumeNegotiation(now);
-        this.match.pendingNegotiation = null;
-        this.match.revision++;
-        this.recordMatchEvent('undo-rejected', member.id, 'rejected', '对方拒绝了悔棋申请', now);
-        this.broadcastGameState({ requestId: message.requestId });
-        this.scheduleClockDeadline();
-      } else if (pending.type === 'draw') {
-        this.match.drawCooldownUntil[pending.initiatorMemberId] = now + DRAW_COOLDOWN_MS;
-        this.match.clock.resumeNegotiation(now);
-        this.match.pendingNegotiation = null;
-        this.match.revision++;
-        this.recordMatchEvent('draw-rejected', member.id, 'rejected', '对方拒绝了求和申请', now);
-        this.broadcastGameState({ requestId: message.requestId });
-        this.scheduleClockDeadline();
-      }
-    }
-  }
-
-  private handleGameResign(
-    socket: WebSocket,
-    connectionId: string,
-    member: RoomMember,
-    message: Extract<ClientMessage, { type: 'game.resign' }>,
-  ): void {
-    if (message.roomId !== this.roomId) {
-      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
-      return;
-    }
-
-    if (!this.match || this.lobby.phase !== 'started') {
-      return;
-    }
-
-    if (this.match.settlement !== null || this.match.gameState.winner !== null) {
-      return;
-    }
-
-    const now = this.now();
-    const adv = this.match.clock.advance(now);
-    if (adv.timeoutResult) {
-      this.match = finalizeMatch(this.match, adv.timeoutResult.winner!, adv.timeoutResult.reason, now);
-      this.stopClockBroadcast();
-      this.clearClockTimer();
-      this.clearNegotiationTimer();
-      this.broadcastGameState({ requestId: message.requestId });
-      return;
-    }
-
-    const resigningCamp = member.id === this.match.startParameters.redMemberId ? 'red' : 'black';
-    const winningCamp = resigningCamp === 'red' ? 'black' : 'red';
-
-    if (this.match.pendingNegotiation) {
-      this.clearNegotiationTimer();
-      this.match.pendingNegotiation = null;
-    }
-
-    this.match = finalizeMatch(this.match, winningCamp, 'resignation', now);
-    this.stopClockBroadcast();
-    this.clearClockTimer();
-    this.recordMatchEvent('resigned', member.id, 'resigned', `${member.name} 认输，对局结束`, now);
-    this.broadcastGameState({ requestId: message.requestId });
-  }
-
-  private handleGameSync(
-    socket: WebSocket,
-    connectionId: string,
-    _member: RoomMember,
-    message: Extract<ClientMessage, { type: 'game.sync' }>,
-  ): void {
-    if (message.roomId !== this.roomId) {
-      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
-      return;
-    }
-    if (!this.match || this.lobby.phase !== 'started') {
-      this.sendGameRejection(
-        socket,
-        message.payload.matchId ?? '',
-        0,
-        '对局尚未开始',
-        createEmptyGameState(),
-        message.requestId,
-      );
-      return;
-    }
-    if (message.payload.matchId && message.payload.matchId !== this.match.matchId) {
-      this.sendGameRejection(
-        socket,
-        message.payload.matchId,
-        this.match.stepNumber,
-        '对局标识不匹配',
-        snapshotMatch(this.match, this.now()).gameState,
-        message.requestId,
-      );
-      return;
-    }
-    const snap = snapshotMatch(this.match, this.now());
-    try {
-      socket.send(
-        buildServerMessage({
-          type: 'game.state',
-          roomId: this.roomId,
-          ...(message.requestId ? { requestId: message.requestId } : {}),
-          payload: {
-            matchId: snap.matchId,
-            seed: snap.seed,
-            stepNumber: snap.stepNumber,
-            revision: snap.revision,
-            state: snap.gameState,
-            startParameters: snap.startParameters,
-            clock: snap.clock,
-            ...(snap.settlement ? { settlement: snap.settlement } : {}),
-            pendingNegotiation: snap.pendingNegotiation,
-            drawCooldownUntil: snap.drawCooldownUntil,
-            phraseCooldownUntil: snap.phraseCooldownUntil,
-            negotiationEvent: snap.negotiationEvent,
-            matchEvents: snap.matchEvents,
-          },
-        }),
-      );
-    } catch {
-      // 忽略单个发送失败
-    }
-  }
-
-  private broadcastGameState(options?: {
-    requestId?: string;
-    actorMemberId?: string;
-    action?: MatchAction;
-  }): void {
-    if (!this.match) {
-      return;
-    }
-    const snap = snapshotMatch(this.match, this.now());
-    const text = buildServerMessage({
-      type: 'game.state',
-      roomId: this.roomId,
-      ...(options?.requestId ? { requestId: options.requestId } : {}),
-      payload: {
-        matchId: snap.matchId,
-        seed: snap.seed,
-        stepNumber: snap.stepNumber,
-        revision: snap.revision,
-        state: snap.gameState,
-        startParameters: snap.startParameters,
-        clock: snap.clock,
-        ...(snap.settlement ? { settlement: snap.settlement } : {}),
-        pendingNegotiation: snap.pendingNegotiation,
-        drawCooldownUntil: snap.drawCooldownUntil,
-        phraseCooldownUntil: snap.phraseCooldownUntil,
-        negotiationEvent: snap.negotiationEvent,
-        matchEvents: snap.matchEvents,
-        ...(options?.actorMemberId ? { actorMemberId: options.actorMemberId } : {}),
-        ...(options?.action ? { action: options.action } : {}),
-      },
-    });
-
-    for (const socket of this.openSockets) {
-      if (socket.readyState === 1) {
-        try {
-          socket.send(text);
-        } catch {
-          // 忽略发送失败
-        }
-      }
-    }
-  }
-
-  private handleChatPhrase(
-    socket: WebSocket,
-    connectionId: string,
-    member: RoomMember | null,
-    message: Extract<ClientMessage, { type: 'chat.phrase' }>,
-  ): void {
-    if (message.roomId !== this.roomId) {
-      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
-      return;
-    }
-
-    if (!member) {
-      this.reject(socket, connectionId, 'UNAUTHORIZED', 'unadmitted-member');
-      return;
-    }
-
-    if (
-      !this.match ||
-      this.lobby.phase !== 'started' ||
-      this.match.settlement !== null ||
-      this.match.gameState.winner !== null
-    ) {
-      this.sendChatPhraseRejection(
-        socket,
-        {
-          matchId: message.payload.matchId,
-          requestId: message.requestId,
-          code: 'MATCH_NOT_ACTIVE',
-          message: '对局未处于进行中',
-        },
-        message.requestId,
-      );
-      return;
-    }
-
-    if (member.id !== this.host?.id && member.id !== this.guest?.id) {
-      this.sendChatPhraseRejection(
-        socket,
-        {
-          matchId: message.payload.matchId,
-          requestId: message.requestId,
-          code: 'NOT_A_PLAYER',
-          message: '非对局玩家',
-        },
-        message.requestId,
-      );
-      return;
-    }
-
-    if (!this.host?.connected || !this.guest?.connected) {
-      this.sendChatPhraseRejection(
-        socket,
-        {
-          matchId: message.payload.matchId,
-          requestId: message.requestId,
-          code: 'MATCH_NOT_ACTIVE',
-          message: '对方已离线，暂无法发送短语',
-        },
-        message.requestId,
-      );
-      return;
-    }
-
-    if (!isQuickPhraseId(message.payload.phraseId)) {
-      this.sendChatPhraseRejection(
-        socket,
-        {
-          matchId: message.payload.matchId,
-          requestId: message.requestId,
-          code: 'INVALID_PHRASE',
-          message: '非法预置短语',
-        },
-        message.requestId,
-      );
-      return;
-    }
-
-    if (message.requestId && this.processedPhraseRequests.has(message.requestId)) {
-      // 相同请求重传不重复广播或延长冷却
-      return;
-    }
-
-    const now = this.now();
-    const cooldownUntil = this.phraseCooldownUntil.get(member.id) ?? 0;
-    if (now < cooldownUntil) {
-      const remainingSeconds = Math.ceil((cooldownUntil - now) / 1000);
-      this.sendChatPhraseRejection(
-        socket,
-        {
-          matchId: message.payload.matchId,
-          requestId: message.requestId,
-          code: 'COOLDOWN',
-          message: `短语发送冷却中，请等待 ${remainingSeconds} 秒`,
-          retryAt: cooldownUntil,
-        },
-        message.requestId,
-      );
-      return;
-    }
-
-    const nextAllowedAt = now + QUICK_PHRASE_COOLDOWN_MS;
-    this.phraseCooldownUntil.set(member.id, nextAllowedAt);
-    if (this.match) {
-      this.match.phraseCooldownUntil[member.id] = nextAllowedAt;
-    }
-
-    const event: QuickPhraseEvent = {
-      eventId: generateId(),
-      matchId: this.match.matchId,
-      senderMemberId: member.id,
-      phraseId: message.payload.phraseId,
-      text: getQuickPhraseText(message.payload.phraseId)!,
-      sentAt: now,
-      nextAllowedAt,
-    };
-
-    if (message.requestId) {
-      this.processedPhraseRequests.set(message.requestId, { event });
-      if (this.processedPhraseRequests.size > 200) {
-        const oldestKey = this.processedPhraseRequests.keys().next().value;
-        if (oldestKey) {
-          this.processedPhraseRequests.delete(oldestKey);
-        }
-      }
-    }
-
-    this.logger('chat.phrase', {
-      room: this.roomId,
-      matchId: this.match.matchId,
-      member: member.id,
-      phraseId: message.payload.phraseId,
-    });
-
-    const text = buildServerMessage(buildServerChatPhrase(this.roomId, event));
-    for (const s of this.openSockets) {
-      if (s.readyState === 1) {
-        try {
-          s.send(text);
-        } catch {
-          // 忽略单个发送失败
-        }
-      }
-    }
-  }
-
-  private sendChatPhraseRejection(
-    socket: WebSocket,
-    rejection: QuickChatRejection,
-    requestId?: string,
-  ): void {
-    if (socket.readyState === 1) {
-      try {
-        socket.send(buildServerMessage(buildServerChatPhraseRejected(this.roomId, rejection, requestId)));
-      } catch {
-        // 忽略发送失败
-      }
-    }
-  }
-
-  private handleLobbyReturn(
-    socket: WebSocket,
-    connectionId: string,
-    member: RoomMember,
-    message: Extract<ClientMessage, { type: 'lobby.return' }>,
-  ): void {
-    // 旁观消息已在分发层拒绝；这里仅为类型收窄到执色玩家。
-    if (member.role === 'spectator') {
-      return;
-    }
-    if (message.roomId !== this.roomId) {
-      this.reject(socket, connectionId, 'INVALID_MESSAGE', 'room-id-mismatch');
-      return;
-    }
-
-    const { matchId, intent } = message.payload;
-
-    if (this.match) {
-      if (this.match.matchId !== matchId) {
-        this.reject(socket, connectionId, 'INVALID_MESSAGE', 'match-id-mismatch');
-        return;
-      }
-
-      if (this.match.settlement === null && this.match.gameState.winner === null) {
-        this.sendError(socket, 'INVALID_MESSAGE', 'game-not-finished');
-        return;
-      }
-
-      this.stopClockBroadcast();
-      this.clearClockTimer();
-      this.clearNegotiationTimer();
-      this.match = null;
-      this.processedActions.clear();
-      this.phraseCooldownUntil.clear();
-      this.processedPhraseRequests.clear();
-
-      this.lobby = {
-        ...this.lobby,
-        phase: 'lobby',
-        startParameters: null,
-        ready: {
-          host: intent === 'rematch' && member.role === 'host',
-          guest: intent === 'rematch' && member.role === 'guest',
-        },
-      };
-
-      this.logger('game.return_lobby', { room: this.roomId, member: member.id, intent });
-      this.broadcastLobby();
-      this.broadcastMembers();
-      return;
-    }
-
-    if (this.lobby.phase === 'lobby') {
-      if (intent === 'rematch') {
-        if (!this.lobby.ready[member.role]) {
-          this.lobby = {
-            ...this.lobby,
-            ready: {
-              ...this.lobby.ready,
-              [member.role]: true,
-            },
-          };
-          this.broadcastLobby();
-        }
-      }
-    }
-  }
-
-  /**
-   * 旁观者动作拒绝：按消息所属通道给出非致命拒绝（大厅/对局/快捷短语各自通道），
-   * 只回复请求方，不进入任何缓存、时钟、revision 或对局裁决逻辑。
-   */
-  private rejectSpectatorAction(socket: WebSocket, message: ClientMessage): void {
-    this.logger('ws.spectator_rejected', { room: this.roomId, type: message.type });
-    try {
-      if (message.type === 'chat.phrase') {
         socket.send(
           buildServerMessage(
-            buildServerChatPhraseRejected(
-              this.roomId,
-              {
-                matchId: message.payload.matchId,
-                requestId: message.requestId ?? '',
-                code: 'NOT_A_PLAYER',
-                message: '旁观者不可发送快捷短语',
-              },
-              message.requestId,
-            ),
+            buildPong(this.roomId, message.payload.seq, {
+              serverReceiveTime: now,
+              serverSendTime: now,
+            }),
           ),
         );
-        return;
+      } catch {
+        // 忽略发送失败
       }
-      if (
-        message.type === 'lobby.settings' ||
-        message.type === 'lobby.lock' ||
-        message.type === 'lobby.ready' ||
-        message.type === 'lobby.start' ||
-        message.type === 'lobby.return'
-      ) {
-        socket.send(
-          buildServerMessage({
-            type: 'lobby.rejected',
-            roomId: this.roomId,
-            payload: { code: 'SPECTATOR_READONLY', message: '旁观者不可执行大厅操作' },
-          }),
-        );
-        return;
-      }
-      const matchId =
-        message.type === 'game.action' ||
-        message.type === 'game.negotiate' ||
-        message.type === 'game.negotiate.reply' ||
-        message.type === 'game.resign'
-          ? message.payload.matchId
-          : '';
-      const snap = this.match ? snapshotMatch(this.match, this.now()) : null;
-      this.sendGameRejection(
-        socket,
-        matchId,
-        snap?.stepNumber ?? 0,
-        '旁观者不可操作对局',
-        snap ? snap.gameState : createEmptyGameState(),
-        message.requestId,
-      );
-    } catch {
-      // socket 已关闭。
+      return;
     }
-  }
 
-  private sendGameRejection(
-    socket: WebSocket,
-    matchId: string,
-    stepNumber: number,
-    reason: string,
-    state: GameStateSnapshot,
-    requestId?: string,
-  ): void {
-    try {
-      socket.send(
-        buildServerMessage({
-          type: 'game.rejected',
-          roomId: this.roomId,
-          ...(requestId ? { requestId } : {}),
-          payload: {
-            matchId,
-            stepNumber,
-            reason,
-            state,
-          },
-        }),
-      );
-    } catch {
-      // socket 已关闭
+    const wd = this.watchdogs.get(socket);
+    if (wd && wd.pendingPongSeq === message.payload.seq) {
+      wd.pendingPongSeq = null;
+      if (wd.timeoutTimer) {
+        clearTimeout(wd.timeoutTimer);
+        wd.timeoutTimer = null;
+      }
     }
   }
 
@@ -2251,7 +515,7 @@ export class RoomServer {
     }
   }
 
-  private reject(socket: WebSocket, connectionId: string, code: ServerErrorCode, detail: string): void {
+  private reject(socket: WebSocket, connectionId: ConnectionId, code: ServerErrorCode, detail: string): void {
     this.logger('ws.rejected', { room: this.roomId, conn: connectionId, code, detail });
     this.sendError(socket, code, detail);
     socket.close(closeCodeForError(code), code);
