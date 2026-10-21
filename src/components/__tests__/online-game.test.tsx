@@ -5,6 +5,7 @@ import type { ConnectionState, GameClientState, RoomConnection } from '../../net
 import { buildStartParameters, createLobbyState } from '../../network/lobby.js';
 import { applyMatchAction, createMatch, finalizeMatch, undoMatchAction } from '../../network/match.js';
 import { projectMatchSnapshot } from '../../../server/public-view.js';
+import { buildFinishedMatchRecord } from '../../../server/finished-records.js';
 import { IDLE_CONNECTION_STATE } from '../rooms/connection-state.js';
 
 describe('OnlineGame component', () => {
@@ -50,7 +51,7 @@ describe('OnlineGame component', () => {
     };
   }
 
-  it.each(['resignation', 'draw-agreement', 'match-timeout', 'step-timeout', 'disconnect-timeout'] as const)('settles %s without exposing a full online record (stage boundary) and sends nothing on the result dialog', (reason) => {
+  it.each(['resignation', 'draw-agreement', 'match-timeout', 'step-timeout', 'disconnect-timeout'] as const)('settles %s and offers the server-generated record for export and replay without client rebuild', (reason) => {
     const { startParameters, match } = createTestMatch(true);
     const first = match.gameState.pieces.find((p) => !p.revealed)!.position!;
     const accepted = applyMatchAction(match, startParameters.redMemberId, { type: 'flip', position: first });
@@ -63,18 +64,39 @@ describe('OnlineGame component', () => {
     const ended = finalizeMatch(undone.match, reason === 'draw-agreement' ? null : 'red', reason);
     const snapshot = projectMatchSnapshot(ended);
     const lobby = createLobbyState(); lobby.phase = 'started'; lobby.startParameters = startParameters;
+    const serverRecord = buildFinishedMatchRecord(ended);
     const connection: ConnectionState = { ...IDLE_CONNECTION_STATE, status:'connected', roomId:'room-1', memberId:'host-1', role:'host', lobby,
-      game: buildTestGame(startParameters, snapshot, { settlement: snapshot.settlement }) };
-    const mockClient = { sendGameAction: vi.fn(), sendLobbyReturn: vi.fn(), requestGameSync: vi.fn() } as unknown as RoomConnection;
+      game: buildTestGame(startParameters, snapshot, { settlement: snapshot.settlement }),
+      recordResult: { matchId: 'm1', requestId: 'server-1', expiresAt: Date.now() + 1_800_000, ...serverRecord },
+    };
+    const mockClient = { sendGameAction: vi.fn(), sendLobbyReturn: vi.fn(), requestGameSync: vi.fn(), requestGameRecord: vi.fn() } as unknown as RoomConnection;
     render(<OnlineGame client={mockClient} connection={connection} onExit={vi.fn()} />);
     expect(screen.getByTestId('game-result-modal')).toBeInTheDocument();
-    // 阶段边界：联机客户端不持有完整开局，因此不提供导出/复盘入口。
-    expect(screen.getByTestId('online-record-unavailable')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '导出棋谱' })).not.toBeInTheDocument();
-    expect(screen.queryByTestId('replay-viewer')).not.toBeInTheDocument();
+    // 终局后由服务器交付完整棋谱：客户端只展示服务器原文。
+    expect(screen.getByTestId('online-record-ready')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '导出棋谱' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '开始复盘' }));
+    expect(screen.getByTestId('replay-viewer')).toBeInTheDocument();
+    expect(screen.getByLabelText('完整步序').children).toHaveLength(1);
     expect(mockClient.sendGameAction).not.toHaveBeenCalled();
     expect(mockClient.sendLobbyReturn).not.toHaveBeenCalled();
     expect(mockClient.requestGameSync).not.toHaveBeenCalled();
+  });
+
+  it('requests the server record when none is available yet and shows the explicit unavailable reason', () => {
+    const { startParameters, match } = createTestMatch(true);
+    const ended = finalizeMatch(match, 'red', 'resignation');
+    const snapshot = projectMatchSnapshot(ended);
+    const lobby = createLobbyState(); lobby.phase = 'started'; lobby.startParameters = startParameters;
+    const connection: ConnectionState = { ...IDLE_CONNECTION_STATE, status:'connected', roomId:'room-1', memberId:'host-1', role:'host', lobby,
+      game: buildTestGame(startParameters, snapshot, { settlement: snapshot.settlement }) };
+    const mockClient = { sendGameAction: vi.fn(), sendLobbyReturn: vi.fn(), requestGameSync: vi.fn(), requestGameRecord: vi.fn() } as unknown as RoomConnection;
+    const view = render(<OnlineGame client={mockClient} connection={connection} onExit={vi.fn()} />);
+    expect(mockClient.requestGameRecord).toHaveBeenCalledWith('m1');
+    expect(screen.getByTestId('online-record-loading')).toBeInTheDocument();
+    view.rerender(<OnlineGame client={mockClient} connection={{ ...connection, recordError: { matchId: 'm1', code: 'UNAVAILABLE', message: '棋谱不存在或已过期' } }} onExit={vi.fn()} />);
+    expect(screen.getByTestId('online-record-error')).toHaveTextContent('棋谱不存在或已过期');
+    expect(screen.queryByRole('button', { name: '导出棋谱' })).not.toBeInTheDocument();
   });
 
   it('renders start summary, snapshot, turn indicator, step counter, and shuffling banner', () => {

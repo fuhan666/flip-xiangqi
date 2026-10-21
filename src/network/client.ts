@@ -27,6 +27,7 @@ import {
   buildClientHello,
   buildClientLeave,
   buildClientLobbyLock,
+  buildClientGameRecordRequest,
   buildClientLobbyReady,
   buildClientLobbyReturn,
   buildClientLobbySettings,
@@ -41,6 +42,7 @@ import {
   PROTOCOL_VERSION,
   type ClientMessage,
   type ErrorCode,
+  type FinishedRecordSummary,
   type LobbyRejection,
   type MatchAction,
   type MatchClockSnapshot,
@@ -52,6 +54,7 @@ import {
   type PublicGameState,
   type QuickPhraseEvent,
   type Role,
+  type RecordUnavailableCode,
   type RoomClosedReason,
   type ServerErrorCode,
   type SidePreference,
@@ -135,6 +138,27 @@ export interface ConnectionState {
   reconnecting: boolean;
   /** 最近一次是否为刚重连成功（触发 3 秒 toast）。 */
   justReconnected: boolean;
+  /** 本房未过期终局摘要（服务端下发，不含布局）。 */
+  records: FinishedRecordSummary[];
+  /** 最近一次成功取回的服务器权威棋谱；独立于当前公开局面保存。 */
+  recordResult: OnlineRecord | null;
+  /** 最近一次棋谱请求的明确不可用/拒绝原因。 */
+  recordError: RecordUnavailable | null;
+}
+
+/** 服务端生成的完整终局棋谱（客户端只展示，不重建）。 */
+export interface OnlineRecord {
+  matchId: string;
+  requestId: string;
+  expiresAt: number;
+  json: string;
+  text: string;
+}
+
+export interface RecordUnavailable {
+  matchId: string | null;
+  code: RecordUnavailableCode;
+  message: string;
 }
 
 export interface JoinOptions {
@@ -184,6 +208,8 @@ export interface RoomConnection {
   sendGameResign(): { ok: boolean; reason?: string };
   /** 显式请求权威对局同步。 */
   requestGameSync(): void;
+  /** 取回本房已结算对局的服务端权威棋谱（双方与获准旁观者可用）。 */
+  requestGameRecord(matchId: string): { ok: boolean; reason?: string };
   /** 发送快捷短语互动（服务端白名单与冷却防刷）。 */
   sendChatPhrase(phraseId: string): { ok: boolean; reason?: string };
 }
@@ -216,6 +242,9 @@ const IDLE_STATE: ConnectionState = {
   rtt: null,
   reconnecting: false,
   justReconnected: false,
+  records: [],
+  recordResult: null,
+  recordError: null,
 };
 
 function defaultWebSocketFactory(url: string): WebSocketLike {
@@ -269,6 +298,8 @@ export class RoomClient implements RoomConnection {
   private reconnecting = false;
   private pendingSyncRequestId: string | null = null;
   private pendingVersionRequestId: string | null = null;
+  /** 在途棋谱请求：只接受与 (matchId, requestId) 同时匹配的应答。 */
+  private pendingRecordRequest: { requestId: string; matchId: string } | null = null;
   private syncTimer: ReturnType<typeof setTimeout> | null = null;
   private actionRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
   private stateAuditTimer: ReturnType<typeof setTimeout> | null = null;
@@ -741,6 +772,28 @@ export class RoomClient implements RoomConnection {
     }
   }
 
+  requestGameRecord(matchId: string): { ok: boolean; reason?: string } {
+    const socket = this.socket;
+    if (!socket || this.state.status !== 'connected' || socket.readyState !== SOCKET_OPEN) {
+      return { ok: false, reason: '连接未就绪' };
+    }
+    const roomId = this.state.roomId;
+    if (!roomId) {
+      return { ok: false, reason: '尚未加入房间' };
+    }
+    // 旁观者同样可以取回；授权由服务器按冻结参与者与本房获准成员裁决。
+    const requestId = generateRequestId();
+    this.pendingRecordRequest = { requestId, matchId };
+    this.setState({ ...this.state, recordError: null });
+    try {
+      socket.send(encodeMessage(buildClientGameRecordRequest(roomId, { requestId, matchId })));
+    } catch {
+      this.pendingRecordRequest = null;
+      return { ok: false, reason: '发送失败，请重试' };
+    }
+    return { ok: true };
+  }
+
   sendChatPhrase(phraseId: string): { ok: boolean; reason?: string } {
     const blocked = this.spectatorBlock();
     if (blocked) {
@@ -887,6 +940,9 @@ export class RoomClient implements RoomConnection {
         rtt: this.state.rtt,
         reconnecting: false,
         justReconnected: wasReconnecting,
+        records: message.payload.records ?? [],
+        recordResult: this.state.recordResult,
+        recordError: this.state.recordError,
       });
 
       if (wasReconnecting) {
@@ -995,6 +1051,49 @@ export class RoomClient implements RoomConnection {
           },
         });
       }
+      return;
+    }
+
+    if (message.type === 'game.records') {
+      this.setState({ ...this.state, records: message.payload.records });
+      return;
+    }
+
+    if (message.type === 'game.record') {
+      const pending = this.pendingRecordRequest;
+      if (!pending || pending.requestId !== message.requestId || pending.matchId !== message.payload.matchId) {
+        return;
+      }
+      this.pendingRecordRequest = null;
+      this.setState({
+        ...this.state,
+        recordResult: {
+          matchId: message.payload.matchId,
+          requestId: message.requestId,
+          expiresAt: message.payload.expiresAt,
+          json: message.payload.json,
+          text: message.payload.text,
+        },
+        recordError: null,
+      });
+      return;
+    }
+
+    if (message.type === 'game.record.unavailable') {
+      const pending = this.pendingRecordRequest;
+      if (pending && pending.requestId !== message.requestId) {
+        return;
+      }
+      this.pendingRecordRequest = null;
+      this.setState({
+        ...this.state,
+        recordError: {
+          matchId: message.payload.matchId,
+          code: message.payload.code,
+          message: message.payload.message,
+        },
+        recordResult: null,
+      });
       return;
     }
 
@@ -1798,6 +1897,7 @@ export class RoomClient implements RoomConnection {
   }
 
   private teardown(): void {
+    this.pendingRecordRequest = null;
     this.clearTimer();
     this.stopHeartbeat();
     this.stopStateRecovery();

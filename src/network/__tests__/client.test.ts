@@ -6,7 +6,7 @@ import { RoomClient, type WebSocketLike } from '../client';
 import { applyLobbyCommand, buildStartParameters, createLobbyState, type LobbyState } from '../lobby';
 import { createMatch } from '../match';
 import { publicGameStatePayload, publicSnapshotOf } from './helpers/public-fixtures';
-import { buildServerMessage, closeCodeForError, PROTOCOL_VERSION } from '../protocol';
+import { buildServerMessage, buildServerGameRecord, buildServerGameRecordUnavailable, closeCodeForError, PROTOCOL_VERSION } from '../protocol';
 
 interface TestServer {
   wss: WebSocketServer;
@@ -1007,5 +1007,72 @@ describe('RoomClient spectator mode', () => {
     client.requestGameSync();
     await waitUntil(() => received.some((m) => m.type === 'game.sync'));
     client.disconnect();
+  });
+});
+
+describe('RoomClient 终局棋谱', () => {
+  it('按 (matchId, requestId) 关联服务器棋谱，丢包重试与迟到应答都不覆盖状态', async () => {
+    let client: RoomClient | null = null;
+    let recordRequests = 0;
+    const server = await startServer((socket) => {
+      socket.on('message', (data) => {
+        const incoming = JSON.parse(data.toString());
+        if (incoming.type === 'hello') {
+          socket.send(
+            buildServerMessage({
+              type: 'welcome',
+              roomId: 'room-1',
+              payload: {
+                roomId: 'room-1',
+                memberId: 'guest-1',
+                role: 'guest',
+                name: '客人',
+                members,
+                lobby: createLobbyState(),
+                records: [{ matchId: 'm1', endedAt: 100, expiresAt: 200 }],
+              },
+            }),
+          );
+          return;
+        }
+        if (incoming.type !== 'game.record.request') return;
+        recordRequests += 1;
+        // 先回一条不属于本轮请求的迟到响应，客户端必须忽略。
+        socket.send(
+          buildServerMessage(buildServerGameRecord('room-1', {
+            requestId: 'stale', matchId: 'm1', expiresAt: 200, json: '{"stale":true}', text: 'stale',
+          })),
+        );
+        if (recordRequests > 1) {
+          socket.send(
+            buildServerMessage(buildServerGameRecordUnavailable('room-1', {
+              requestId: incoming.requestId, matchId: 'm1', code: 'UNAVAILABLE', message: '棋谱不存在或已过期',
+            })),
+          );
+          return;
+        }
+        socket.send(
+          buildServerMessage(buildServerGameRecord('room-1', {
+            requestId: incoming.requestId, matchId: 'm1', expiresAt: 500, json: '{"ok":true}', text: 'text',
+          })),
+        );
+      });
+    });
+
+    client = makeClient();
+    client.connect({ host: '127.0.0.1', port: server.port }, { role: 'guest', name: '客人' });
+    await waitUntil(() => client!.getState().status === 'connected');
+    expect(client.getState().records).toEqual([{ matchId: 'm1', endedAt: 100, expiresAt: 200 }]);
+    expect(client.getState().recordResult).toBeNull();
+
+    expect(client.requestGameRecord('m1')).toEqual({ ok: true });
+    await waitUntil(() => client!.getState().recordResult !== null);
+    expect(client.getState().recordResult).toMatchObject({ matchId: 'm1', expiresAt: 500, json: '{"ok":true}', text: 'text' });
+    expect(client.getState().recordResult!.requestId).not.toBe('stale');
+
+    expect(client.requestGameRecord('m1')).toEqual({ ok: true });
+    await waitUntil(() => client!.getState().recordError !== null);
+    expect(client.getState().recordError).toMatchObject({ matchId: 'm1', code: 'UNAVAILABLE' });
+    expect(client.getState().recordResult).toBeNull();
   });
 });

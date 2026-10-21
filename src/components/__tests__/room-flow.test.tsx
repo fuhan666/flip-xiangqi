@@ -63,6 +63,10 @@ class FakeConnection implements RoomConnection {
   lobbyCalls: LobbyCall[] = [];
   private savedAddress: string | null = null;
 
+  requestGameRecord(): { ok: boolean; reason?: string } {
+    return { ok: true };
+  }
+
   connect(address: ParsedAddress, options: JoinOptions): void {
     this.connectCalls.push({ address, options });
     this.savedAddress = `${address.host}:${address.port}`;

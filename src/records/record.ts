@@ -1,7 +1,7 @@
-import { snapshotState, restoreState, PIECE_SYMBOLS } from '../game';
-import type { Camp, GameState, GameStateSnapshot, GameHistoryEntry, HistoryPieceSnapshot, Position } from '../game';
-import { parseGameStateSnapshot } from '../network/match';
-import type { EndgameReason } from '../network/match-clock';
+import { snapshotState, restoreState, PIECE_SYMBOLS } from '../game/index.js';
+import type { Camp, GameState, GameStateSnapshot, GameHistoryEntry, HistoryPieceSnapshot, Position } from '../game/index.js';
+import { parseGameStateSnapshot } from '../network/match.js';
+import type { EndgameReason } from '../network/match-clock.js';
 
 export interface GameRecord {
   format: 'flip-xiangqi';
@@ -141,15 +141,3 @@ export function recordText(record: GameRecord): string {
     'JSON 文件包含完整初始布局，可用于单步复盘。'].join('\n');
 }
 export function recordJSON(record: GameRecord): string { return JSON.stringify(record, null, 2); }
-export function downloadRecord(record: GameRecord, format: 'txt' | 'json'): void {
-  const blob = new Blob([format === 'txt' ? recordText(record) : recordJSON(record)], { type: format === 'txt' ? 'text/plain;charset=utf-8' : 'application/json;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `flip-xiangqi-${record.result.totalSteps}-steps.${format}`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  // Let the browser acquire the download before releasing the URL.
-  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
